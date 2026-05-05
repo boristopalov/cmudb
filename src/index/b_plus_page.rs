@@ -1,12 +1,13 @@
 use crate::buf::{BufReader, BufWriter, BufferError};
-use crate::catalog::{IndexKey, RecordId};
+use crate::catalog::index_schema::IndexKey;
 use crate::disk::PAGE_SIZE;
-use crate::index::index::RemoveError;
+use crate::index::RemoveError;
 use crate::index::page_codec::{
     COMMON_HEADER_BYTES, KIND_HEADER, KIND_INTERNAL, KIND_LEAF, KIND_OFFSET, PageCodecError,
     U32_BYTES, U64_BYTES, decode_page_id, decode_record_id, encode_page_id, encode_record_id,
     read_common_header, write_common_header,
 };
+use crate::table_heap::RecordId;
 use log::{error, info};
 use std::collections::VecDeque;
 use std::convert::TryFrom;
@@ -1175,12 +1176,13 @@ impl HeaderPage {
 mod tests {
 
     use crate::buf::BufferError;
-    use crate::catalog::{IndexKey, RecordId};
+    use crate::catalog::index_schema::IndexKey;
     use crate::disk::PAGE_SIZE;
     use crate::index::b_plus_page::{
         HeaderPage, INVALID_PAGE_ID, InternalPage, LeafPage, NUM_TOMBSTONES,
     };
     use crate::index::page_codec::PageCodecError;
+    use crate::table_heap::RecordId;
     use std::collections::VecDeque;
 
     #[test]

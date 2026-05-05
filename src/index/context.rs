@@ -3,13 +3,12 @@ use std::collections::VecDeque;
 use crate::{
     buffer_pool::{PageMut, PageRef},
     index::b_plus_page::INVALID_PAGE_ID,
-    table_heap::PageId,
 };
 
 pub struct TreeContext<'a> {
     pub header: Option<PageMut<'a>>,
 
-    pub root_page_id: PageId,
+    pub root_page_id: usize,
 
     pub read_set: VecDeque<PageRef<'a>>,
 

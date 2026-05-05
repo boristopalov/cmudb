@@ -1,6 +1,6 @@
 use crate::buf::{BufReader, BufWriter, BufferError};
-use crate::catalog::RecordId;
 use crate::index::b_plus_page::{INVALID_PAGE_ID, PageId};
+use crate::table_heap::RecordId;
 use std::fmt;
 
 const MAGIC: [u8; 4] = *b"CMDB";
@@ -76,11 +76,6 @@ pub fn decode_page_id(raw: u64) -> Result<PageId, PageCodecError> {
     }
     usize::try_from(raw).map_err(|_| PageCodecError::BufferError(BufferError::Overflow))
 }
-
-/// returns a Result tuple consisting of the size of the page, max size, and whether the page is a leaf page
-// pub fn peek_size_and_kind(r: &mut BufReader<'_>) -> Result<u32, u32, bool> {
-
-// }
 
 pub fn encode_record_id(rid: &RecordId) -> Result<(u64, u64), PageCodecError> {
     Ok((

@@ -24,14 +24,6 @@ use std::sync::mpsc;
 #[cfg(feature = "deadlock_detection")]
 const DEADLOCK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-// #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-// enum AccessType {
-//     Unknown,
-//     Lookup,
-//     Scan,
-//     Index,
-// }
-
 type Page = [u8; disk::PAGE_SIZE];
 
 #[derive(Debug)]
@@ -41,7 +33,6 @@ struct FrameHeader {
     buf: Page,
     pin_count: AtomicU32,
     dirty: AtomicBool,
-    // evicting: AtomicBool,
 }
 
 #[derive(Debug)]

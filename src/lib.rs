@@ -3,6 +3,7 @@ pub mod buffer_pool;
 pub mod catalog;
 pub mod disk;
 pub mod index;
+pub mod processor;
 pub mod replacer;
 pub mod table_heap;
 

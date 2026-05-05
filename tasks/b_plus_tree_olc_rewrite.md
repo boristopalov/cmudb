@@ -151,6 +151,13 @@ LOGS:
   - Why: remove() is in-line with cmu OLC
   - How validated (tests run + results): unit tests and integration tests passed.
 
+- Date: 2026-05-03
+  - What changed: code to delete has been deleted.
+  - Why: not needed
+  - How validated (tests run + results): unit tests and integration tests passed.
+
+
+
 
 ---
 

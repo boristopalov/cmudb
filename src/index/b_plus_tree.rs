@@ -1,13 +1,11 @@
 use crate::buffer_pool::{BufferPoolManager, PageMut, PageRef};
-use crate::catalog::{IndexKey, IndexValue};
+use crate::catalog::index_schema::{IndexKey, IndexValue};
 use crate::index::b_plus_page::{
     HeaderPage, INVALID_PAGE_ID, InternalPage, LeafPage, NUM_TOMBSTONES, Page, PageId, PageKind,
 };
 use crate::index::context::TreeContext;
-use crate::index::index::{
-    Index, IndexError, InsertError, InsertResult, RemoveError, RemoveResult,
-};
 use crate::index::page_codec::PageCodecError;
+use crate::index::{Index, IndexError, InsertError, InsertResult, RemoveError, RemoveResult};
 use log::{debug, error, info, warn};
 
 use std::sync::Arc;
@@ -755,55 +753,6 @@ impl BPlusTree {
         Ok(())
     }
 
-    // fn leftmost_leaf_id(&self, root_id: PageId) -> Result<PageId, IndexError> {
-    //     if root_id == INVALID_PAGE_ID {
-    //         return Ok(INVALID_PAGE_ID);
-    //     }
-    //     let mut current = root_id;
-    //     loop {
-    //         let page = self.bpm.read_page(current).map_err(IndexError::BpmError)?;
-    //         match LeafPage::decode(page.data(), self.key_len) {
-    //             Ok(_) => return Ok(current),
-    //             Err(PageCodecError::WrongPageKind { .. }) => {
-    //                 let internal = InternalPage::decode(page.data(), self.key_len)
-    //                     .map_err(IndexError::PageError)?;
-    //                 if internal.children.len() == 0 {
-    //                     return Err(IndexError::PageError(PageCodecError::Malformed(
-    //                         "internal page has no children",
-    //                     )));
-    //                 }
-    //                 current = internal.get_child(0).ok_or(IndexError::Lookup)?.clone();
-    //             }
-    //             Err(e) => return Err(IndexError::PageError(e)),
-    //         }
-    //     }
-    // }
-
-    // fn subtree_first_key(&self, page_id: PageId) -> Result<IndexKey, IndexError> {
-    //     let mut current = page_id;
-    //     loop {
-    //         let page = self.bpm.read_page(current).map_err(IndexError::BpmError)?;
-    //         match LeafPage::decode(page.data(), self.key_len) {
-    //             Ok(leaf) => {
-    //                 return leaf.keys.first().cloned().ok_or(IndexError::PageError(
-    //                     PageCodecError::Malformed("leaf page is empty"),
-    //                 ));
-    //             }
-    //             Err(PageCodecError::WrongPageKind { .. }) => {
-    //                 let internal = InternalPage::decode(page.data(), self.key_len)
-    //                     .map_err(IndexError::PageError)?;
-    //                 if internal.children.len() == 0 {
-    //                     return Err(IndexError::PageError(PageCodecError::Malformed(
-    //                         "internal page has no children",
-    //                     )));
-    //                 }
-    //                 current = internal.get_child(0).ok_or(IndexError::Lookup)?.clone();
-    //             }
-    //             Err(e) => return Err(IndexError::PageError(e)),
-    //         }
-    //     }
-    // }
-
     fn get_root_page_from_header(&self) -> Result<Option<PageRef<'_>>, IndexError> {
         let header = self.read_header()?;
         if header.root_page_id == INVALID_PAGE_ID {
@@ -1043,10 +992,10 @@ impl Index for BPlusTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::RecordId;
     use crate::create_buffer_pool_manager;
     use crate::disk::{DiskManager, DiskScheduler};
     use crate::replacer::ArcReplacer;
+    use crate::table_heap::RecordId;
     use tempfile::tempdir;
 
     fn make_bpm(num_frames: usize) -> (Arc<BufferPoolManager>, tempfile::TempDir) {
@@ -1234,7 +1183,7 @@ mod tests {
         let err = tree.remove(missing).unwrap_err();
         assert!(matches!(
             err,
-            IndexError::Remove(crate::index::index::RemoveError::KeyNotFound)
+            IndexError::Remove(crate::index::RemoveError::KeyNotFound)
         ));
 
         for i in 0u8..3u8 {
@@ -1256,7 +1205,7 @@ mod tests {
         let err = tree.remove(missing).unwrap_err();
         assert!(matches!(
             err,
-            IndexError::Remove(crate::index::index::RemoveError::KeyNotFound)
+            IndexError::Remove(crate::index::RemoveError::KeyNotFound)
         ));
 
         let after_header = tree.read_header().unwrap();
@@ -1289,7 +1238,7 @@ mod tests {
         let err = tree.remove(key).unwrap_err();
         assert!(matches!(
             err,
-            IndexError::Remove(crate::index::index::RemoveError::KeyNotFound)
+            IndexError::Remove(crate::index::RemoveError::KeyNotFound)
         ));
     }
 
