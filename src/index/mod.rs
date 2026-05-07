@@ -3,6 +3,7 @@ pub mod b_plus_tree;
 pub mod context;
 mod page_codec;
 use std::fmt;
+use std::ops::Bound;
 
 use crate::buffer_pool::BpmError;
 use crate::catalog::index_schema::{IndexKey, IndexValue};
@@ -11,11 +12,12 @@ pub use b_plus_tree::*;
 pub type InsertResult = Result<(), IndexError>;
 pub type RemoveResult = Result<(), IndexError>;
 
+pub type IndexIter = Box<dyn Iterator<Item = Result<(IndexKey, IndexValue), IndexError>>>;
 pub trait Index {
     fn insert(&self, key: IndexKey, val: IndexValue) -> InsertResult;
     fn remove(&self, key: IndexKey) -> RemoveResult;
     fn search(&self, key: &IndexKey) -> Result<Option<IndexValue>, IndexError>;
-    // fn scan(...) // TODO: not sure that this belongs here
+    fn scan(&self, range: (Bound<IndexKey>, Bound<IndexKey>)) -> Result<IndexIter, IndexError>;
 }
 
 // TODO: clean these up

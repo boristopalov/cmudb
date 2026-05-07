@@ -381,31 +381,6 @@ impl InternalPage {
         Ok(page)
     }
 
-    // pub fn child_at(&self, index: usize) -> PageId {
-    //     self.children[index]
-    // }
-
-    // pub fn child_count(&self) -> usize {
-    //     self.children.len()
-    // }
-
-    // pub fn keys.len(&self) -> usize {
-    //     self.keys.len()
-    // }
-
-    // pub fn key_at(&self, index: usize) -> &IndexKey {
-    //     &self.keys[index]
-    // }
-
-    // pub fn set_key_at(&mut self, index: usize, key: IndexKey) {
-    //     self.keys[index] = key;
-    //     self.validate();
-    // }
-
-    // pub fn min_size(&self) -> u32 {
-    //     self.base.min_size()
-    // }
-
     pub fn is_full(&self) -> bool {
         self.base.size == self.base.max_size
     }
@@ -413,46 +388,6 @@ impl InternalPage {
     pub fn is_underfull(&self) -> bool {
         self.base.size < self.base.min_size()
     }
-
-    // We should decode first and then read children....
-    // pub fn peek_child_at(buf: &[u8], child_index: usize) -> Result<PageId, PageCodecError> {
-    //     let mut r = BufReader::new(buf)?;
-    //     let kind = read_common_header(&mut r)?;
-    //     if kind != KIND_INTERNAL {
-    //         return Err(PageCodecError::WrongPageKind {
-    //             expected: KIND_INTERNAL,
-    //             actual: kind,
-    //         });
-    //     }
-    //     let _latch = r.read_u64_le()?;
-    //     let _size = r.read_u32_le()?;
-    //     let _max_size = r.read_u32_le()?;
-    //     let child_count = r.read_u32_le()? as usize;
-    //     let _reserved = r.read_u32_le()?;
-    //     if child_index >= child_count {
-    //         return Err(PageCodecError::Malformed(
-    //             "internal page child_index out of bounds",
-    //         ));
-    //     }
-    //     let base = INTERNAL_FIXED_HEADER_BYTES;
-    //     let off = base
-    //         .checked_add(
-    //             child_index
-    //                 .checked_mul(PAGE_ID_ENCODED_BYTES)
-    //                 .ok_or(PageCodecError::BufferError(BufferError::Overflow))?,
-    //         )
-    //         .ok_or(PageCodecError::BufferError(BufferError::Overflow))?;
-    //     if off + PAGE_ID_ENCODED_BYTES > PAGE_SIZE {
-    //         return Err(PageCodecError::BufferError(BufferError::BufferTooSmall {
-    //             needed: off + PAGE_ID_ENCODED_BYTES,
-    //             actual: PAGE_SIZE,
-    //         });
-    //     }
-    //     let raw: [u8; 8] = buf[off..off + 8]
-    //         .try_into()
-    //         .map_err(|_| PageCodecError::Malformed("internal child pointer slice"))?;
-    //     decode_page_id(u64::from_le_bytes(raw))
-    // }
 
     /// Removes the separator key between `children[left_child_index]` and `children[left_child_index+1]`,
     /// and removes (and returns) the right child pointer (`children[left_child_index+1]`).
@@ -643,6 +578,10 @@ impl LeafPage {
         self.keys.partition_point(|k| k < key)
     }
 
+    pub fn upper_bound(&self, key: &IndexKey) -> usize {
+        self.keys.partition_point(|k| k <= key)
+    }
+
     /// Performs a binary search on the leaf page's list of keys for the given key
     /// Returns an Option<RecordId> which will contain the record ID
     /// for the given key is found, if the given key is found.
@@ -665,7 +604,7 @@ impl LeafPage {
         })
     }
 
-    fn is_tombstoned(&self, slot: u32) -> bool {
+    pub fn is_tombstoned(&self, slot: u32) -> bool {
         self.tombstones.iter().any(|&s| s == slot)
     }
 

@@ -1,9 +1,10 @@
+use std::ops::Bound;
 use std::sync::Arc;
 
 use crate::buffer_pool::BufferPoolManager;
 use crate::catalog::{Column, DataType, IndexType, Schema, Value};
 use crate::index::{
-    BPlusTree, Index, IndexError, InsertError, InsertResult, RemoveError, RemoveResult,
+    BPlusTree, Index, IndexError, IndexIter, InsertError, InsertResult, RemoveError, RemoveResult,
 };
 use crate::table_heap::{RecordId, Tuple};
 
@@ -56,6 +57,15 @@ impl TableIndex {
         IndexKey(data)
     }
 
+    fn encode_key_from_values(&self, vals: &[Value]) -> IndexKey {
+        assert_eq!(vals.len(), self.indexed_cols.len());
+        let mut data = Vec::with_capacity(self.key_size);
+        for v in vals {
+            v.encode(&mut data);
+        }
+        IndexKey(data)
+    }
+
     pub fn insert(&self, tuple: &Tuple, rid: RecordId) -> InsertResult {
         let key = self.encode_key(tuple);
         self.idx.insert(key, IndexValue::IndexValue(rid))
@@ -64,12 +74,30 @@ impl TableIndex {
         let key = self.encode_key(tuple);
         self.idx.remove(key)
     }
-    pub fn search(&self, tuple: &Tuple) -> Result<Option<RecordId>, IndexError> {
-        let key = self.encode_key(tuple);
+
+    /// search looks up a key (one Value per indexed column, in index-schema order) in the index.
+    pub fn search(&self, vals: &[Value]) -> Result<Option<RecordId>, IndexError> {
+        let key = self.encode_key_from_values(vals);
         match self.idx.search(&key)? {
             Some(IndexValue::IndexValue(rid)) => Ok(Some(rid)),
             _ => Ok(None),
         }
+    }
+
+    /// scans the index with start/end key bounds (one Value per indexed column, in index-schema order).
+    pub fn scan(
+        &self,
+        start: Bound<&[Value]>,
+        end: Bound<&[Value]>,
+    ) -> Result<IndexIter, IndexError> {
+        let to_key = |b: Bound<&[Value]>| -> Bound<IndexKey> {
+            match b {
+                Bound::Included(v) => Bound::Included(self.encode_key_from_values(v)),
+                Bound::Excluded(v) => Bound::Excluded(self.encode_key_from_values(v)),
+                Bound::Unbounded => Bound::Unbounded,
+            }
+        };
+        self.idx.scan((to_key(start), to_key(end)))
     }
 }
 

@@ -5,9 +5,13 @@ use crate::index::b_plus_page::{
 };
 use crate::index::context::TreeContext;
 use crate::index::page_codec::PageCodecError;
-use crate::index::{Index, IndexError, InsertError, InsertResult, RemoveError, RemoveResult};
+use crate::index::{
+    Index, IndexError, IndexIter, InsertError, InsertResult, RemoveError, RemoveResult,
+};
 use log::{debug, error, info, warn};
 
+use std::collections::HashSet;
+use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -769,6 +773,37 @@ impl BPlusTree {
                 .map_err(IndexError::BpmError)?,
         ))
     }
+
+    /// find_leaf looks for the leaf page that would contain `key`, if `key` exists in our tree.
+    /// This is useful for index scans, where we use a key as a lower bound. The key does not need
+    /// to exist to be used as a bound.
+    fn find_leaf(&self, key: &IndexKey) -> Result<LeafPage, IndexError> {
+        let Some(root_page) = self.get_root_page_from_header()? else {
+            return Err(IndexError::Lookup);
+        };
+
+        let mut current = root_page;
+        loop {
+            match Page::decode(current.data(), self.key_len)? {
+                Page::Internal(node) => {
+                    let next_page_id = node.children[node.find_child_index(key)];
+
+                    // acquire a read latch on the next page,
+                    // then drop the latch on the current page by reassigning
+                    let next_page = self
+                        .bpm
+                        .read_page(next_page_id)
+                        .map_err(IndexError::BpmError)?;
+                    current = next_page;
+                    // current.page_id()?;
+                }
+                Page::Leaf(leaf) => {
+                    // we've arrived at a leaf!
+                    return Ok(leaf);
+                }
+            }
+        }
+    }
 }
 
 impl Index for BPlusTree {
@@ -957,34 +992,107 @@ impl Index for BPlusTree {
             return Err(IndexError::Insert(InsertError::InvalidKey));
         }
 
-        let Some(root_page) = self.get_root_page_from_header()? else {
-            return Ok(None);
+        let leaf = self.find_leaf(key)?;
+
+        // we've arrived at a leaf, look for the key
+        let record_id = leaf.get(key).map(IndexValue::IndexValue);
+        return Ok(record_id);
+    }
+
+    fn scan(&self, range: (Bound<IndexKey>, Bound<IndexKey>)) -> Result<IndexIter, IndexError> {
+        // figure out which leaf page to start at, and which slot in the leaf page to start at
+        let (start_leaf, start_slot) = match range.start_bound() {
+            // start at the beginning
+            Bound::Unbounded => {
+                let header = self.read_header()?;
+                let page_guard = self.bpm.read_page(header.first_leaf_id)?;
+
+                let start_leaf = LeafPage::decode(page_guard.data(), self.key_len)?;
+                (start_leaf, 0)
+            }
+            Bound::Excluded(key) => {
+                let leaf = self.find_leaf(key)?;
+                let start_slot = leaf.upper_bound(key);
+                (leaf, start_slot)
+            }
+            Bound::Included(key) => {
+                let leaf = self.find_leaf(key)?;
+                let start_slot = leaf.lower_bound(key);
+                (leaf, start_slot)
+            }
         };
 
-        // search for the given key, starting from the root page id
-        let mut current = root_page;
-        loop {
-            // TODO: instead of decoding the full page,
-            // we could get the type of page, and then only look up the child,
-            // without decoding the full page
-            match Page::decode(current.data(), self.key_len)? {
-                Page::Internal(node) => {
-                    let next_page_id = node.children[node.find_child_index(key)];
+        let leaf_iter = LeafPagesIter {
+            bpm: self.bpm.clone(),
+            next_leaf_id: start_leaf.next_leaf_id,
+            seen: HashSet::new(),
+            key_len: self.key_len,
+            finished: false,
+        };
 
-                    // acquire a read latch on the next page,
-                    // then drop the latch on the current page by reassigning
-                    let next_page = self
-                        .bpm
-                        .read_page(next_page_id)
-                        .map_err(IndexError::BpmError)?;
-                    current = next_page;
-                }
-                Page::Leaf(leaf) => {
-                    // we've arrived at a leaf, look for the key
-                    let record_id = leaf.get(key).map(IndexValue::IndexValue);
-                    return Ok(record_id);
+        let da_iter = BPlusTreeIter {
+            leaves_iter: leaf_iter,
+            current_leaf: Some(start_leaf),
+            slot_idx: start_slot,
+            upper_bound: range.end_bound().cloned(),
+        };
+        Ok(Box::new(da_iter))
+    }
+}
+
+pub struct BPlusTreeIter {
+    leaves_iter: LeafPagesIter,
+    current_leaf: Option<LeafPage>,
+    slot_idx: usize,
+    upper_bound: Bound<IndexKey>,
+}
+
+impl Iterator for BPlusTreeIter {
+    type Item = Result<(IndexKey, IndexValue), IndexError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let leaf = self.current_leaf.as_ref()?;
+
+            if self.slot_idx >= leaf.keys.len() {
+                match self.leaves_iter.next() {
+                    None => {
+                        self.current_leaf = None;
+                        return None;
+                    }
+                    Some(Err(e)) => {
+                        self.current_leaf = None;
+                        return Some(Err(e));
+                    }
+                    Some(Ok((_, next_leaf))) => {
+                        self.current_leaf = Some(next_leaf);
+                        self.slot_idx = 0;
+                        continue; // re-check num_slots in case the leaf is empty
+                    }
                 }
             }
+
+            let i = self.slot_idx;
+            self.slot_idx += 1;
+
+            if leaf.is_tombstoned(i as u32) {
+                continue;
+            }
+
+            let rid = leaf.record_ids[i];
+            let val = IndexValue::IndexValue(rid);
+
+            let past_upper = match &self.upper_bound {
+                Bound::Included(u) => &leaf.keys[i] > u,
+                Bound::Excluded(u) => &leaf.keys[i] >= u,
+                Bound::Unbounded => false,
+            };
+            if past_upper {
+                self.current_leaf = None;
+                return None;
+            }
+
+            // fuck this clone
+            return Some(Ok((leaf.keys[i].clone(), val)));
         }
     }
 }

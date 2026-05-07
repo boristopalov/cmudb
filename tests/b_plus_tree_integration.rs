@@ -83,11 +83,11 @@ fn b_plus_tree_single_thread() {
 
 #[test]
 fn b_plus_tree_soak_concurrent() {
-    let num_frames = 10;
-    let key_len = 4;
+    let num_frames = 50;
+    let key_len = 128;
     let threads = 20;
-    let ops_per_thread = 50;
-    let key_space = 64;
+    let ops_per_thread = 500;
+    let key_space = 256;
     let max_pages = 100;
 
     let (bpm, _tmp) = make_bpm(num_frames);

@@ -1,4 +1,5 @@
 pub mod index_schema;
+use crate::table_heap::TableHeapIterator;
 use crate::{buffer_pool::BufferPoolManager, table_heap::TableHeap};
 use crate::{catalog::index_schema::TableIndex, table_heap::Tuple};
 use ordered_float::OrderedFloat;
@@ -214,6 +215,7 @@ impl Schema {
         }
     }
 
+    /// Returns a value given a tuple and a column index
     pub fn get_value(&self, tuple: &Tuple, col_idx: usize) -> Result<Value, CatalogError> {
         let col = self
             .cols
@@ -251,7 +253,7 @@ pub struct Column {
 /// Defines the value types we support.
 /// Note: FLOAT uses the OrderedFloat struct from the ordered-float crate.
 /// NaN is treated as greater than all other values, and equal to itself.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub enum Value {
     BOOLEAN(bool),
     INT(i32),
