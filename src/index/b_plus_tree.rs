@@ -1435,33 +1435,3 @@ mod tests {
         assert!(tree.search(&missing).unwrap().is_none());
     }
 }
-
-// TODO: implement table heap pages
-// TablePage stores:
-//      -
-//
-// Full testing flow looks something like:
-//      1. Create new Schema
-//      2. Create mock Tuple's
-//      3. Create IndexDefinition from provided schema and provided index cols
-//      3 (cont). This should also create the IndexEncoder
-//      4. Iterate through tuples and create idx keys using the encoder
-//      4 (cont). encoder.encode(&tuple.data) -> [u8]
-//      5. Create new b+ tree and insert each index key into it
-//
-
-// TODO:
-// implement traversal + insertion of a page
-//
-// 1. get page structure and invariants down for internal pages
-// 2a. get
-// 2b. for leaf pages, we can store mock data for now
-// 3. get traversal/search down... i think we need to get insertion down first
-// insert(key, value)
-//
-// for inserts/removals:
-// we start from the root of the tree
-// we keep track of any pages we visit in a stack
-// when inserting or removing from the tree,
-// lock the header page (which is stored separate, not part of the tree itself)
-// we do this bc the root page id is stored in the header

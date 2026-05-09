@@ -50,10 +50,10 @@ mod tests {
             .create_table("t".to_string(), make_schema())
             .expect("create table");
 
-        let expected: Vec<Vec<Value>> = vec![
-            vec![Value::INT(1), Value::BOOLEAN(true)],
-            vec![Value::INT(2), Value::BOOLEAN(false)],
-            vec![Value::INT(42), Value::BOOLEAN(true)],
+        let expected: Vec<Vec<Option<Value>>> = vec![
+            vec![Some(Value::INT(1)), Some(Value::BOOLEAN(true))],
+            vec![Some(Value::INT(2)), Some(Value::BOOLEAN(false))],
+            vec![Some(Value::INT(42)), Some(Value::BOOLEAN(true))],
         ];
 
         let rows: Vec<Vec<Expression>> = expected
@@ -91,7 +91,7 @@ mod tests {
 
         let mut got = Vec::new();
         while let Some((tuple, _rid)) = scan_exec.next().expect("scan next") {
-            let row: Vec<Value> = (0..make_schema().cols.len())
+            let row: Vec<Option<Value>> = (0..make_schema().cols.len())
                 .map(|i| make_schema().get_value(&tuple, i).expect("decode"))
                 .collect();
             got.push(row);

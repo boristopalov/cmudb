@@ -2,7 +2,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use crate::buffer_pool::BufferPoolManager;
-use crate::catalog::{Column, DataType, IndexType, Schema, Value};
+use crate::catalog::{Column, DataType, IndexType, Schema, Value, is_null};
 use crate::index::{
     BPlusTree, Index, IndexError, IndexIter, InsertError, InsertResult, RemoveError, RemoveResult,
 };
@@ -16,18 +16,25 @@ pub enum IndexValue {
     IndexValue(RecordId),
 }
 
+/// We do not allow nulls in indexes!!!
 pub struct TableIndex {
-    indexed_cols: Vec<Column>, // offsets are into the table tuple
-    pub schema: Schema,        // schema of the index key, not the tuple
+    indexed_cols: Vec<Column>, // offsets are into the table tuple's payload region
+    indexed_col_idxs: Vec<usize>, // each indexed column's position in the table schema (for null-bit lookup)
+    table_bitmap_len: usize,      // bytes of bitmap prefix on tuples from the indexed table
+    pub schema: Schema,           // schema of the index key, not the tuple
     key_size: usize,
     idx: Box<dyn Index>,
 }
 
+/// represents an index of a table
+/// does NOT support nulls, i.e. our indexes contain only non-nulled
 impl TableIndex {
     pub fn new(
         bpm: Arc<BufferPoolManager>,
         index_name: String,
         indexed_cols: Vec<Column>,
+        indexed_col_idxs: Vec<usize>,
+        table_bitmap_len: usize,
         index_type: IndexType,
     ) -> Result<Self, IndexError> {
         let cols_for_schema: Vec<(DataType, String)> = indexed_cols
@@ -43,6 +50,8 @@ impl TableIndex {
 
         Ok(Self {
             indexed_cols,
+            indexed_col_idxs,
+            table_bitmap_len,
             schema,
             key_size,
             idx: Box::new(idx),
@@ -50,9 +59,10 @@ impl TableIndex {
     }
 
     pub fn encode_key(&self, tuple: &Tuple) -> IndexKey {
-        let mut data = Vec::with_capacity(self.schema.data_len);
+        let mut data = Vec::with_capacity(self.key_size);
         for c in self.indexed_cols.iter() {
-            c.dtype.encode_from_tuple(tuple, c.offset, &mut data);
+            c.dtype
+                .encode_from_tuple(tuple, self.table_bitmap_len, c.offset, &mut data);
         }
         IndexKey(data)
     }
@@ -60,22 +70,47 @@ impl TableIndex {
     fn encode_key_from_values(&self, vals: &[Value]) -> IndexKey {
         assert_eq!(vals.len(), self.indexed_cols.len());
         let mut data = Vec::with_capacity(self.key_size);
-        for v in vals {
-            v.encode(&mut data);
+        for v in vals.iter() {
+            // Sort-friendly encoding: must match encode_from_tuple's per-type format
+            // exactly so search/scan keys line up with insert keys.
+            match v {
+                Value::BOOLEAN(b) => data.push(*b as u8),
+                Value::INT(i) => {
+                    data.extend_from_slice(&((*i as u32) ^ 0x8000_0000).to_be_bytes());
+                }
+                Value::FLOAT(f) => {
+                    data.extend_from_slice(&((f.0 as u32) ^ 0x8000_0000).to_be_bytes());
+                }
+                Value::TIMESTAMP(t) => {
+                    data.extend_from_slice(&((*t as u64) ^ 0x8000_0000_0000_0000).to_be_bytes());
+                }
+            }
         }
         IndexKey(data)
     }
 
+    fn key_has_null(&self, tuple: &Tuple) -> bool {
+        self.indexed_col_idxs
+            .iter()
+            .any(|&i| is_null(&tuple.data, i))
+    }
+
     pub fn insert(&self, tuple: &Tuple, rid: RecordId) -> InsertResult {
+        if self.key_has_null(tuple) {
+            return Ok(()); // skip inserting a null value. we could return an error instead, idk
+        }
         let key = self.encode_key(tuple);
         self.idx.insert(key, IndexValue::IndexValue(rid))
     }
     pub fn remove(&self, tuple: &Tuple) -> RemoveResult {
+        if self.key_has_null(tuple) {
+            return Ok(()); // wasn't indexed, nothing to remove
+        }
         let key = self.encode_key(tuple);
         self.idx.remove(key)
     }
 
-    /// search looks up a key (one Value per indexed column, in index-schema order) in the index.
+    /// search looks up a key in the index
     pub fn search(&self, vals: &[Value]) -> Result<Option<RecordId>, IndexError> {
         let key = self.encode_key_from_values(vals);
         match self.idx.search(&key)? {
@@ -84,7 +119,7 @@ impl TableIndex {
         }
     }
 
-    /// scans the index with start/end key bounds (one Value per indexed column, in index-schema order).
+    /// scans the index with start/end key bounds
     pub fn scan(
         &self,
         start: Bound<&[Value]>,
@@ -141,10 +176,10 @@ mod tests {
 
         // 2. create a tuple that abides to this schema
         let values = vec![
-            Value::INT(12),
-            Value::BOOLEAN(true),
-            Value::INT(13),
-            Value::INT(14),
+            Some(Value::INT(12)),
+            Some(Value::BOOLEAN(true)),
+            Some(Value::INT(13)),
+            Some(Value::INT(14)),
         ];
         let tup = schema.encode_tuple(&values).unwrap();
 
@@ -153,6 +188,7 @@ mod tests {
             schema.cols.get(0).unwrap().clone(),
             schema.cols.get(2).unwrap().clone(),
         ];
+        let index_col_idxs = vec![0, 2];
 
         let (bpm, _tmp) = make_bpm(10);
 
@@ -160,18 +196,17 @@ mod tests {
             bpm,
             "mock_index".to_string(),
             index_cols,
+            index_col_idxs,
+            schema.bitmap_len,
             IndexType::BPlusTree,
         )
         .unwrap();
-
-        // we expect each index key to be: 4 bytes + 4 bytes long
         assert_eq!(8, index.schema.data_len);
 
-        // // 3. create index keys
         let tuples = vec![tup];
         for t in tuples.iter() {
             let index_key = index.encode_key(t).0;
-            assert_eq!(8, index_key.len());
+            assert_eq!(2 * 4, index_key.len());
         }
     }
 }

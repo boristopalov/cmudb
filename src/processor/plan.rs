@@ -40,7 +40,6 @@ pub struct DeletePlanNode {
     pub table_oid: u32,
 }
 
-/// The binder should
 pub struct IndexScanPlanNode {
     pub schema: Schema,
     pub start: Bound<Vec<Value>>,
@@ -59,11 +58,94 @@ pub struct ProjectionPlanNode {
     pub child: Box<Plan>,
 }
 
+/// Example: SUM(a+b), MIN(c) GROUP BY c;
+/// group_bys would be len 1 vec![c]
+/// aggregates would be len 2 vec![(a+b, SUM), (c, MIN)]
+pub struct AggregationPlanNode {
+    pub schema: Schema,
+    pub child: Box<Plan>,
+    pub group_bys: Vec<Expression>,
+    pub aggregates: Vec<(Expression, AggType)>,
+}
+
+pub enum AggType {
+    MAX,
+    MIN,
+    SUM,
+    AVG,
+    COUNT,
+    RANK, // not an agg type but whatever
+}
+
+pub struct NestedLoopJoinPlanNode {
+    pub schema: Schema,
+    pub left: Box<Plan>,
+    pub right: Box<Plan>,
+    pub predicate: Expression,
+    pub join_type: JoinType,
+}
+
+pub enum JoinType {
+    Inner,
+    Left,
+}
+
+pub struct NestedIndexJoinPlanNode {
+    pub schema: Schema,
+    pub child: Box<Plan>,
+    pub key_predicate: Expression,
+    pub table_oid: u32,
+    pub table_schema: Schema, // the schema of the table we are joining on
+    pub index_oid: u32,
+    pub join_type: JoinType,
+}
+
+pub struct HashJoinPlanNode {
+    pub schema: Schema,
+    pub left: Box<Plan>,
+    pub right: Box<Plan>,
+    pub left_exprs: Vec<Expression>,
+    pub right_exprs: Vec<Expression>,
+    pub join_type: JoinType,
+}
+
+pub struct ExternalMergeSortPlanNode {
+    pub schema: Schema,
+    pub child: Box<Plan>,
+}
+
+/// Unlike aggregate functions, window functions are "self-contained" and don't collapse columns
+/// down to the group bys + aggregates.
+/// So we need to know which columns are present ahead of time.
+/// This is how window functions work by definition.
+/// We could not specify the columns, and stream back the window function columns,
+/// plus the child columns, and have a separate projection pull from the window function,
+/// but that would be wasteful.
+///
+/// For example:  `SELECT salary * 2, AVG(salary) OVER (PARTITION BY dept) FROM emp;`
+///
+/// Without providing columns, we would return salary directly, and a project would pull and return salary * 2.
+/// If providing columns, we can directly compute salary * 2 and skip the projection
+pub struct WindowFunctionPlanNode {
+    pub schema: Schema,
+    pub child: Box<Plan>,
+    pub order_by_exprs: Option<Vec<Expression>>,
+    pub partition_by_exprs: Option<Vec<Expression>>,
+    pub aggregates: Vec<(Expression, AggType)>,
+    pub columns: Vec<Expression>,
+}
+
+pub struct LimitPlanNode {
+    pub schema: Schema,
+    pub child: Box<Plan>,
+    pub limit: u32,
+}
+
 #[derive(Clone)]
 pub enum Expression {
-    Constant(Value),
+    Constant(Option<Value>),
     Column {
-        tuple_idx: u8, // left valiue or right value, used in joins
+        tuple_idx: u8, // 0 or 1, left valiue or right value, used in joins
         col_idx: u32,
         dtype: DataType,
     },
@@ -74,9 +156,9 @@ pub enum Expression {
     },
 }
 
-/// TODO: add nulls and return Option<Value> instead of just Value
 impl Expression {
-    pub fn evaluate(&self, tuple: &Tuple, schema: &Schema) -> Result<Value, ExecutorError> {
+    /// Evaluates am expression against a single tuple
+    pub fn evaluate(&self, tuple: &Tuple, schema: &Schema) -> Result<Option<Value>, ExecutorError> {
         match self {
             Expression::Binary { left, right, op } => {
                 let l = left.evaluate(tuple, schema)?;
@@ -84,7 +166,7 @@ impl Expression {
                 return Ok(eval_binary(op, l, r));
             }
             Expression::Column {
-                tuple_idx, // will be used for joins
+                tuple_idx,
                 col_idx,
                 dtype,
             } => {
@@ -93,48 +175,77 @@ impl Expression {
                     .get_value(tuple, c_idx)
                     .map_err(|_| ExecutorError("error when evaluating".to_string()))
             }
-            Expression::Constant(v) => {
-                return Ok(v.clone());
+            Expression::Constant(v) => Ok(v.clone()),
+        }
+    }
+
+    /// Evaluates an expression against two tuples
+    pub fn evaluate_join(
+        &self,
+        left_tuple: &Tuple,
+        left_schema: &Schema,
+        right_tuple: &Tuple,
+        right_schema: &Schema,
+    ) -> Result<Option<Value>, ExecutorError> {
+        match self {
+            Expression::Binary { left, right, op } => {
+                let l = left.evaluate_join(left_tuple, left_schema, right_tuple, right_schema)?;
+                let r = right.evaluate_join(left_tuple, left_schema, right_tuple, right_schema)?;
+                Ok(eval_binary(op, l, r))
             }
+            Expression::Column {
+                tuple_idx, col_idx, ..
+            } => {
+                let (tup, sch) = match tuple_idx {
+                    0 => (left_tuple, left_schema),
+                    1 => (right_tuple, right_schema),
+                    _ => unreachable!("tuple_idx must be 0 or 1"),
+                };
+                sch.get_value(tup, *col_idx as usize)
+                    .map_err(|_| ExecutorError("error when evaluating".to_string()))
+            }
+            Expression::Constant(v) => Ok(v.clone()),
         }
     }
 }
 
 /// Some invariants that we should take care of in the Binder:
 /// - reject different types of l and r
-fn eval_binary(op: &Op, l: Value, r: Value) -> Value {
+fn eval_binary(op: &Op, l: Option<Value>, r: Option<Value>) -> Option<Value> {
     use Value::*;
 
-    macro_rules! arith {
-        ($f:tt) => {
-            match (l, r) {
-                (INT(a), INT(b))     => INT(a $f b),
-                (FLOAT(a), FLOAT(b)) => FLOAT(a $f b),
-                _ => unreachable!("type-checked at plan time"),
-            }
-        };
-    }
-
     match op {
-        Op::Add => arith!(+),
-        Op::Sub => arith!(-),
-        Op::Mul => arith!(*),
-        Op::Div => arith!(/),
+        // arithmetic and comparison: NULL propagates
+        Op::Add => Some(l? + r?),
+        Op::Sub => Some(l? - r?),
+        Op::Mul => Some(l? * r?),
+        Op::Div => Some(l? / r?),
 
-        Op::Eq => BOOLEAN(l == r),
-        Op::NEq => BOOLEAN(l != r),
-        Op::Lt => BOOLEAN(l < r),
-        Op::Gt => BOOLEAN(l > r),
-        Op::Lte => BOOLEAN(l <= r),
-        Op::Gte => BOOLEAN(l >= r),
+        Op::Eq => Some(BOOLEAN(l? == r?)),
+        Op::NEq => Some(BOOLEAN(l? != r?)),
+        Op::Lt => Some(BOOLEAN(l? < r?)),
+        Op::Gt => Some(BOOLEAN(l? > r?)),
+        Op::Lte => Some(BOOLEAN(l? <= r?)),
+        Op::Gte => Some(BOOLEAN(l? >= r?)),
 
+        //   TRUE  AND x    = x
+        //   FALSE AND _    = FALSE
+        //   NULL  AND NULL = NULL
         Op::And => match (l, r) {
-            (BOOLEAN(a), BOOLEAN(b)) => BOOLEAN(a && b),
-            _ => unreachable!(),
+            (Some(BOOLEAN(false)), _) | (_, Some(BOOLEAN(false))) => Some(BOOLEAN(false)),
+            (Some(BOOLEAN(a)), Some(BOOLEAN(b))) => Some(BOOLEAN(a && b)),
+            (None, _) | (_, None) => None,
+            _ => unreachable!("type-checked at plan time"),
         },
+
+        //   TRUE  OR _    = TRUE
+        //   FALSE OR x    = x
+        //   NULL  OR NULL = NULL
         Op::Or => match (l, r) {
-            (BOOLEAN(a), BOOLEAN(b)) => BOOLEAN(a || b),
-            _ => unreachable!(),
+            (Some(BOOLEAN(true)), _) | (_, Some(BOOLEAN(true))) => Some(BOOLEAN(true)),
+            (Some(BOOLEAN(a)), Some(BOOLEAN(b))) => Some(BOOLEAN(a || b)),
+            (None, _) | (_, None) => None,
+            _ => unreachable!("type-checked at plan time"),
         },
 
         Op::Like | Op::In => todo!(),

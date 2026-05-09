@@ -1,12 +1,20 @@
-use crate::catalog::index_schema::{IndexKey, IndexValue, TableIndex};
+use crate::buffer_pool::BufferPoolManager;
+use crate::catalog::index_schema::{IndexKey, IndexValue};
 use crate::catalog::{Catalog, CatalogError, IndexInfo, Schema, TableInfo, Value};
 use crate::index::IndexError;
 use crate::processor::plan::{
-    DeletePlanNode, IndexScanPlanNode, InsertPlanNode, SeqScanPlanNode, UpdatePlanNode,
-    ValuesPlanNode,
+    AggType, AggregationPlanNode, DeletePlanNode, Expression, HashJoinPlanNode, IndexScanPlanNode,
+    InsertPlanNode, JoinType, LimitPlanNode, NestedIndexJoinPlanNode, NestedLoopJoinPlanNode,
+    SeqScanPlanNode, UpdatePlanNode, ValuesPlanNode, WindowFunctionPlanNode,
 };
-use crate::table_heap::{RecordId, TableHeapError, TableHeapIterator, Tuple};
+use crate::table_heap::{RecordId, TableHeap, TableHeapError, TableHeapIterator, Tuple};
+use std::cmp::Ordering;
+use std::collections::hash_map::IntoIter;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::ops::Bound;
 use std::sync::Arc;
+use std::vec::IntoIter as VecIter;
 
 #[derive(Debug)]
 pub struct ExecutorError(pub String);
@@ -34,9 +42,9 @@ impl From<IndexError> for ExecutorError {
 }
 
 /// Executors in the executor tree can be:
-/// - leaves, i.e. no children executors
-/// - unary, i.e. one child exectur
-/// - binary, i.e. two children
+/// - leaves, meaning they produce values
+/// - unary, meaning they pull from child to get values to mutate
+/// - binary (joins)
 /// in many cases, close() doesn't do anything; the executor simply going out of scope is enough for rust to clean things up for us
 /// the next() method returns only 1 tuple at a time, with no batching, for simplicity.
 pub trait Executor {
@@ -181,10 +189,10 @@ impl<'a> Executor for ValuesExecutor<'a> {
         // exprs represents a single tuple
         // each expr repsents the value in that particular column in the tuple at exprs.index_of(expr)
         let dummy = Tuple { data: vec![] };
-        let vals: Vec<Value> = exprs
+        let vals: Vec<Option<Value>> = exprs
             .iter()
             .map(|e| e.evaluate(&dummy, self.schema()))
-            .collect::<Result<Vec<Value>, ExecutorError>>()?;
+            .collect::<Result<Vec<Option<Value>>, ExecutorError>>()?;
 
         let tuple = self.schema().encode_tuple(&vals)?;
         self.cursor += 1;
@@ -233,7 +241,7 @@ impl<'a> Executor for UpdateExecutor<'a> {
         // so we need to update the values in those columns, and keep the values of the old columns,
         // and then return the updated tuple
         // First, populate new_values with the old values
-        let mut new_values: Vec<Value> = Vec::with_capacity(self.schema().cols.len());
+        let mut new_values: Vec<Option<Value>> = Vec::with_capacity(self.schema().cols.len());
         for i in 0..self.schema().cols.len() {
             new_values.push(self.schema().get_value(&tuple_to_update, i)?);
         }
@@ -316,6 +324,8 @@ pub struct IndexScanExecutor<'a> {
 impl<'a> Executor for IndexScanExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
         let info = self.ctx.catalog.get_index(self.plan.index_oid)?;
+
+        // for now we don't support NULLS when scanning indexes
         let iter = info.as_ref().index.scan(
             self.plan.start.as_ref().map(Vec::as_slice),
             self.plan.end.as_ref().map(Vec::as_slice),
@@ -329,7 +339,7 @@ impl<'a> Executor for IndexScanExecutor<'a> {
     }
     fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
         let iter = self.iter.as_mut().ok_or_else(|| {
-            ExecutorError("ndexScanExecutor::next called before open".to_string())
+            ExecutorError("IndexScanExecutor::next called before open".to_string())
         })?;
         let table = self.table.as_ref().ok_or_else(|| {
             ExecutorError("IndexScanExecutor::next called before open".to_string())
@@ -351,4 +361,819 @@ impl<'a> Executor for IndexScanExecutor<'a> {
     fn close(&mut self) -> Result<(), ExecutorError> {
         Ok(())
     }
+}
+
+pub struct AggregationExecutor<'a> {
+    plan: &'a AggregationPlanNode,
+    child: Box<dyn Executor + 'a>,
+    iter: Option<IntoIter<ExprKey, AggVal>>,
+}
+
+impl<'a> Executor for AggregationExecutor<'a> {
+    fn open(&mut self) -> Result<(), ExecutorError> {
+        let mut agg_hash_table: HashMap<ExprKey, AggVal> = HashMap::new();
+
+        // populate the hash table
+        // this executor is a pipeline breaker, meaning we need to
+        // drain the child completely before we do any work
+        while let Some((tuple, _)) = self.child.next()? {
+            let schema = self.schema();
+            let groups: Vec<Option<Value>> = self
+                .plan
+                .group_bys
+                .iter()
+                .map(|expr| expr.evaluate(&tuple, schema).ok()?)
+                .collect();
+            let hashkey = ExprKey(groups);
+
+            // get the entry, if it exists
+            // otherwise, round up all of the aggregates to get a default
+            let entry = agg_hash_table.entry(hashkey).or_insert_with(|| {
+                AggVal(
+                    self.plan
+                        .aggregates
+                        .iter()
+                        .map(|(_, agg_type)| AggState::new(agg_type))
+                        .collect(),
+                )
+            });
+
+            // compute the updated value by, once again, iterating through the aggregates,
+            // this time evaluating the actual expressions
+            for (state, (expr, _)) in entry.0.iter_mut().zip(self.plan.aggregates.iter()) {
+                let v = expr.evaluate(&tuple, schema)?;
+                state.update(v);
+            }
+        }
+        self.iter = Some(agg_hash_table.into_iter());
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+        // here, next iterates through the hash table
+        // each entry in the hash table corresponds to one tuple that we return to our parent
+        let Some(iter) = self.iter.as_mut() else {
+            return Err(ExecutorError(
+                "AggregationExecutor::next called before open".to_string(),
+            ));
+        };
+
+        let Some((key, val)) = iter.next() else {
+            return Ok(None);
+        };
+
+        // ok so now we need to zip up key+val into a tuple
+        // output tuple has columns for each group by + column for each aggregate
+        let mut out: Vec<Option<Value>> = Vec::with_capacity(key.0.len() + val.0.len());
+        out.extend(key.0);
+        for v in val.0 {
+            out.push(v.consume());
+        }
+
+        let tuple = self.schema().encode_tuple(&out)?;
+        Ok(Some((tuple, RecordId::RESERVED)))
+    }
+
+    fn close(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.plan.schema
+    }
+}
+
+#[derive(Eq, PartialEq, Hash)]
+struct ExprKey(Vec<Option<Value>>);
+
+struct AggVal(Vec<AggState>);
+
+enum AggState {
+    Max(Option<Value>),
+    Min(Option<Value>),
+    Sum(Option<Value>),
+    Avg { sum: Option<Value>, count: i32 },
+    Count(i32),
+    Rank(i32), // not an aggregate but whatever
+}
+
+impl AggState {
+    fn new(agg_type: &AggType) -> Self {
+        match agg_type {
+            AggType::AVG => Self::Avg {
+                sum: None,
+                count: 0,
+            },
+            AggType::MAX => Self::Max(None),
+            AggType::MIN => Self::Min(None),
+            AggType::SUM => Self::Sum(None),
+            AggType::COUNT => Self::Count(0),
+            AggType::RANK => Self::Rank(1),
+        }
+    }
+
+    fn update_rank(&mut self, order_changed: bool, pos: i32) {
+        match self {
+            Self::Rank(r) => {
+                if order_changed {
+                    *r = pos;
+                }
+            }
+            _ => unreachable!("use update() instead"),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Sum(current) => {
+                *current = None;
+            }
+            Self::Avg { sum, count } => {
+                *sum = None;
+                *count = 0;
+            }
+            Self::Max(current) => {
+                *current = None;
+            }
+            Self::Min(current) => {
+                *current = None;
+            }
+            Self::Count(c) => {
+                *c = 0;
+            }
+            Self::Rank(_) => unreachable!("use update_rank() instead"),
+        }
+    }
+
+    fn update(&mut self, v: Option<Value>) {
+        if let Self::Count(count) = self {
+            *count += 1;
+            return;
+        }
+
+        // skip nulls
+        let Some(v) = v else { return };
+
+        match self {
+            Self::Sum(current) => {
+                *current = Some(current.take().map_or(v, |c| c + v));
+            }
+            Self::Avg { sum, count } => {
+                *sum = Some(sum.take().map_or(v, |s| s + v));
+                *count += 1;
+            }
+            Self::Max(current) => {
+                *current = Some(current.take().map_or(v, |c| c.max(v)));
+            }
+            Self::Min(current) => {
+                *current = Some(current.take().map_or(v, |c| c.min(v)));
+            }
+            Self::Count(_) => unreachable!("blah"),
+            Self::Rank(_) => unreachable!("use update_rank() instead"),
+        }
+    }
+
+    fn consume(self) -> Option<Value> {
+        match self {
+            Self::Sum(v) | Self::Max(v) | Self::Min(v) => v,
+            Self::Count(c) => Some(Value::INT(c)),
+            Self::Avg { sum, count } => {
+                if count == 0 {
+                    None
+                } else {
+                    sum.map(|s| s / Value::INT(count))
+                }
+            }
+            Self::Rank(r) => Some(Value::INT(r)),
+        }
+    }
+
+    fn peek(&self) -> Option<Value> {
+        match self {
+            Self::Sum(v) | Self::Max(v) | Self::Min(v) => v.clone(),
+            Self::Count(c) => Some(Value::INT(*c)),
+            Self::Avg { sum, count } => {
+                if *count == 0 {
+                    None
+                } else {
+                    sum.clone().map(|s| s / Value::INT(*count))
+                }
+            }
+            Self::Rank(r) => Some(Value::INT(*r)),
+        }
+    }
+}
+
+pub struct NestedLoopJoinExecutor<'a> {
+    plan: &'a NestedLoopJoinPlanNode,
+    left: Box<dyn Executor>,
+    right: Box<dyn Executor>,
+
+    right_tuples: Vec<Tuple>,
+
+    right_cursor: usize,
+    curr_left: Option<Tuple>,
+    left_matched: bool,
+}
+
+impl<'a> Executor for NestedLoopJoinExecutor<'a> {
+    fn open(&mut self) -> Result<(), ExecutorError> {
+        while let Some((tup, _)) = self.right.next()? {
+            self.right_tuples.push(tup);
+        }
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+        loop {
+            if self.curr_left.is_none() {
+                let Some((lt, _)) = self.left.next()? else {
+                    return Ok(None);
+                };
+                self.curr_left = Some(lt);
+
+                // reset state
+                // reset back to 0 so we can iterate through right tuples again
+                self.right_cursor = 0;
+                self.left_matched = false;
+            };
+
+            let lt = self.curr_left.as_ref().unwrap();
+
+            while self.right_cursor < self.right_tuples.len() {
+                let rt = &self.right_tuples[self.right_cursor];
+                self.right_cursor += 1;
+                let val = self.plan.predicate.evaluate_join(
+                    &lt,
+                    self.left.schema(),
+                    &rt,
+                    self.right.schema(),
+                )?;
+
+                // predicate must always evaluate to a boolean
+                if matches!(val, Some(Value::BOOLEAN(true))) {
+                    self.left_matched = true;
+                    // build the combined tuple
+                    let mut combined: Vec<Option<Value>> = Vec::with_capacity(
+                        self.left.schema().cols.len() + self.right.schema().cols.len(),
+                    );
+
+                    for i in 0..self.left.schema().cols.len() {
+                        combined.push(self.left.schema().get_value(&lt, i)?);
+                    }
+                    for i in 0..self.right.schema().cols.len() {
+                        combined.push(self.right.schema().get_value(&rt, i)?);
+                    }
+
+                    let out = self.schema().encode_tuple(&combined)?;
+                    return Ok(Some((out, RecordId::RESERVED)));
+                }
+            }
+
+            // if this is a left outer join, and there is no match,
+            // we still need to make sure to return the left tuple.
+            // since there is no match we just populate the "right" tuple with None's
+            if matches!(self.plan.join_type, JoinType::Left) && !self.left_matched {
+                let lt = self.curr_left.as_ref().unwrap();
+                let mut combined = Vec::with_capacity(
+                    self.left.schema().cols.len() + self.right.schema().cols.len(),
+                );
+                for i in 0..self.left.schema().cols.len() {
+                    combined.push(self.left.schema().get_value(lt, i)?);
+                }
+                for _ in 0..self.right.schema().cols.len() {
+                    combined.push(None);
+                }
+                let out = self.schema().encode_tuple(&combined)?;
+                self.curr_left = None;
+                return Ok(Some((out, RecordId::RESERVED)));
+            }
+            self.curr_left = None;
+        }
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.plan.schema
+    }
+
+    fn close(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
+pub struct NestedIndexJoinExecutor<'a> {
+    ctx: &'a ExecutorContext<'a>,
+    plan: &'a NestedIndexJoinPlanNode,
+    child: Box<dyn Executor>,
+    inner_table: Option<Arc<TableInfo>>,
+
+    index: Option<Arc<IndexInfo>>,
+    // since duplicate keys can be inserted into the index, instead of doing index.search(),
+    // we need to do index.scan(), using the same value as both the lower and upper bounds, so that
+    // we can scan for all index keys that are equal to the given key, instead of returning the first match like search()
+    index_iter: Option<Box<dyn Iterator<Item = Result<(IndexKey, IndexValue), IndexError>>>>,
+    curr_left: Option<Tuple>,
+    left_matched: bool,
+}
+
+impl<'a> Executor for NestedIndexJoinExecutor<'a> {
+    fn open(&mut self) -> Result<(), ExecutorError> {
+        let info = self.ctx.catalog.get_index(self.plan.index_oid)?;
+        self.index = Some(info);
+
+        let table = self.ctx.catalog.get_table(self.plan.table_oid)?;
+        self.inner_table = Some(table);
+        Ok(())
+    }
+    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+        let Some(index) = self.index.as_ref() else {
+            return Err(ExecutorError(
+                "NestedIndexJoinExecutor::next called before open".to_string(),
+            ));
+        };
+
+        let Some(table) = self.inner_table.as_ref() else {
+            return Err(ExecutorError(
+                "NestedIndexJoinExecutor::next called before open".to_string(),
+            ));
+        };
+
+        loop {
+            // very similar to NestedLoopJoinExecutor
+            // basically we keep some state on the executor,
+            // in this case an index iterator, that we use across next() calls.
+            // we also track the current outer (left) key, to account for the scenario
+            // where that key has multiple matches inside the index.
+            if self.curr_left.is_none() {
+                let Some((outer, _)) = self.child.next()? else {
+                    return Ok(None);
+                };
+                let key = self
+                    .plan
+                    .key_predicate
+                    .evaluate(&outer, self.child.schema())?;
+                self.index_iter = match key {
+                    Some(v) => {
+                        let probe = [v];
+                        Some(
+                            index
+                                .index
+                                .scan(Bound::Included(&probe[..]), Bound::Included(&probe[..]))?,
+                        )
+                    }
+                    None => None,
+                };
+                self.curr_left = Some(outer);
+                self.left_matched = false;
+            }
+
+            // try to pull the next inner match for the current outer tuple
+            if let Some(iter) = self.index_iter.as_mut() {
+                if let Some(entry) = iter.next() {
+                    let (_, IndexValue::IndexValue(rid)) = entry?;
+                    let (_, inner_tuple) = table.heap.get(rid)?;
+                    let outer = self.curr_left.as_ref().unwrap();
+
+                    let mut combined: Vec<Option<Value>> = Vec::with_capacity(
+                        self.child.schema().cols.len() + table.schema.cols.len(),
+                    );
+                    for i in 0..self.child.schema().cols.len() {
+                        combined.push(self.child.schema().get_value(outer, i)?);
+                    }
+                    for i in 0..table.schema.cols.len() {
+                        combined.push(table.schema.get_value(&inner_tuple, i)?);
+                    }
+                    let out = self.schema().encode_tuple(&combined)?;
+                    self.left_matched = true;
+                    return Ok(Some((out, RecordId::RESERVED)));
+                }
+            }
+
+            if matches!(self.plan.join_type, JoinType::Left) && !self.left_matched {
+                let outer = self.curr_left.as_ref().unwrap();
+                let mut combined: Vec<Option<Value>> =
+                    Vec::with_capacity(self.child.schema().cols.len() + table.schema.cols.len());
+                for i in 0..self.child.schema().cols.len() {
+                    combined.push(self.child.schema().get_value(outer, i)?);
+                }
+                for _ in 0..table.schema.cols.len() {
+                    combined.push(None);
+                }
+                let out = self.schema().encode_tuple(&combined)?;
+                self.curr_left = None;
+                self.index_iter = None;
+                return Ok(Some((out, RecordId::RESERVED)));
+            }
+
+            self.curr_left = None;
+            self.index_iter = None;
+        }
+    }
+    fn schema(&self) -> &Schema {
+        &self.plan.schema
+    }
+    fn close(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
+pub struct HashJoinExecutor<'a> {
+    plan: &'a HashJoinPlanNode,
+    left: Box<dyn Executor>,
+    right: Box<dyn Executor>,
+    bpm: Arc<BufferPoolManager>,
+    left_partitions: Vec<TableHeap>,
+    right_partitions: Vec<TableHeap>,
+
+    right_partition_iter: Option<TableHeapIterator>,
+    // we store the hashed tuples, as well as a boolean flag to indicate if the tuple matched with a right tuple
+    // at the end of the join, for any tuples that didn't have a match, we emit them
+    // we store this in the hash table, because the left tuples are only accessible when we build the left hash table
+    // when there is no match, there is no left tuple, so it's not like other joins where we keep track of the current left
+    // tuple and emit it.
+    left_hash_table: Option<HashMap<ExprKey, Vec<(Tuple, bool)>>>,
+    partition_cursor: usize,
+    matches_buffer: VecDeque<Tuple>,
+}
+
+impl<'a> Executor for HashJoinExecutor<'a> {
+    fn open(&mut self) -> Result<(), ExecutorError> {
+        // here we populate the partition pages
+        // in a real database we would have statistics on each table,
+        // and would accordingly create N partitions based on those stats,
+        // as well as based on a memory budget that we assign to the join.
+        // in this case we just pick a constant 64 for N.
+        // according to claude it's normal for a single hash join to take 10s or 100s of MB,
+        // or even 1GB. For us: let's assume a memory budget of 10000 pages per partition. we won't
+        // hold the database to this number, we will just assume it works.
+        // that means we assume each indiv. partition will take up to 40mb (4kb * 10000 pages),
+        // so the max size of the input must be 64 * 4kb * 10000 = 2.56gb.
+        // The input could be a full table, or some filtered output from another child.
+        // which is several million rows for a table with ~15 cols with various dtypes.
+        // in our databse it would be even more rows because we only support a few basic data types.
+        let n = 64;
+        for _ in 0..n {
+            let lh = TableHeap::new(self.bpm.clone())?;
+            self.left_partitions.push(lh);
+
+            let rh = TableHeap::new(self.bpm.clone())?;
+            self.right_partitions.push(rh);
+        }
+
+        while let Some((lt, _)) = self.left.next()? {
+            let key: Vec<Option<Value>> = self
+                .plan
+                .left_exprs
+                .iter()
+                .map(|e| e.evaluate(&lt, self.left.schema()))
+                .collect::<Result<_, _>>()?;
+
+            let slot = hash_key(key.as_ref()) % n;
+            self.left_partitions[slot as usize].insert(&lt)?;
+        }
+
+        while let Some((rt, _)) = self.right.next()? {
+            let key: Vec<Option<Value>> = self
+                .plan
+                .right_exprs
+                .iter()
+                .map(|e| e.evaluate(&rt, self.right.schema()))
+                .collect::<Result<_, _>>()?;
+
+            let slot = hash_key(key.as_ref()) % n;
+            self.right_partitions[slot as usize].insert(&rt)?;
+        }
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+        // now that we have partitioned our data, we need ot join it together,
+        // one partition at a time. Like in our other joins, we need to be careful
+        // to keep track of where we are in each partition
+        // at this point we have built our hash table using the left partition's keys
+        // now we can iterate over the right partition and check for any matches
+        loop {
+            if let Some(out) = self.matches_buffer.pop_back() {
+                return Ok(Some((out, RecordId::RESERVED)));
+            };
+
+            if self.partition_cursor >= self.left_partitions.len() {
+                return Ok(None);
+            };
+
+            if self.left_hash_table.is_none() {
+                // we need to build the hash table for this partition
+                // to do so we iterate through whatever partition we are on,
+                // and build using the left partition
+                let p = &self.left_partitions[self.partition_cursor];
+                let mut new_table: HashMap<ExprKey, Vec<(Tuple, bool)>> = HashMap::new();
+                for item in p.iter() {
+                    let (tup, _) = item?;
+                    let key: ExprKey = ExprKey(
+                        self.plan
+                            .left_exprs
+                            .iter()
+                            .map(|e| e.evaluate(&tup, self.left.schema()))
+                            .collect::<Result<_, _>>()?,
+                    );
+                    new_table.entry(key).or_default().push((tup, false));
+                }
+                self.left_hash_table = Some(new_table);
+            }
+
+            if self.right_partition_iter.is_none() {
+                self.right_partition_iter =
+                    Some(self.right_partitions[self.partition_cursor].iter());
+            }
+            let iter = self.right_partition_iter.as_mut().unwrap();
+            let Some(item) = iter.next() else {
+                // we are done with this partition,
+                // move on to the next partition
+                // for a left join, we need to make sure to emit the unmatched left tuples
+                if matches!(self.plan.join_type, JoinType::Left) {
+                    for entries in self.left_hash_table.as_ref().unwrap().values() {
+                        for (lt, matched) in entries {
+                            if !matched {
+                                let mut combined: Vec<Option<Value>> = Vec::with_capacity(
+                                    self.left.schema().cols.len() + self.right.schema().cols.len(),
+                                );
+                                for i in 0..self.left.schema().cols.len() {
+                                    combined.push(self.left.schema().get_value(&lt, i)?);
+                                }
+                                for _ in 0..self.right.schema().cols.len() {
+                                    combined.push(None);
+                                }
+                                let out = self.schema().encode_tuple(&combined)?;
+                                self.matches_buffer.push_back(out);
+                            }
+                        }
+                    }
+                }
+                self.right_partition_iter = None;
+                self.partition_cursor += 1;
+                self.left_hash_table = None;
+                continue;
+            };
+
+            let (rt, _) = item?;
+            let key: ExprKey = ExprKey(
+                self.plan
+                    .right_exprs
+                    .iter()
+                    .map(|e| e.evaluate(&rt, self.right.schema()))
+                    .collect::<Result<_, _>>()?,
+            );
+
+            // probe the hash table for this key
+            let tuple_matches = self.left_hash_table.as_mut().unwrap().get_mut(&key);
+            if tuple_matches.is_some() {
+                // we have a match, we need to yield the combined tuples
+                // we need to yield them one by one so we store them in a buffer
+                let tuples_to_yield = tuple_matches.unwrap();
+
+                for entry in tuples_to_yield {
+                    // mark the tuple as matched
+                    entry.1 = true;
+                    let mut combined: Vec<Option<Value>> = Vec::with_capacity(
+                        self.left.schema().cols.len() + self.right.schema().cols.len(),
+                    );
+                    for i in 0..self.left.schema().cols.len() {
+                        combined.push(self.left.schema().get_value(&entry.0, i)?);
+                    }
+                    for i in 0..self.right.schema().cols.len() {
+                        combined.push(self.right.schema().get_value(&rt, i)?);
+                    }
+
+                    // borrow checker does not like self.schema() because we already borrow self as mutable,
+                    // due to self.left_hash_table.as_mut() call.
+                    // self.plan.schema works because rust sees the self.plan is a different field than self.left_hash_table,
+                    // while self.schema() borrows the whole self as immutable
+                    let out = self.plan.schema.encode_tuple(&combined)?;
+                    self.matches_buffer.push_back(out);
+                }
+                continue;
+            }
+        }
+    }
+
+    /// TODO: delete the pages allocated for the partitions
+    /// see tasks/delete_page.md for claude plan
+    fn close(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+    fn schema(&self) -> &Schema {
+        &self.plan.schema
+    }
+}
+
+pub struct LimitExecutor<'a> {
+    plan: &'a LimitPlanNode,
+    child: Box<dyn Executor>,
+    count: u32,
+}
+
+impl<'a> Executor for LimitExecutor<'a> {
+    fn open(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+        let Some((tup, rid)) = self.child.next()? else {
+            return Ok(None);
+        };
+        if self.count >= self.plan.limit {
+            return Ok(None);
+        };
+        self.count += 1;
+        Ok(Some((tup, rid)))
+    }
+    fn close(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+    fn schema(&self) -> &Schema {
+        &self.plan.schema
+    }
+}
+
+pub struct WindowFunctionExecutor<'a> {
+    plan: &'a WindowFunctionPlanNode,
+    child: Box<dyn Executor>,
+    iter: Option<VecIter<Tuple>>,
+}
+
+impl<'a> Executor for WindowFunctionExecutor<'a> {
+    fn open(&mut self) -> Result<(), ExecutorError> {
+        // another pipeline breaker
+        // we start by draining the child and sorting the tuples
+        // sort is based on both the partition expressions and order by expressions
+        // if no partition expressions are provided,
+        // it's just a single partition with all the tuples
+        // need to make sure to sort first
+        let mut tups: Vec<Tuple> = vec![];
+        while let Some((t, _)) = self.child.next()? {
+            tups.push(t);
+        }
+
+        let child_schema = self.child.schema();
+        let partition_by_exprs = self.plan.partition_by_exprs.iter().flatten();
+        let order_by_exprs = self.plan.order_by_exprs.iter().flatten();
+        let sort_exprs: Vec<&Expression> = partition_by_exprs.chain(order_by_exprs).collect();
+
+        // sort by the both the order by exprs and the partition exprs
+        // pretty sure this will work...
+        tups.sort_by(|a, b| {
+            for expr in &sort_exprs {
+                let va = expr.evaluate(a, child_schema).ok().flatten();
+                let vb = expr.evaluate(b, child_schema).ok().flatten();
+                match va.cmp(&vb) {
+                    Ordering::Equal => continue,
+                    ord => return ord,
+                }
+            }
+            return Ordering::Equal;
+        });
+
+        // keeps track of all the aggregate outputs for each partition
+        let mut partition_aggregates: Vec<AggState> = self
+            .plan
+            .aggregates
+            .iter()
+            .map(|agg| AggState::new(&agg.1))
+            .collect();
+
+        // keep track of the tuples in this partition
+        let mut partition_buffer: Vec<Tuple> = Vec::new();
+
+        // full output tuples to emit
+        let mut output_tuples: Vec<Tuple> = Vec::with_capacity(tups.len());
+
+        let mut curr_rank = 1;
+        let mut row_num = 1;
+        let mut prev_partition_key: Option<ExprKey> = None;
+        let mut prev_order_key: Option<ExprKey> = None;
+
+        // now that we've sorted tuples we can do all of our calculations here
+        for t in tups.iter() {
+            let curr_partition_key: ExprKey = ExprKey(
+                self.plan
+                    .partition_by_exprs
+                    .iter()
+                    .flatten()
+                    .map(|e| e.evaluate(&t, self.child.schema()))
+                    .collect::<Result<_, _>>()?,
+            );
+            let new_partition = match &prev_partition_key {
+                Some(prev) => curr_partition_key != *prev,
+                None => true,
+            };
+
+            let curr_order_key: ExprKey = ExprKey(
+                self.plan
+                    .order_by_exprs
+                    .iter()
+                    .flatten()
+                    .map(|e| e.evaluate(&t, self.child.schema()))
+                    .collect::<Result<_, _>>()?,
+            );
+            let new_order = match &prev_order_key {
+                Some(prev) => curr_order_key != *prev,
+                None => true,
+            };
+
+            if new_order {
+                curr_rank = row_num;
+            }
+
+            if new_partition {
+                // take all of the tuples in this partition, take all of the aggregates for this partition, zip them up into tuples,
+                // then reset the aggregates for the next partition
+                for t in partition_buffer.drain(0..) {
+                    let mut combined: Vec<Option<Value>> =
+                        Vec::with_capacity(self.schema().cols.len());
+                    for i in 0..self.child.schema().cols.len() {
+                        combined.push(self.child.schema().get_value(&t, i)?);
+                    }
+                    for agg in &partition_aggregates {
+                        combined.push(agg.peek());
+                    }
+
+                    let out = self.schema().encode_tuple(&combined)?;
+                    output_tuples.push(out);
+                }
+
+                // reset aggregates
+                for (i, (_, agg_type)) in self.plan.aggregates.iter().enumerate() {
+                    let state = &mut partition_aggregates[i];
+                    match agg_type {
+                        AggType::RANK => {
+                            state.update_rank(new_order, curr_rank);
+                        }
+                        _ => state.reset(),
+                    }
+                }
+            }
+            // update aggregates
+            for (i, (agg, agg_type)) in self.plan.aggregates.iter().enumerate() {
+                let state = &mut partition_aggregates[i];
+                match agg_type {
+                    AggType::RANK => {
+                        state.update_rank(new_order, curr_rank);
+                    }
+                    _ => {
+                        let agg = agg.evaluate(&t, self.child.schema())?;
+                        state.update(agg);
+                    }
+                }
+            }
+
+            partition_buffer.push(t.clone());
+
+            row_num += 1;
+            prev_partition_key = Some(curr_partition_key);
+            prev_order_key = Some(curr_order_key);
+        }
+
+        // we need to make sure to push the final partition buffer here
+        for t in partition_buffer.drain(0..) {
+            let mut combined: Vec<Option<Value>> = Vec::with_capacity(self.schema().cols.len());
+            for i in 0..self.child.schema().cols.len() {
+                combined.push(self.child.schema().get_value(&t, i)?);
+            }
+            for agg in &partition_aggregates {
+                combined.push(agg.peek());
+            }
+
+            let out = self.schema().encode_tuple(&combined)?;
+            output_tuples.push(out);
+        }
+
+        self.iter = Some(output_tuples.into_iter());
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+        let Some(iter) = self.iter.as_mut() else {
+            return Err(ExecutorError(
+                "WindowFunctionExecutor::next called before open".to_string(),
+            ));
+        };
+
+        let Some(tup) = iter.next() else {
+            return Ok(None);
+        };
+
+        Ok(Some((tup, RecordId::RESERVED)))
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.plan.schema
+    }
+    fn close(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
+fn hash_key(key: &[Option<Value>]) -> u64 {
+    let mut h = DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
 }

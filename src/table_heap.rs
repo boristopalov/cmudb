@@ -138,10 +138,11 @@ pub struct Tuple {
 
 pub struct TableHeap {
     bpm: Arc<BufferPoolManager>,
-    first_page_id: usize, // the page where the table starts
-    last_page_id: usize,  // the page where we insert new tuples into
+    pub first_page_id: usize, // the page where the table starts
+    pub last_page_id: usize,  // the page where we insert new tuples into
 }
 
+/// TableHeapIterator streams back tuples of (Tuple, RecordId) from the table heap.
 /// separating this from the table heap avoid lifetime issues. Not sure if it's the right call.
 pub struct TableHeapIterator {
     bpm: Arc<BufferPoolManager>,

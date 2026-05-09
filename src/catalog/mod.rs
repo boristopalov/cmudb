@@ -111,21 +111,28 @@ impl Catalog {
         col_names: &[&str],
         index_type: IndexType,
     ) -> Result<u32, CatalogError> {
-        let (table_name, indexed_cols) = {
+        let (table_name, indexed_cols, indexed_col_idxs, table_bitmap_len) = {
             let tinfo = self
                 .tables
                 .get(&table_oid)
                 .ok_or(CatalogError::TableDoesNotExist)?;
 
             let mut indexed_cols = Vec::with_capacity(col_names.len());
+            let mut indexed_col_idxs = Vec::with_capacity(col_names.len());
             for cname in col_names {
                 let idx = tinfo
                     .schema
                     .col_idx(cname)
                     .ok_or(CatalogError::ColumnNotFound)?;
                 indexed_cols.push(tinfo.schema.cols[idx].clone());
+                indexed_col_idxs.push(idx);
             }
-            (tinfo.name.clone(), indexed_cols)
+            (
+                tinfo.name.clone(),
+                indexed_cols,
+                indexed_col_idxs,
+                tinfo.schema.bitmap_len,
+            )
         };
 
         if let Some(table_indexes) = self.index_names.get(&table_name) {
@@ -134,9 +141,15 @@ impl Catalog {
             }
         }
 
-        let index = TableIndex::new(bpm, name.clone(), indexed_cols, index_type).map_err(|_| {
-            CatalogError::IndexCreationError(("failed to create index").to_string())
-        })?;
+        let index = TableIndex::new(
+            bpm,
+            name.clone(),
+            indexed_cols,
+            indexed_col_idxs,
+            table_bitmap_len,
+            index_type,
+        )
+        .map_err(|_| CatalogError::IndexCreationError(("failed to create index").to_string()))?;
         let oid = self.next_index_oid();
         let info = IndexInfo {
             name: name.clone(),
@@ -189,16 +202,18 @@ impl Catalog {
 #[derive(Debug)]
 pub struct Schema {
     pub cols: Vec<Column>,
-    pub data_len: usize,
+    pub data_len: usize, // payload size only (sum of column sizes); does not include the bitmap prefix
+    pub bitmap_len: usize, // bytes of null bitmap that prefix every encoded tuple
 }
 
 impl Schema {
     pub fn new(columns: Vec<(DataType, String)>) -> Self {
+        let bitmap_len = (columns.len() + 7) / 8;
         let mut offset: usize = 0;
         let cols: Vec<Column> = columns
             .into_iter()
             .map(|(dtype, name)| {
-                let inlined = dtype.clone().inline();
+                let inlined = dtype.inline();
                 let col = Column {
                     name,
                     dtype,
@@ -212,27 +227,45 @@ impl Schema {
         Schema {
             cols,
             data_len: offset,
+            bitmap_len,
         }
     }
 
-    /// Returns a value given a tuple and a column index
-    pub fn get_value(&self, tuple: &Tuple, col_idx: usize) -> Result<Value, CatalogError> {
+    /// Returns a value given a tuple and a column index. `Ok(None)` means the
+    /// slot is null per the tuple's bitmap.
+    pub fn get_value(&self, tuple: &Tuple, col_idx: usize) -> Result<Option<Value>, CatalogError> {
         let col = self
             .cols
             .get(col_idx)
             .ok_or(CatalogError::ColumnOutOfBounds)?;
-        let end = col.offset + col.dtype.size();
-        let bytes = &tuple.data[col.offset..end];
-        Ok(Value::decode(bytes, &col.dtype))
+        if is_null(&tuple.data, col_idx) {
+            return Ok(None);
+        }
+        let start = self.bitmap_len + col.offset;
+        let end = start + col.dtype.size();
+        let bytes = &tuple.data[start..end];
+        Ok(Some(Value::decode(bytes, &col.dtype)))
     }
 
-    pub fn encode_tuple(&self, values: &[Value]) -> Result<Tuple, CatalogError> {
-        let mut data = Vec::with_capacity(self.data_len);
-        for (col, val) in self.cols.iter().zip(values) {
-            if val.data_type() != col.dtype {
-                return Err(CatalogError::TupleSchemaMismatch);
+    pub fn encode_tuple(&self, values: &[Option<Value>]) -> Result<Tuple, CatalogError> {
+        if values.len() != self.cols.len() {
+            return Err(CatalogError::TupleSchemaMismatch);
+        }
+        let mut data = vec![0u8; self.bitmap_len];
+        data.reserve(self.data_len);
+        for (i, (col, val)) in self.cols.iter().zip(values).enumerate() {
+            match val {
+                Some(v) => {
+                    if v.data_type() != col.dtype {
+                        return Err(CatalogError::TupleSchemaMismatch);
+                    }
+                    v.encode(&mut data);
+                }
+                None => {
+                    data[i / 8] |= 1 << (i % 8);
+                    data.resize(data.len() + col.dtype.size(), 0);
+                }
             }
-            val.encode(&mut data);
         }
         Ok(Tuple { data })
     }
@@ -242,18 +275,23 @@ impl Schema {
     }
 }
 
+/// Reads the null bit for `col_idx` from a tuple's bitmap prefix.
+pub fn is_null(data: &[u8], col_idx: usize) -> bool {
+    (data[col_idx / 8] >> (col_idx % 8)) & 1 == 1
+}
+
 #[derive(Debug, Clone)]
 pub struct Column {
     name: String,
     dtype: DataType,
-    offset: usize, // offset, used to index into this column from the beginning of a tuple
+    offset: usize, // offset into the payload region (after the bitmap prefix)
     inlined: bool, // whether the data is inlined (true for fixed-width data, false for variable-length)
 }
 
 /// Defines the value types we support.
 /// Note: FLOAT uses the OrderedFloat struct from the ordered-float crate.
 /// NaN is treated as greater than all other values, and equal to itself.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash)]
 pub enum Value {
     BOOLEAN(bool),
     INT(i32),
@@ -261,6 +299,7 @@ pub enum Value {
     TIMESTAMP(i64),
     // ENUM // assume static, i.e. can't add a member after creating
     // VARCHAR
+    // BIGINT
     // VECTOR
 }
 
@@ -294,6 +333,54 @@ impl Value {
     }
 }
 
+impl std::ops::Add for Value {
+    type Output = Value;
+    fn add(self, rhs: Value) -> Value {
+        use Value::*;
+        match (self, rhs) {
+            (INT(a), INT(b)) => INT(a + b),
+            (FLOAT(a), FLOAT(b)) => FLOAT(a + b),
+            _ => unreachable!("type-checked at plan time"),
+        }
+    }
+}
+
+impl std::ops::Sub for Value {
+    type Output = Value;
+    fn sub(self, rhs: Value) -> Value {
+        use Value::*;
+        match (self, rhs) {
+            (INT(a), INT(b)) => INT(a - b),
+            (FLOAT(a), FLOAT(b)) => FLOAT(a - b),
+            _ => unreachable!("type-checked at plan time"),
+        }
+    }
+}
+
+impl std::ops::Mul for Value {
+    type Output = Value;
+    fn mul(self, rhs: Value) -> Value {
+        use Value::*;
+        match (self, rhs) {
+            (INT(a), INT(b)) => INT(a * b),
+            (FLOAT(a), FLOAT(b)) => FLOAT(a * b),
+            _ => unreachable!("type-checked at plan time"),
+        }
+    }
+}
+
+impl std::ops::Div for Value {
+    type Output = Value;
+    fn div(self, rhs: Value) -> Value {
+        use Value::*;
+        match (self, rhs) {
+            (INT(a), INT(b)) => INT(a / b),
+            (FLOAT(a), FLOAT(b)) => FLOAT(a / b),
+            _ => unreachable!("type-checked at plan time"),
+        }
+    }
+}
+
 /// Metadata for a table schema
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
@@ -301,8 +388,6 @@ pub enum DataType {
     INT,   // signed, 32 bit
     FLOAT, // 32 bit floating point
     TIMESTAMP, // assume UTC
-
-           // not inline
            // ENUM,
            // VARCHAR(usize),
            // VECTOR(usize),
@@ -310,25 +395,32 @@ pub enum DataType {
 
 // TODO: this feels weird
 impl DataType {
-    pub fn encode_from_tuple(&self, tuple: &Tuple, offset: usize, out: &mut Vec<u8>) {
+    pub fn encode_from_tuple(
+        &self,
+        tuple: &Tuple,
+        bitmap_len: usize,
+        offset: usize,
+        out: &mut Vec<u8>,
+    ) {
+        let off = bitmap_len + offset;
         match self {
             DataType::BOOLEAN => {
-                let b = tuple.data.get(offset).unwrap();
+                let b = tuple.data.get(off).unwrap();
                 out.push(*b);
             }
             DataType::INT => {
                 // assumes data is stored little-endian
-                let val = i32::from_le_bytes(tuple.data[offset..offset + 4].try_into().unwrap());
+                let val = i32::from_le_bytes(tuple.data[off..off + 4].try_into().unwrap());
                 let big_e_converted = ((val as u32) ^ 0x8000_0000).to_be_bytes();
                 out.extend_from_slice(&big_e_converted);
             }
             DataType::FLOAT => {
-                let val = f32::from_le_bytes(tuple.data[offset..offset + 4].try_into().unwrap());
+                let val = f32::from_le_bytes(tuple.data[off..off + 4].try_into().unwrap());
                 let big_e_converted = ((val as u32) ^ 0x8000_0000).to_be_bytes();
                 out.extend_from_slice(&big_e_converted);
             }
             DataType::TIMESTAMP => {
-                let val = i64::from_le_bytes(tuple.data[offset..offset + 4].try_into().unwrap());
+                let val = i64::from_le_bytes(tuple.data[off..off + 8].try_into().unwrap());
                 let big_e_converted = ((val as u64) ^ 0x8000_0000_0000_0000).to_be_bytes();
                 out.extend_from_slice(&big_e_converted);
             }
@@ -363,15 +455,16 @@ fn test_schema_encode_decode_roundtrip() {
         (DataType::TIMESTAMP, "d".to_string()),
     ]);
     assert_eq!(4 + 1 + 4 + 8, schema.data_len);
+    assert_eq!(1, schema.bitmap_len);
 
     let values = vec![
-        Value::INT(-42),
-        Value::BOOLEAN(true),
-        Value::FLOAT(OrderedFloat(3.5)),
-        Value::TIMESTAMP(1_700_000_000_000),
+        Some(Value::INT(-42)),
+        Some(Value::BOOLEAN(true)),
+        Some(Value::FLOAT(OrderedFloat(3.5))),
+        Some(Value::TIMESTAMP(1_700_000_000_000)),
     ];
     let tuple = schema.encode_tuple(&values).unwrap();
-    assert_eq!(schema.data_len, tuple.data.len());
+    assert_eq!(schema.bitmap_len + schema.data_len, tuple.data.len());
 
     for (i, expected) in values.iter().enumerate() {
         let got = schema.get_value(&tuple, i).unwrap();
@@ -382,6 +475,23 @@ fn test_schema_encode_decode_roundtrip() {
         schema.get_value(&tuple, 99),
         Err(CatalogError::ColumnOutOfBounds)
     ));
+}
+
+#[test]
+fn test_schema_encode_decode_with_nulls() {
+    let schema = Schema::new(vec![
+        (DataType::INT, "a".to_string()),
+        (DataType::BOOLEAN, "b".to_string()),
+        (DataType::INT, "c".to_string()),
+    ]);
+
+    let values = vec![Some(Value::INT(7)), None, Some(Value::INT(9))];
+    let tuple = schema.encode_tuple(&values).unwrap();
+    assert_eq!(schema.bitmap_len + schema.data_len, tuple.data.len());
+
+    assert_eq!(Some(Value::INT(7)), schema.get_value(&tuple, 0).unwrap());
+    assert_eq!(None, schema.get_value(&tuple, 1).unwrap());
+    assert_eq!(Some(Value::INT(9)), schema.get_value(&tuple, 2).unwrap());
 }
 
 #[test]
@@ -406,7 +516,7 @@ fn test_schema_encode_tuple_type_mismatch() {
     ]);
 
     // second value is wrong type
-    let bad = vec![Value::INT(1), Value::INT(2)];
+    let bad = vec![Some(Value::INT(1)), Some(Value::INT(2))];
     assert!(matches!(
         schema.encode_tuple(&bad),
         Err(CatalogError::TupleSchemaMismatch)
