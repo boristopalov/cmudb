@@ -3,9 +3,10 @@ use crate::catalog::index_schema::{IndexKey, IndexValue};
 use crate::catalog::{Catalog, CatalogError, IndexInfo, Schema, TableInfo, Value};
 use crate::index::IndexError;
 use crate::processor::plan::{
-    AggType, AggregationPlanNode, DeletePlanNode, Expression, HashJoinPlanNode, IndexScanPlanNode,
-    InsertPlanNode, JoinType, LimitPlanNode, NestedIndexJoinPlanNode, NestedLoopJoinPlanNode,
-    SeqScanPlanNode, UpdatePlanNode, ValuesPlanNode, WindowFunctionPlanNode,
+    AggType, AggregationPlanNode, DeletePlanNode, Expression, ExternalMergeSortPlanNode,
+    HashJoinPlanNode, IndexScanPlanNode, InsertPlanNode, JoinType, LimitPlanNode,
+    NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, SeqScanPlanNode, SortPlanNode, UpdatePlanNode,
+    ValuesPlanNode, WindowFunctionPlanNode,
 };
 use crate::table_heap::{RecordId, TableHeap, TableHeapError, TableHeapIterator, Tuple};
 use std::cmp::Ordering;
@@ -483,28 +484,6 @@ impl AggState {
         }
     }
 
-    fn reset(&mut self) {
-        match self {
-            Self::Sum(current) => {
-                *current = None;
-            }
-            Self::Avg { sum, count } => {
-                *sum = None;
-                *count = 0;
-            }
-            Self::Max(current) => {
-                *current = None;
-            }
-            Self::Min(current) => {
-                *current = None;
-            }
-            Self::Count(c) => {
-                *c = 0;
-            }
-            Self::Rank(_) => unreachable!("use update_rank() instead"),
-        }
-    }
-
     fn update(&mut self, v: Option<Value>) {
         if let Self::Count(count) = self {
             *count += 1;
@@ -966,6 +945,193 @@ impl<'a> Executor for HashJoinExecutor<'a> {
     }
 }
 
+pub struct SortExecutor<'a> {
+    plan: &'a SortPlanNode,
+    child: Box<dyn Executor>,
+    sorted: VecIter<(Tuple, RecordId)>,
+}
+
+impl<'a> Executor for SortExecutor<'a> {
+    fn open(&mut self) -> Result<(), ExecutorError> {
+        let mut buf: Vec<(Tuple, RecordId)> = Vec::new();
+        while let Some(row) = self.child.next()? {
+            buf.push(row);
+        }
+        let schema = &self.plan.schema;
+        let order_by = &self.plan.order_by_exprs;
+        buf.sort_by(|a, b| cmp_tuples(&a.0, &b.0, order_by, schema));
+        self.sorted = buf.into_iter();
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+        Ok(self.sorted.next())
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.plan.schema
+    }
+
+    fn close(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
+pub struct ExternalMergeSortExecutor<'a> {
+    plan: &'a ExternalMergeSortPlanNode,
+    child: Box<dyn Executor>,
+    bpm: Arc<BufferPoolManager>,
+    iter: Option<TableHeapIterator>,
+}
+
+fn cmp_tuples(a: &Tuple, b: &Tuple, exprs: &[Expression], schema: &Schema) -> Ordering {
+    for expr in exprs {
+        let va = expr.evaluate(a, schema).ok().flatten();
+        let vb = expr.evaluate(b, schema).ok().flatten();
+        match va.cmp(&vb) {
+            Ordering::Equal => continue,
+            ord => return ord,
+        }
+    }
+    Ordering::Equal
+}
+
+impl<'a> Executor for ExternalMergeSortExecutor<'a> {
+    fn open(&mut self) -> Result<(), ExecutorError> {
+        // the idea here is: we define a constant B, which dictates
+        // the number of pages we pull into memory at a time,
+        // or in other words the size of each run.
+        // the number of runs N == len(tuples) / B.
+        // we sort these in memory, and then write them out to disk.
+        // after we have drained self.child, we recursively merge 2 runs at a time.
+        // to do this, we load 1 page from each run into memory, and use TableHeapIterators
+        // to iterate over them. At each iteration we take the smaller of the 2 entries and
+        // write out that entry to a 3rd output page.
+        // when we've exhausted both iterators, we move on to the next two runs
+        // after doing this once for, we'll have N/2 sorted runs
+        // we repeat this until the number of sorted runs == 1
+        let num_pages = 10_000; // 4kb pages * 10,000 = 40mb chunks at a time
+        let target_bytes = num_pages * 4096;
+        let mut run_bytes: usize = 0;
+        let mut buf: Vec<Tuple> = Vec::new();
+        let mut runs: Vec<TableHeap> = Vec::new();
+        let child_schema = &self.plan.schema;
+        let order_by = &self.plan.order_by_exprs;
+
+        while let Some((tup, _)) = self.child.next()? {
+            run_bytes += tup.data.len();
+            buf.push(tup);
+            if run_bytes >= target_bytes {
+                buf.sort_by(|a, b| cmp_tuples(a, b, order_by, child_schema));
+
+                // iterate over tuples and insert into table heap
+                let th = TableHeap::new(self.bpm.clone())?;
+                for t in buf.iter() {
+                    th.insert(&t)?;
+                }
+
+                buf.clear();
+                run_bytes = 0;
+                runs.push(th);
+            }
+        }
+
+        // flush whatever is left in the buffer
+        buf.sort_by(|a, b| cmp_tuples(a, b, order_by, child_schema));
+
+        // iterate over tuples and insert into table heap
+        let th = TableHeap::new(self.bpm.clone())?;
+        for t in buf.iter() {
+            th.insert(&t)?;
+        }
+        runs.push(th);
+
+        // at this point we have all of our runs, so we can start merging
+        while runs.len() > 1 {
+            let mut next_runs: Vec<TableHeap> = Vec::new();
+            for chunk in runs.chunks(2) {
+                let out = TableHeap::new(self.bpm.clone())?;
+                if chunk.len() == 2 {
+                    // merge the two chunks: hold whichever side's current head
+                    // wasn't emitted, and pull a new tuple from the side that was.
+                    let mut c1 = chunk[0].iter();
+                    let mut c2 = chunk[1].iter();
+                    let mut head1 = c1.next().transpose()?.map(|(t, _)| t);
+                    let mut head2 = c2.next().transpose()?.map(|(t, _)| t);
+                    loop {
+                        match (&head1, &head2) {
+                            (Some(t1), Some(t2)) => {
+                                if cmp_tuples(t1, t2, order_by, child_schema) != Ordering::Greater {
+                                    out.insert(head1.as_ref().unwrap())?;
+                                    head1 = c1.next().transpose()?.map(|(t, _)| t);
+                                } else {
+                                    out.insert(head2.as_ref().unwrap())?;
+                                    head2 = c2.next().transpose()?.map(|(t, _)| t);
+                                }
+                            }
+                            (Some(_), None) => {
+                                out.insert(head1.as_ref().unwrap())?;
+                                for t in c1.by_ref() {
+                                    let (tup, _) = t?;
+                                    out.insert(&tup)?;
+                                }
+                                break;
+                            }
+                            (None, Some(_)) => {
+                                out.insert(head2.as_ref().unwrap())?;
+                                for t in c2.by_ref() {
+                                    let (tup, _) = t?;
+                                    out.insert(&tup)?;
+                                }
+                                break;
+                            }
+                            (None, None) => break,
+                        }
+                    }
+                } else {
+                    // only 1 chunk
+                    let mut c = chunk[0].iter();
+                    while let Some(t) = c.next() {
+                        let (tup, _) = t?;
+                        out.insert(&tup)?;
+                    }
+                }
+                next_runs.push(out);
+            }
+            runs = next_runs;
+        }
+
+        if runs.len() == 0 {
+            return Ok(());
+        }
+
+        self.iter = Some(runs[0].iter());
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+        let Some(iter) = self.iter.as_mut() else {
+            return Err(ExecutorError(
+                "ExternalMergeSortExecutor: next(): ran before open".to_string(),
+            ));
+        };
+
+        let t = iter.next();
+        if t.is_none() {
+            return Ok(None);
+        }
+
+        let (tup, _) = t.unwrap()?;
+        Ok(Some((tup, RecordId::RESERVED)))
+    }
+    fn close(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+    fn schema(&self) -> &Schema {
+        &self.plan.schema
+    }
+}
+
 pub struct LimitExecutor<'a> {
     plan: &'a LimitPlanNode,
     child: Box<dyn Executor>,
@@ -1032,7 +1198,12 @@ impl<'a> Executor for WindowFunctionExecutor<'a> {
             return Ordering::Equal;
         });
 
-        // keeps track of all the aggregate outputs for each partition
+        // check if we need to keep running aggregates
+        // if ORDER BY is present, we basically have two levels of partitions,
+        // the first being PARTITION BY expr, the second being ORDER BY exprs
+        // so this tells us what level to use when calculating aggregates
+        let running = self.plan.order_by_exprs.is_some();
+
         let mut partition_aggregates: Vec<AggState> = self
             .plan
             .aggregates
@@ -1040,10 +1211,7 @@ impl<'a> Executor for WindowFunctionExecutor<'a> {
             .map(|agg| AggState::new(&agg.1))
             .collect();
 
-        // keep track of the tuples in this partition
-        let mut partition_buffer: Vec<Tuple> = Vec::new();
-
-        // full output tuples to emit
+        let mut peer_buffer: Vec<Tuple> = Vec::new();
         let mut output_tuples: Vec<Tuple> = Vec::with_capacity(tups.len());
 
         let mut curr_rank = 1;
@@ -1051,18 +1219,17 @@ impl<'a> Executor for WindowFunctionExecutor<'a> {
         let mut prev_partition_key: Option<ExprKey> = None;
         let mut prev_order_key: Option<ExprKey> = None;
 
-        // now that we've sorted tuples we can do all of our calculations here
         for t in tups.iter() {
             let curr_partition_key: ExprKey = ExprKey(
                 self.plan
                     .partition_by_exprs
                     .iter()
                     .flatten()
-                    .map(|e| e.evaluate(&t, self.child.schema()))
+                    .map(|e| e.evaluate(t, child_schema))
                     .collect::<Result<_, _>>()?,
             );
             let new_partition = match &prev_partition_key {
-                Some(prev) => curr_partition_key != *prev,
+                Some(prev) => &curr_partition_key != prev,
                 None => true,
             };
 
@@ -1071,79 +1238,76 @@ impl<'a> Executor for WindowFunctionExecutor<'a> {
                     .order_by_exprs
                     .iter()
                     .flatten()
-                    .map(|e| e.evaluate(&t, self.child.schema()))
+                    .map(|e| e.evaluate(t, child_schema))
                     .collect::<Result<_, _>>()?,
             );
-            let new_order = match &prev_order_key {
-                Some(prev) => curr_order_key != *prev,
-                None => true,
-            };
+            // a partition boundary is also a peer-group boundary
+            let new_order = new_partition
+                || match &prev_order_key {
+                    Some(prev) => &curr_order_key != prev,
+                    None => true,
+                };
+
+            if new_partition && prev_partition_key.is_some() {
+                // flush the trailing peer group of the previous partition with its final state
+                flush_peer_group(
+                    &mut peer_buffer,
+                    &mut partition_aggregates,
+                    &self.plan.aggregates,
+                    child_schema,
+                    &self.plan.schema,
+                    &mut output_tuples,
+                )?;
+                // reset state for the new partition
+                partition_aggregates = self
+                    .plan
+                    .aggregates
+                    .iter()
+                    .map(|agg| AggState::new(&agg.1))
+                    .collect();
+                row_num = 1;
+            } else if running && new_order && !peer_buffer.is_empty() {
+                // peer group changed within the same partition: flush before buffering new peers
+                flush_peer_group(
+                    &mut peer_buffer,
+                    &mut partition_aggregates,
+                    &self.plan.aggregates,
+                    child_schema,
+                    &self.plan.schema,
+                    &mut output_tuples,
+                )?;
+            }
 
             if new_order {
                 curr_rank = row_num;
             }
 
-            if new_partition {
-                // take all of the tuples in this partition, take all of the aggregates for this partition, zip them up into tuples,
-                // then reset the aggregates for the next partition
-                for t in partition_buffer.drain(0..) {
-                    let mut combined: Vec<Option<Value>> =
-                        Vec::with_capacity(self.schema().cols.len());
-                    for i in 0..self.child.schema().cols.len() {
-                        combined.push(self.child.schema().get_value(&t, i)?);
-                    }
-                    for agg in &partition_aggregates {
-                        combined.push(agg.peek());
-                    }
-
-                    let out = self.schema().encode_tuple(&combined)?;
-                    output_tuples.push(out);
-                }
-
-                // reset aggregates
-                for (i, (_, agg_type)) in self.plan.aggregates.iter().enumerate() {
-                    let state = &mut partition_aggregates[i];
-                    match agg_type {
-                        AggType::RANK => {
-                            state.update_rank(new_order, curr_rank);
-                        }
-                        _ => state.reset(),
-                    }
-                }
-            }
-            // update aggregates
-            for (i, (agg, agg_type)) in self.plan.aggregates.iter().enumerate() {
-                let state = &mut partition_aggregates[i];
-                match agg_type {
-                    AggType::RANK => {
-                        state.update_rank(new_order, curr_rank);
-                    }
-                    _ => {
-                        let agg = agg.evaluate(&t, self.child.schema())?;
-                        state.update(agg);
-                    }
+            // RANK is updated here, since its value is based on row position within partitions
+            for (state, (_, agg_type)) in partition_aggregates
+                .iter_mut()
+                .zip(self.plan.aggregates.iter())
+            {
+                if matches!(agg_type, AggType::RANK) {
+                    state.update_rank(new_order, curr_rank);
                 }
             }
 
-            partition_buffer.push(t.clone());
-
+            peer_buffer.push(t.clone());
             row_num += 1;
             prev_partition_key = Some(curr_partition_key);
             prev_order_key = Some(curr_order_key);
         }
 
         // we need to make sure to push the final partition buffer here
-        for t in partition_buffer.drain(0..) {
-            let mut combined: Vec<Option<Value>> = Vec::with_capacity(self.schema().cols.len());
-            for i in 0..self.child.schema().cols.len() {
-                combined.push(self.child.schema().get_value(&t, i)?);
-            }
-            for agg in &partition_aggregates {
-                combined.push(agg.peek());
-            }
-
-            let out = self.schema().encode_tuple(&combined)?;
-            output_tuples.push(out);
+        if !peer_buffer.is_empty() {
+            flush_peer_group(
+                &mut peer_buffer,
+                &mut partition_aggregates,
+                &self.plan.aggregates,
+                child_schema,
+                &self.plan.schema,
+                &mut output_tuples,
+            )?;
         }
 
         self.iter = Some(output_tuples.into_iter());
@@ -1176,4 +1340,35 @@ fn hash_key(key: &[Option<Value>]) -> u64 {
     let mut h = DefaultHasher::new();
     key.hash(&mut h);
     h.finish()
+}
+
+/// Zips up input tuples from buffer with provided aggregates, and outputs to a new vector of the combined tuples
+fn flush_peer_group(
+    buffer: &mut Vec<Tuple>,
+    aggregates: &mut [AggState],
+    plan_aggs: &[(Expression, AggType)],
+    child_schema: &Schema,
+    out_schema: &Schema,
+    output: &mut Vec<Tuple>,
+) -> Result<(), ExecutorError> {
+    for buf_tup in buffer.iter() {
+        for (state, (expr, agg_type)) in aggregates.iter_mut().zip(plan_aggs.iter()) {
+            if !matches!(agg_type, AggType::RANK) {
+                let v = expr.evaluate(buf_tup, child_schema)?;
+                state.update(v);
+            }
+        }
+    }
+    for buf_tup in buffer.drain(..) {
+        let mut combined: Vec<Option<Value>> = Vec::with_capacity(out_schema.cols.len());
+        for i in 0..child_schema.cols.len() {
+            combined.push(child_schema.get_value(&buf_tup, i)?);
+        }
+        for agg in aggregates.iter() {
+            combined.push(agg.peek());
+        }
+        let out = out_schema.encode_tuple(&combined)?;
+        output.push(out);
+    }
+    Ok(())
 }

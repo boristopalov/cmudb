@@ -112,6 +112,13 @@ pub struct HashJoinPlanNode {
 pub struct ExternalMergeSortPlanNode {
     pub schema: Schema,
     pub child: Box<Plan>,
+    pub order_by_exprs: Vec<Expression>,
+}
+
+pub struct SortPlanNode {
+    pub schema: Schema,
+    pub child: Box<Plan>,
+    pub order_by_exprs: Vec<Expression>,
 }
 
 /// Unlike aggregate functions, window functions are "self-contained" and don't collapse columns
