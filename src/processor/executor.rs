@@ -20,10 +20,6 @@ use std::vec::IntoIter as VecIter;
 #[derive(Debug)]
 pub struct ExecutorError(pub String);
 
-pub struct ExecutorContext<'a> {
-    pub catalog: &'a Catalog,
-}
-
 impl From<CatalogError> for ExecutorError {
     fn from(e: CatalogError) -> Self {
         ExecutorError(format!("catalog error: {:?}", e))
@@ -56,15 +52,15 @@ pub trait Executor {
 }
 
 pub struct SeqScanExecutor<'a> {
-    ctx: &'a ExecutorContext<'a>,
+    catalog: &'a Catalog,
     plan: &'a SeqScanPlanNode,
     iter: Option<TableHeapIterator>,
 }
 
 impl<'a> SeqScanExecutor<'a> {
-    pub fn new(ctx: &'a ExecutorContext<'a>, plan: &'a SeqScanPlanNode) -> Self {
+    pub fn new(catalog: &'a Catalog, plan: &'a SeqScanPlanNode) -> Self {
         Self {
-            ctx,
+            catalog,
             plan,
             iter: None,
         }
@@ -73,7 +69,7 @@ impl<'a> SeqScanExecutor<'a> {
 
 impl<'a> Executor for SeqScanExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
-        let table = self.ctx.catalog.get_table(self.plan.table_oid)?;
+        let table = self.catalog.get_table(self.plan.table_oid)?;
         self.iter = Some(table.heap.iter());
         Ok(())
     }
@@ -96,7 +92,7 @@ impl<'a> Executor for SeqScanExecutor<'a> {
 }
 
 pub struct InsertExecutor<'a> {
-    ctx: &'a ExecutorContext<'a>,
+    catalog: &'a Catalog,
     plan: &'a InsertPlanNode,
     child: Box<dyn Executor + 'a>,
     table: Option<Arc<TableInfo>>,
@@ -105,12 +101,12 @@ pub struct InsertExecutor<'a> {
 
 impl<'a> InsertExecutor<'a> {
     pub fn new(
-        ctx: &'a ExecutorContext<'a>,
+        catalog: &'a Catalog,
         plan: &'a InsertPlanNode,
         child: Box<dyn Executor + 'a>,
     ) -> Self {
         Self {
-            ctx,
+            catalog,
             plan,
             child,
             table: None,
@@ -121,7 +117,7 @@ impl<'a> InsertExecutor<'a> {
 
 impl<'a> Executor for InsertExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
-        let table = self.ctx.catalog.get_table(self.plan.table_oid)?;
+        let table = self.catalog.get_table(self.plan.table_oid)?;
         self.table = Some(table);
         Ok(())
     }
@@ -141,7 +137,7 @@ impl<'a> Executor for InsertExecutor<'a> {
         let mut count: i32 = 0;
         while let Some(res) = self.child.next()? {
             let rid = table.heap.insert(&res.0)?;
-            for idx in self.ctx.catalog.get_table_indexes(self.plan.table_oid)? {
+            for idx in self.catalog.get_table_indexes(self.plan.table_oid)? {
                 idx.as_ref().index.insert(&res.0, rid)?;
             }
             count += 1;
@@ -214,15 +210,30 @@ impl<'a> Executor for ValuesExecutor<'a> {
 }
 
 pub struct UpdateExecutor<'a> {
-    ctx: &'a ExecutorContext<'a>,
+    catalog: &'a Catalog,
     plan: &'a UpdatePlanNode,
     child: Box<dyn Executor + 'a>,
     table: Option<Arc<TableInfo>>,
 }
 
+impl<'a> UpdateExecutor<'a> {
+    pub fn new(
+        catalog: &'a Catalog,
+        plan: &'a UpdatePlanNode,
+        child: Box<dyn Executor + 'a>,
+    ) -> Self {
+        Self {
+            catalog,
+            plan,
+            child,
+            table: None,
+        }
+    }
+}
+
 impl<'a> Executor for UpdateExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
-        let table = self.ctx.catalog.get_table(self.plan.table_oid)?;
+        let table = self.catalog.get_table(self.plan.table_oid)?;
         self.table = Some(table);
         Ok(())
     }
@@ -259,7 +270,7 @@ impl<'a> Executor for UpdateExecutor<'a> {
 
         // to update the index we remove first, and then re-insert
         // not ideal :/
-        for idx in self.ctx.catalog.get_table_indexes(self.plan.table_oid)? {
+        for idx in self.catalog.get_table_indexes(self.plan.table_oid)? {
             idx.as_ref().index.remove(&tuple_to_update)?;
             idx.as_ref().index.insert(&new_tuple, new_rid)?;
         }
@@ -276,15 +287,30 @@ impl<'a> Executor for UpdateExecutor<'a> {
 }
 
 pub struct DeleteExecutor<'a> {
-    ctx: &'a ExecutorContext<'a>,
+    catalog: &'a Catalog,
     plan: &'a DeletePlanNode,
     child: Box<dyn Executor + 'a>,
     table: Option<Arc<TableInfo>>,
 }
 
+impl<'a> DeleteExecutor<'a> {
+    pub fn new(
+        catalog: &'a Catalog,
+        plan: &'a DeletePlanNode,
+        child: Box<dyn Executor + 'a>,
+    ) -> Self {
+        Self {
+            catalog,
+            plan,
+            child,
+            table: None,
+        }
+    }
+}
+
 impl<'a> Executor for DeleteExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
-        let table = self.ctx.catalog.get_table(self.plan.table_oid)?;
+        let table = self.catalog.get_table(self.plan.table_oid)?;
         self.table = Some(table);
         Ok(())
     }
@@ -300,7 +326,7 @@ impl<'a> Executor for DeleteExecutor<'a> {
         };
 
         table.heap.delete(&rid)?;
-        for idx in self.ctx.catalog.get_table_indexes(self.plan.table_oid)? {
+        for idx in self.catalog.get_table_indexes(self.plan.table_oid)? {
             idx.as_ref().index.remove(&tup)?;
         }
         Ok(Some((tup, rid)))
@@ -316,15 +342,26 @@ impl<'a> Executor for DeleteExecutor<'a> {
 }
 
 pub struct IndexScanExecutor<'a> {
-    ctx: &'a ExecutorContext<'a>,
+    catalog: &'a Catalog,
     plan: &'a IndexScanPlanNode,
     table: Option<Arc<TableInfo>>,
     iter: Option<Box<dyn Iterator<Item = Result<(IndexKey, IndexValue), IndexError>>>>,
 }
 
+impl<'a> IndexScanExecutor<'a> {
+    pub fn new(catalog: &'a Catalog, plan: &'a IndexScanPlanNode) -> Self {
+        Self {
+            catalog,
+            plan,
+            table: None,
+            iter: None,
+        }
+    }
+}
+
 impl<'a> Executor for IndexScanExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
-        let info = self.ctx.catalog.get_index(self.plan.index_oid)?;
+        let info = self.catalog.get_index(self.plan.index_oid)?;
 
         // for now we don't support NULLS when scanning indexes
         let iter = info.as_ref().index.scan(
@@ -333,7 +370,7 @@ impl<'a> Executor for IndexScanExecutor<'a> {
         )?;
         self.iter = Some(iter);
 
-        let table = self.ctx.catalog.get_table(info.as_ref().table_oid)?;
+        let table = self.catalog.get_table(info.as_ref().table_oid)?;
         self.table = Some(table);
 
         Ok(())
@@ -368,6 +405,16 @@ pub struct AggregationExecutor<'a> {
     plan: &'a AggregationPlanNode,
     child: Box<dyn Executor + 'a>,
     iter: Option<IntoIter<ExprKey, AggVal>>,
+}
+
+impl<'a> AggregationExecutor<'a> {
+    pub fn new(plan: &'a AggregationPlanNode, child: Box<dyn Executor + 'a>) -> Self {
+        Self {
+            plan,
+            child,
+            iter: None,
+        }
+    }
 }
 
 impl<'a> Executor for AggregationExecutor<'a> {
@@ -545,14 +592,32 @@ impl AggState {
 
 pub struct NestedLoopJoinExecutor<'a> {
     plan: &'a NestedLoopJoinPlanNode,
-    left: Box<dyn Executor>,
-    right: Box<dyn Executor>,
+    left: Box<dyn Executor + 'a>,
+    right: Box<dyn Executor + 'a>,
 
     right_tuples: Vec<Tuple>,
 
     right_cursor: usize,
     curr_left: Option<Tuple>,
     left_matched: bool,
+}
+
+impl<'a> NestedLoopJoinExecutor<'a> {
+    pub fn new(
+        plan: &'a NestedLoopJoinPlanNode,
+        left: Box<dyn Executor + 'a>,
+        right: Box<dyn Executor + 'a>,
+    ) -> Self {
+        Self {
+            plan,
+            left,
+            right,
+            right_tuples: Vec::new(),
+            right_cursor: 0,
+            curr_left: None,
+            left_matched: false,
+        }
+    }
 }
 
 impl<'a> Executor for NestedLoopJoinExecutor<'a> {
@@ -641,9 +706,9 @@ impl<'a> Executor for NestedLoopJoinExecutor<'a> {
 }
 
 pub struct NestedIndexJoinExecutor<'a> {
-    ctx: &'a ExecutorContext<'a>,
+    catalog: &'a Catalog,
     plan: &'a NestedIndexJoinPlanNode,
-    child: Box<dyn Executor>,
+    child: Box<dyn Executor + 'a>,
     inner_table: Option<Arc<TableInfo>>,
 
     index: Option<Arc<IndexInfo>>,
@@ -655,12 +720,31 @@ pub struct NestedIndexJoinExecutor<'a> {
     left_matched: bool,
 }
 
+impl<'a> NestedIndexJoinExecutor<'a> {
+    pub fn new(
+        catalog: &'a Catalog,
+        plan: &'a NestedIndexJoinPlanNode,
+        child: Box<dyn Executor + 'a>,
+    ) -> Self {
+        Self {
+            catalog,
+            plan,
+            child,
+            inner_table: None,
+            index: None,
+            index_iter: None,
+            curr_left: None,
+            left_matched: false,
+        }
+    }
+}
+
 impl<'a> Executor for NestedIndexJoinExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
-        let info = self.ctx.catalog.get_index(self.plan.index_oid)?;
+        let info = self.catalog.get_index(self.plan.index_oid)?;
         self.index = Some(info);
 
-        let table = self.ctx.catalog.get_table(self.plan.table_oid)?;
+        let table = self.catalog.get_table(self.plan.table_oid)?;
         self.inner_table = Some(table);
         Ok(())
     }
@@ -758,8 +842,8 @@ impl<'a> Executor for NestedIndexJoinExecutor<'a> {
 
 pub struct HashJoinExecutor<'a> {
     plan: &'a HashJoinPlanNode,
-    left: Box<dyn Executor>,
-    right: Box<dyn Executor>,
+    left: Box<dyn Executor + 'a>,
+    right: Box<dyn Executor + 'a>,
     bpm: Arc<BufferPoolManager>,
     left_partitions: Vec<TableHeap>,
     right_partitions: Vec<TableHeap>,
@@ -773,6 +857,28 @@ pub struct HashJoinExecutor<'a> {
     left_hash_table: Option<HashMap<ExprKey, Vec<(Tuple, bool)>>>,
     partition_cursor: usize,
     matches_buffer: VecDeque<Tuple>,
+}
+
+impl<'a> HashJoinExecutor<'a> {
+    pub fn new(
+        plan: &'a HashJoinPlanNode,
+        left: Box<dyn Executor + 'a>,
+        right: Box<dyn Executor + 'a>,
+        bpm: Arc<BufferPoolManager>,
+    ) -> Self {
+        Self {
+            plan,
+            left,
+            right,
+            bpm,
+            left_partitions: Vec::new(),
+            right_partitions: Vec::new(),
+            right_partition_iter: None,
+            left_hash_table: None,
+            partition_cursor: 0,
+            matches_buffer: VecDeque::new(),
+        }
+    }
 }
 
 impl<'a> Executor for HashJoinExecutor<'a> {
@@ -947,8 +1053,18 @@ impl<'a> Executor for HashJoinExecutor<'a> {
 
 pub struct SortExecutor<'a> {
     plan: &'a SortPlanNode,
-    child: Box<dyn Executor>,
+    child: Box<dyn Executor + 'a>,
     sorted: VecIter<(Tuple, RecordId)>,
+}
+
+impl<'a> SortExecutor<'a> {
+    pub fn new(plan: &'a SortPlanNode, child: Box<dyn Executor + 'a>) -> Self {
+        Self {
+            plan,
+            child,
+            sorted: Vec::new().into_iter(),
+        }
+    }
 }
 
 impl<'a> Executor for SortExecutor<'a> {
@@ -979,9 +1095,24 @@ impl<'a> Executor for SortExecutor<'a> {
 
 pub struct ExternalMergeSortExecutor<'a> {
     plan: &'a ExternalMergeSortPlanNode,
-    child: Box<dyn Executor>,
+    child: Box<dyn Executor + 'a>,
     bpm: Arc<BufferPoolManager>,
     iter: Option<TableHeapIterator>,
+}
+
+impl<'a> ExternalMergeSortExecutor<'a> {
+    pub fn new(
+        plan: &'a ExternalMergeSortPlanNode,
+        child: Box<dyn Executor + 'a>,
+        bpm: Arc<BufferPoolManager>,
+    ) -> Self {
+        Self {
+            plan,
+            child,
+            bpm,
+            iter: None,
+        }
+    }
 }
 
 fn cmp_tuples(a: &Tuple, b: &Tuple, exprs: &[Expression], schema: &Schema) -> Ordering {
@@ -1134,8 +1265,18 @@ impl<'a> Executor for ExternalMergeSortExecutor<'a> {
 
 pub struct LimitExecutor<'a> {
     plan: &'a LimitPlanNode,
-    child: Box<dyn Executor>,
+    child: Box<dyn Executor + 'a>,
     count: u32,
+}
+
+impl<'a> LimitExecutor<'a> {
+    pub fn new(plan: &'a LimitPlanNode, child: Box<dyn Executor + 'a>) -> Self {
+        Self {
+            plan,
+            child,
+            count: 0,
+        }
+    }
 }
 
 impl<'a> Executor for LimitExecutor<'a> {
@@ -1162,8 +1303,18 @@ impl<'a> Executor for LimitExecutor<'a> {
 
 pub struct WindowFunctionExecutor<'a> {
     plan: &'a WindowFunctionPlanNode,
-    child: Box<dyn Executor>,
+    child: Box<dyn Executor + 'a>,
     iter: Option<VecIter<Tuple>>,
+}
+
+impl<'a> WindowFunctionExecutor<'a> {
+    pub fn new(plan: &'a WindowFunctionPlanNode, child: Box<dyn Executor + 'a>) -> Self {
+        Self {
+            plan,
+            child,
+            iter: None,
+        }
+    }
 }
 
 impl<'a> Executor for WindowFunctionExecutor<'a> {

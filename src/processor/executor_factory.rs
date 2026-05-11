@@ -1,16 +1,69 @@
+use crate::buffer_pool::BufferPoolManager;
+use crate::catalog::Catalog;
 use crate::processor::executor::{
-    Executor, ExecutorContext, InsertExecutor, SeqScanExecutor, ValuesExecutor,
+    AggregationExecutor, DeleteExecutor, Executor, ExternalMergeSortExecutor, HashJoinExecutor,
+    IndexScanExecutor, InsertExecutor, LimitExecutor, NestedIndexJoinExecutor,
+    NestedLoopJoinExecutor, SeqScanExecutor, SortExecutor, UpdateExecutor, ValuesExecutor,
+    WindowFunctionExecutor,
 };
 use crate::processor::plan::Plan;
+use std::sync::Arc;
 
-pub fn create_executor<'a>(ctx: &'a ExecutorContext, plan: &'a Plan) -> Box<dyn Executor + 'a> {
+pub fn create_executor<'a>(
+    catalog: &'a Catalog,
+    bpm: &Arc<BufferPoolManager>,
+    plan: &'a Plan,
+) -> Box<dyn Executor + 'a> {
     match plan {
-        Plan::SeqScan(p) => Box::new(SeqScanExecutor::new(ctx, p)),
+        Plan::SeqScan(p) => Box::new(SeqScanExecutor::new(catalog, p)),
         Plan::Insert(p) => {
-            let child = create_executor(ctx, &p.child);
-            Box::new(InsertExecutor::new(ctx, p, child))
+            let child = create_executor(catalog, bpm, &p.child);
+            Box::new(InsertExecutor::new(catalog, p, child))
         }
         Plan::Values(p) => Box::new(ValuesExecutor::new(p)),
+        Plan::Update(p) => {
+            let child = create_executor(catalog, bpm, &p.child);
+            Box::new(UpdateExecutor::new(catalog, p, child))
+        }
+        Plan::Delete(p) => {
+            let child = create_executor(catalog, bpm, &p.child);
+            Box::new(DeleteExecutor::new(catalog, p, child))
+        }
+        Plan::IndexScan(p) => Box::new(IndexScanExecutor::new(catalog, p)),
+        Plan::Aggregation(p) => {
+            let child = create_executor(catalog, bpm, &p.child);
+            Box::new(AggregationExecutor::new(p, child))
+        }
+        Plan::NestedLoopJoin(p) => {
+            let left = create_executor(catalog, bpm, &p.left);
+            let right = create_executor(catalog, bpm, &p.right);
+            Box::new(NestedLoopJoinExecutor::new(p, left, right))
+        }
+        Plan::NestedIndexJoin(p) => {
+            let child = create_executor(catalog, bpm, &p.child);
+            Box::new(NestedIndexJoinExecutor::new(catalog, p, child))
+        }
+        Plan::HashJoin(p) => {
+            let left = create_executor(catalog, bpm, &p.left);
+            let right = create_executor(catalog, bpm, &p.right);
+            Box::new(HashJoinExecutor::new(p, left, right, bpm.clone()))
+        }
+        Plan::Sort(p) => {
+            let child = create_executor(catalog, bpm, &p.child);
+            Box::new(SortExecutor::new(p, child))
+        }
+        Plan::ExternalMergeSort(p) => {
+            let child = create_executor(catalog, bpm, &p.child);
+            Box::new(ExternalMergeSortExecutor::new(p, child, bpm.clone()))
+        }
+        Plan::Limit(p) => {
+            let child = create_executor(catalog, bpm, &p.child);
+            Box::new(LimitExecutor::new(p, child))
+        }
+        Plan::WindowFunction(p) => {
+            let child = create_executor(catalog, bpm, &p.child);
+            Box::new(WindowFunctionExecutor::new(p, child))
+        }
     }
 }
 
@@ -25,7 +78,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
-    fn make_catalog() -> (Catalog, tempfile::TempDir) {
+    fn make_catalog() -> (Catalog, Arc<BufferPoolManager>, tempfile::TempDir) {
         let num_frames = 16;
         let dir = tempdir().expect("tempdir");
         let dm = DiskManager::new(&dir.path().join("db"), &dir.path().join("log"))
@@ -33,7 +86,7 @@ mod tests {
         let scheduler = DiskScheduler::new(dm);
         let replacer = ArcReplacer::new(num_frames);
         let bpm = Arc::new(create_buffer_pool_manager(num_frames, replacer, scheduler));
-        (Catalog::new(bpm), dir)
+        (Catalog::new(bpm.clone()), bpm, dir)
     }
 
     fn make_schema() -> Schema {
@@ -45,7 +98,7 @@ mod tests {
 
     #[test]
     fn insert_then_seq_scan_returns_inserted_rows() {
-        let (mut catalog, _dir) = make_catalog();
+        let (mut catalog, bpm, _dir) = make_catalog();
         let table_oid = catalog
             .create_table("t".to_string(), make_schema())
             .expect("create table");
@@ -70,9 +123,7 @@ mod tests {
             table_oid,
         });
 
-        let ctx = ExecutorContext { catalog: &catalog };
-
-        let mut insert_exec = create_executor(&ctx, &insert_plan);
+        let mut insert_exec = create_executor(&catalog, &bpm, &insert_plan);
         insert_exec.open().expect("open insert");
         let (count_tuple, _) = insert_exec
             .next()
@@ -86,7 +137,7 @@ mod tests {
             table_oid,
             schema: make_schema(),
         });
-        let mut scan_exec = create_executor(&ctx, &scan_plan);
+        let mut scan_exec = create_executor(&catalog, &bpm, &scan_plan);
         scan_exec.open().expect("open scan");
 
         let mut got = Vec::new();

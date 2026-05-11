@@ -9,6 +9,17 @@ pub enum Plan {
     SeqScan(SeqScanPlanNode),
     Insert(InsertPlanNode),
     Values(ValuesPlanNode),
+    Update(UpdatePlanNode),
+    Delete(DeletePlanNode),
+    IndexScan(IndexScanPlanNode),
+    Aggregation(AggregationPlanNode),
+    NestedLoopJoin(NestedLoopJoinPlanNode),
+    NestedIndexJoin(NestedIndexJoinPlanNode),
+    HashJoin(HashJoinPlanNode),
+    Sort(SortPlanNode),
+    ExternalMergeSort(ExternalMergeSortPlanNode),
+    Limit(LimitPlanNode),
+    WindowFunction(WindowFunctionPlanNode),
 }
 
 pub struct SeqScanPlanNode {
