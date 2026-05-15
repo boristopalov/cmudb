@@ -1,12 +1,15 @@
 use crate::buffer_pool::BufferPoolManager;
 use crate::catalog::index_schema::{IndexKey, IndexValue};
-use crate::catalog::{Catalog, CatalogError, IndexInfo, Schema, TableInfo, Value};
+use crate::catalog::{
+    Catalog, CatalogError, DataType, IndexInfo, IndexType, Schema, TableInfo, Value,
+};
 use crate::index::IndexError;
 use crate::processor::plan::{
-    AggType, AggregationPlanNode, DeletePlanNode, Expression, ExternalMergeSortPlanNode,
+    AggType, AggregationPlanNode, CreateIndexPlanNode, CreateTablePlanNode, DeletePlanNode,
+    DropIndexPlanNode, DropTablePlanNode, Expression, ExternalMergeSortPlanNode, FilterPlanNode,
     HashJoinPlanNode, IndexScanPlanNode, InsertPlanNode, JoinType, LimitPlanNode,
-    NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, SeqScanPlanNode, SortPlanNode, UpdatePlanNode,
-    ValuesPlanNode, WindowFunctionPlanNode,
+    NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, ProjectionPlanNode, SeqScanPlanNode,
+    SortPlanNode, UpdatePlanNode, ValuesPlanNode, WindowFunctionPlanNode,
 };
 use crate::table_heap::{RecordId, TableHeap, TableHeapError, TableHeapIterator, Tuple};
 use std::cmp::Ordering;
@@ -117,6 +120,7 @@ impl<'a> InsertExecutor<'a> {
 
 impl<'a> Executor for InsertExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
+        self.child.open()?;
         let table = self.catalog.get_table(self.plan.table_oid)?;
         self.table = Some(table);
         Ok(())
@@ -233,6 +237,7 @@ impl<'a> UpdateExecutor<'a> {
 
 impl<'a> Executor for UpdateExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
+        self.child.open()?;
         let table = self.catalog.get_table(self.plan.table_oid)?;
         self.table = Some(table);
         Ok(())
@@ -310,6 +315,7 @@ impl<'a> DeleteExecutor<'a> {
 
 impl<'a> Executor for DeleteExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
+        self.child.open()?;
         let table = self.catalog.get_table(self.plan.table_oid)?;
         self.table = Some(table);
         Ok(())
@@ -419,13 +425,17 @@ impl<'a> AggregationExecutor<'a> {
 
 impl<'a> Executor for AggregationExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
+        self.child.open()?;
         let mut agg_hash_table: HashMap<ExprKey, AggVal> = HashMap::new();
 
         // populate the hash table
         // this executor is a pipeline breaker, meaning we need to
         // drain the child completely before we do any work
         while let Some((tuple, _)) = self.child.next()? {
-            let schema = self.schema();
+            // group-by and aggregate expressions reference *child* columns,
+            // so they must be evaluated against the child's schema
+            // (which also carries `join_offset` when the child is a join).
+            let schema = self.child.schema();
             let groups: Vec<Option<Value>> = self
                 .plan
                 .group_bys
@@ -896,6 +906,8 @@ impl<'a> Executor for HashJoinExecutor<'a> {
         // The input could be a full table, or some filtered output from another child.
         // which is several million rows for a table with ~15 cols with various dtypes.
         // in our databse it would be even more rows because we only support a few basic data types.
+        self.left.open()?;
+        self.right.open()?;
         let n = 64;
         for _ in 0..n {
             let lh = TableHeap::new(self.bpm.clone())?;
@@ -1069,6 +1081,7 @@ impl<'a> SortExecutor<'a> {
 
 impl<'a> Executor for SortExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
+        self.child.open()?;
         let mut buf: Vec<(Tuple, RecordId)> = Vec::new();
         while let Some(row) = self.child.next()? {
             buf.push(row);
@@ -1089,7 +1102,7 @@ impl<'a> Executor for SortExecutor<'a> {
     }
 
     fn close(&mut self) -> Result<(), ExecutorError> {
-        Ok(())
+        self.child.close()
     }
 }
 
@@ -1141,6 +1154,7 @@ impl<'a> Executor for ExternalMergeSortExecutor<'a> {
         // when we've exhausted both iterators, we move on to the next two runs
         // after doing this once for, we'll have N/2 sorted runs
         // we repeat this until the number of sorted runs == 1
+        self.child.open()?;
         let num_pages = 10_000; // 4kb pages * 10,000 = 40mb chunks at a time
         let target_bytes = num_pages * 4096;
         let mut run_bytes: usize = 0;
@@ -1256,7 +1270,7 @@ impl<'a> Executor for ExternalMergeSortExecutor<'a> {
         Ok(Some((tup, RecordId::RESERVED)))
     }
     fn close(&mut self) -> Result<(), ExecutorError> {
-        Ok(())
+        self.child.close()
     }
     fn schema(&self) -> &Schema {
         &self.plan.schema
@@ -1281,7 +1295,7 @@ impl<'a> LimitExecutor<'a> {
 
 impl<'a> Executor for LimitExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
-        Ok(())
+        self.child.open()
     }
     fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
         let Some((tup, rid)) = self.child.next()? else {
@@ -1294,7 +1308,7 @@ impl<'a> Executor for LimitExecutor<'a> {
         Ok(Some((tup, rid)))
     }
     fn close(&mut self) -> Result<(), ExecutorError> {
-        Ok(())
+        self.child.close()
     }
     fn schema(&self) -> &Schema {
         &self.plan.schema
@@ -1482,6 +1496,313 @@ impl<'a> Executor for WindowFunctionExecutor<'a> {
     fn schema(&self) -> &Schema {
         &self.plan.schema
     }
+    fn close(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
+pub struct FilterExecutor<'a> {
+    plan: &'a FilterPlanNode,
+    child: Box<dyn Executor + 'a>,
+}
+
+impl<'a> FilterExecutor<'a> {
+    pub fn new(plan: &'a FilterPlanNode, child: Box<dyn Executor + 'a>) -> Self {
+        Self { plan, child }
+    }
+}
+
+impl<'a> Executor for FilterExecutor<'a> {
+    fn open(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+        // pull tuples from the child until one satisfies the predicate.
+        // null predicates are treated as false (SQL three-valued logic).
+        while let Some((tup, rid)) = self.child.next()? {
+            let v = self.plan.predicate.evaluate(&tup, self.child.schema())?;
+            if matches!(v, Some(Value::BOOLEAN(true))) {
+                return Ok(Some((tup, rid)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.plan.schema
+    }
+
+    fn close(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
+pub struct ProjectionExecutor<'a> {
+    plan: &'a ProjectionPlanNode,
+    child: Box<dyn Executor + 'a>,
+}
+
+impl<'a> ProjectionExecutor<'a> {
+    pub fn new(plan: &'a ProjectionPlanNode, child: Box<dyn Executor + 'a>) -> Self {
+        Self { plan, child }
+    }
+}
+
+impl<'a> Executor for ProjectionExecutor<'a> {
+    fn open(&mut self) -> Result<(), ExecutorError> {
+        self.child.open()
+    }
+
+    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+        let Some((tup, rid)) = self.child.next()? else {
+            return Ok(None);
+        };
+        let child_schema = self.child.schema();
+        let vals: Vec<Option<Value>> = self
+            .plan
+            .expressions
+            .iter()
+            .map(|e| e.evaluate(&tup, child_schema))
+            .collect::<Result<_, _>>()?;
+        let out = self.plan.schema.encode_tuple(&vals)?;
+        Ok(Some((out, rid)))
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.plan.schema
+    }
+
+    fn close(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
+/// One-shot status schema used by DDL executors: a single INT column that reports rows affected.
+fn ddl_status_schema() -> Schema {
+    Schema::new(vec![(DataType::INT, "status".to_string())])
+}
+
+pub struct CreateTableExecutor<'a> {
+    catalog: &'a Catalog,
+    plan: &'a CreateTablePlanNode,
+    status_schema: Schema,
+    done: bool,
+}
+
+impl<'a> CreateTableExecutor<'a> {
+    pub fn new(catalog: &'a Catalog, plan: &'a CreateTablePlanNode) -> Self {
+        Self {
+            catalog,
+            plan,
+            status_schema: ddl_status_schema(),
+            done: false,
+        }
+    }
+}
+
+impl<'a> Executor for CreateTableExecutor<'a> {
+    fn open(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+        if self.done {
+            return Err(ExecutorError("already executed".to_string()));
+        }
+        self.done = true;
+        match self
+            .catalog
+            .create_table(self.plan.table_name.clone(), self.plan.schema.clone())
+        {
+            Ok(_oid) => {
+                let tup = self.status_schema.encode_tuple(&[Some(Value::INT(1))])?;
+                Ok(Some((tup, RecordId::RESERVED)))
+            }
+            Err(CatalogError::TableExists) if self.plan.if_not_exists => {
+                let tup = self.status_schema.encode_tuple(&[Some(Value::INT(0))])?;
+                Ok(Some((tup, RecordId::RESERVED)))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.status_schema
+    }
+
+    fn close(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
+pub struct DropTableExecutor<'a> {
+    catalog: &'a Catalog,
+    plan: &'a DropTablePlanNode,
+    status_schema: Schema,
+    done: bool,
+}
+
+impl<'a> DropTableExecutor<'a> {
+    pub fn new(catalog: &'a Catalog, plan: &'a DropTablePlanNode) -> Self {
+        Self {
+            catalog,
+            plan,
+            status_schema: ddl_status_schema(),
+            done: false,
+        }
+    }
+}
+
+impl<'a> Executor for DropTableExecutor<'a> {
+    fn open(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+        if self.done {
+            return Err(ExecutorError("already executed".to_string()));
+        }
+        self.done = true;
+        let dropped = self.catalog.drop_table(self.plan.table_oid)?;
+        if !dropped && !self.plan.if_exists {
+            return Err(ExecutorError(format!(
+                "table with oid {} does not exist",
+                self.plan.table_oid
+            )));
+        }
+        let tup = self
+            .status_schema
+            .encode_tuple(&[Some(Value::INT(if dropped { 1 } else { 0 }))])?;
+        Ok(Some((tup, RecordId::RESERVED)))
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.status_schema
+    }
+
+    fn close(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
+pub struct CreateIndexExecutor<'a> {
+    catalog: &'a Catalog,
+    plan: &'a CreateIndexPlanNode,
+    bpm: Arc<BufferPoolManager>,
+    status_schema: Schema,
+    done: bool,
+}
+
+impl<'a> CreateIndexExecutor<'a> {
+    pub fn new(
+        catalog: &'a Catalog,
+        plan: &'a CreateIndexPlanNode,
+        bpm: Arc<BufferPoolManager>,
+    ) -> Self {
+        Self {
+            catalog,
+            plan,
+            bpm,
+            status_schema: ddl_status_schema(),
+            done: false,
+        }
+    }
+}
+
+impl<'a> Executor for CreateIndexExecutor<'a> {
+    fn open(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+        if self.done {
+            return Err(ExecutorError("already executed".to_string()));
+        }
+        self.done = true;
+
+        // catalog.create_index takes column names, not indices; resolve via the table's schema.
+        let table = self.catalog.get_table(self.plan.table_oid)?;
+        let col_names: Vec<String> = self
+            .plan
+            .key_columns
+            .iter()
+            .map(|idx| {
+                table
+                    .schema
+                    .cols
+                    .get(*idx as usize)
+                    .map(|c| c.name.clone())
+                    .ok_or(CatalogError::ColumnOutOfBounds)
+            })
+            .collect::<Result<_, _>>()?;
+        let col_refs: Vec<&str> = col_names.iter().map(String::as_str).collect();
+
+        self.catalog.create_index(
+            self.bpm.clone(),
+            self.plan.table_oid,
+            self.plan.index_name.clone(),
+            &col_refs,
+            IndexType::BPlusTree,
+        )?;
+        let tup = self.status_schema.encode_tuple(&[Some(Value::INT(1))])?;
+        Ok(Some((tup, RecordId::RESERVED)))
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.status_schema
+    }
+
+    fn close(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
+pub struct DropIndexExecutor<'a> {
+    catalog: &'a Catalog,
+    plan: &'a DropIndexPlanNode,
+    status_schema: Schema,
+    done: bool,
+}
+
+impl<'a> DropIndexExecutor<'a> {
+    pub fn new(catalog: &'a Catalog, plan: &'a DropIndexPlanNode) -> Self {
+        Self {
+            catalog,
+            plan,
+            status_schema: ddl_status_schema(),
+            done: false,
+        }
+    }
+}
+
+impl<'a> Executor for DropIndexExecutor<'a> {
+    fn open(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+        if self.done {
+            return Err(ExecutorError("already executed".to_string()));
+        }
+        self.done = true;
+        let dropped = self.catalog.drop_index(self.plan.index_oid)?;
+        if !dropped && !self.plan.if_exists {
+            return Err(ExecutorError(format!(
+                "index with oid {} does not exist",
+                self.plan.index_oid
+            )));
+        }
+        let tup = self
+            .status_schema
+            .encode_tuple(&[Some(Value::INT(if dropped { 1 } else { 0 }))])?;
+        Ok(Some((tup, RecordId::RESERVED)))
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.status_schema
+    }
+
     fn close(&mut self) -> Result<(), ExecutorError> {
         Ok(())
     }

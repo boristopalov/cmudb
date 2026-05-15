@@ -1,6 +1,3 @@
-use std::io::{self, BufRead, Write};
-use std::sync::Arc;
-
 use cmudb::catalog::{Catalog, Schema, Value};
 use cmudb::create_buffer_pool_manager;
 use cmudb::disk::{DiskManager, DiskScheduler};
@@ -10,104 +7,116 @@ use cmudb::processor::executor::Executor;
 use cmudb::processor::executor_factory::create_executor;
 use cmudb::processor::plan::Plan;
 use cmudb::replacer::ArcReplacer;
-
+use env_logger::Env;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use std::sync::Arc;
 use tempfile::tempdir;
 
-fn main() {
+fn init_logger() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = env_logger::Builder::from_env(Env::default().default_filter_or("debug")).try_init();
+    });
+}
+
+struct TestContext<'a> {
+    planner: Planner<'a>,
+    binder: Binder<'a>,
+}
+
+fn new_test_context<'a>(catalog: &'a Catalog) -> TestContext<'a> {
+    let binder = Binder::new(&catalog);
+    let planner = Planner::new(&catalog);
+    TestContext { planner, binder }
+}
+
+#[test]
+fn test_e2e_flow() {
+    // wires up the whole dbms and executes several queries against the db
     let num_frames: usize = 64;
     let dir = tempdir().expect("failed to create tempdir for db");
-    let dm = DiskManager::new(
-        dir.path().join("cmudb.data"),
-        dir.path().join("cmudb.log"),
-    )
-    .expect("failed to create disk manager");
+    let dm = DiskManager::new(dir.path().join("cmudb.data"), dir.path().join("cmudb.log"))
+        .expect("failed to create disk manager");
     let scheduler = DiskScheduler::new(dm);
     let replacer = ArcReplacer::new(num_frames);
     let bpm = Arc::new(create_buffer_pool_manager(num_frames, replacer, scheduler));
     let catalog = Catalog::new(bpm.clone());
+    let context = new_test_context(&catalog);
 
-    let dialect = GenericDialect {};
-    let stdin = io::stdin();
-    let stdin = stdin.lock();
-    let mut stdout = io::stdout();
-    let mut buf = String::new();
-
-    println!("cmudb — a toy SQL shell. terminate statements with `;`. type `\\q` to quit.");
-
-    for line in stdin.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("input error: {e}");
-                break;
-            }
-        };
-
-        if buf.is_empty() {
-            let t = line.trim();
-            if t == "\\q" || t == "quit" || t == "exit" {
-                break;
-            }
-            if t.is_empty() {
-                prompt(&mut stdout, false);
-                continue;
-            }
-        }
-
-        buf.push_str(&line);
-        buf.push('\n');
-
-        if buf.trim_end().ends_with(';') {
-            let sql = std::mem::take(&mut buf);
-            if let Err(e) = run(&dialect, &catalog, &bpm, &sql) {
-                eprintln!("error: {e}");
-            }
-            prompt(&mut stdout, false);
-        } else {
-            prompt(&mut stdout, true);
-        }
+    let dialect = GenericDialect;
+    let create_sql = "CREATE TABLE users ( \
+        id INTEGER PRIMARY KEY, \
+        age INTEGER \
+    );";
+    let create_ast = Parser::parse_sql(&dialect, create_sql)
+        .map_err(|e| format!("parse: {e}"))
+        .unwrap();
+    let create_bound = context
+        .binder
+        .bind(create_ast)
+        .map_err(|e| format!("bind: {}", e.0))
+        .unwrap();
+    for stmt in create_bound {
+        let plan = context
+            .planner
+            .plan(stmt)
+            .map_err(|e| format!("plan: {}", e.0))
+            .unwrap();
+        let mut exec = create_executor(&catalog, &bpm, &plan);
+        exec.open().map_err(|e| format!("open: {}", e.0)).unwrap();
+        execute(&plan, &mut *exec).unwrap();
+        exec.close().map_err(|e| format!("close: {}", e.0)).unwrap();
     }
 
-    // keep the tempdir alive for the whole session
-    drop(dir);
-}
-
-fn prompt(out: &mut io::Stdout, continuation: bool) {
-    let p = if continuation { "    -> " } else { "cmudb> " };
-    let _ = out.write_all(p.as_bytes());
-    let _ = out.flush();
-}
-
-fn run(
-    dialect: &GenericDialect,
-    catalog: &Catalog,
-    bpm: &Arc<cmudb::buffer_pool::BufferPoolManager>,
-    sql: &str,
-) -> Result<(), String> {
-    let ast = Parser::parse_sql(dialect, sql).map_err(|e| format!("parse: {e}"))?;
-    let binder = Binder::new(catalog);
-    let bound = binder.bind(ast).map_err(|e| format!("bind: {}", e.0))?;
-    let planner = Planner::new(catalog);
-
-    for stmt in bound {
-        let plan = planner.plan(stmt).map_err(|e| format!("plan: {}", e.0))?;
-        let mut exec = create_executor(catalog, bpm, &plan);
-        exec.open().map_err(|e| format!("open: {}", e.0))?;
-        execute(&plan, &mut *exec)?;
-        exec.close().map_err(|e| format!("close: {}", e.0))?;
+    let insert_sql = "INSERT INTO users (id, age) VALUES (1, 25), (2, 50);";
+    let insert_ast = Parser::parse_sql(&dialect, insert_sql)
+        .map_err(|e| format!("parse: {e}"))
+        .unwrap();
+    let insert_bound = context
+        .binder
+        .bind(insert_ast)
+        .map_err(|e| format!("bind: {}", e.0))
+        .unwrap();
+    for stmt in insert_bound {
+        let plan = context
+            .planner
+            .plan(stmt)
+            .map_err(|e| format!("plan: {}", e.0))
+            .unwrap();
+        let mut exec = create_executor(&catalog, &bpm, &plan);
+        exec.open().map_err(|e| format!("open: {}", e.0)).unwrap();
+        execute(&plan, &mut *exec).unwrap();
+        exec.close().map_err(|e| format!("close: {}", e.0)).unwrap();
     }
-    Ok(())
+
+    let query_sql = "SELECT * FROM users;";
+    let query_ast = Parser::parse_sql(&dialect, query_sql)
+        .map_err(|e| format!("parse: {e}"))
+        .unwrap();
+    let query_bound = context
+        .binder
+        .bind(query_ast)
+        .map_err(|e| format!("bind: {}", e.0))
+        .unwrap();
+    for stmt in query_bound {
+        let plan = context
+            .planner
+            .plan(stmt)
+            .map_err(|e| format!("plan: {}", e.0))
+            .unwrap();
+        let mut exec = create_executor(&catalog, &bpm, &plan);
+        exec.open().map_err(|e| format!("open: {}", e.0)).unwrap();
+        execute(&plan, &mut *exec).unwrap();
+        exec.close().map_err(|e| format!("close: {}", e.0)).unwrap();
+    }
 }
 
 fn execute(plan: &Plan, exec: &mut dyn Executor) -> Result<(), String> {
     match plan {
         Plan::Insert(_) => {
             if let Some((tup, _)) = exec.next().map_err(|e| format!("exec: {}", e.0))? {
-                let n = i32::from_ne_bytes(
-                    tup.data.as_slice().try_into().unwrap_or([0, 0, 0, 0]),
-                );
+                let n = i32::from_ne_bytes(tup.data.as_slice().try_into().unwrap_or([0, 0, 0, 0]));
                 println!("INSERT {n}");
             }
         }
@@ -141,7 +150,7 @@ fn execute(plan: &Plan, exec: &mut dyn Executor) -> Result<(), String> {
             exec.next().map_err(|e| format!("exec: {}", e.0))?;
             println!("DROP INDEX");
         }
-        _ => print_rows(exec)?,
+        _ => print_rows(exec).unwrap(),
     }
     Ok(())
 }

@@ -5,6 +5,7 @@ use crate::{catalog::index_schema::TableIndex, table_heap::Tuple};
 use ordered_float::OrderedFloat;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::AcqRel;
 
@@ -27,6 +28,7 @@ pub struct TableInfo {
 }
 
 pub struct IndexInfo {
+    pub oid: u32,
     pub name: String,
     pub table_oid: u32,
     pub index: TableIndex,
@@ -38,14 +40,17 @@ pub enum IndexType {
 
 /// Stores atomic reference counted pointers to tables and indexes.
 /// Executors should retrieve tables and indexes from here so that they can do work.
+///
+/// Lock ordering, to avoid deadlocks: always acquire in this order if multiple are needed:
+///   tables -> table_names -> indexes -> index_names
 pub struct Catalog {
     next_table_oid: AtomicU32,
     next_index_oid: AtomicU32,
     bpm: Arc<BufferPoolManager>,
-    tables: HashMap<u32, Arc<TableInfo>>, // table oid -> table info
-    table_names: HashMap<String, u32>,    // table name -> table oid
-    indexes: HashMap<u32, Arc<IndexInfo>>, // index oid -> index info
-    index_names: HashMap<String, HashMap<String, u32>>, // talbe name -> index name -> index oid
+    tables: RwLock<HashMap<u32, Arc<TableInfo>>>, // table oid -> table info
+    table_names: RwLock<HashMap<String, u32>>,    // table name -> table oid
+    indexes: RwLock<HashMap<u32, Arc<IndexInfo>>>, // index oid -> index info
+    index_names: RwLock<HashMap<String, HashMap<String, u32>>>, // table name -> index name -> index oid
 }
 
 impl Catalog {
@@ -54,10 +59,10 @@ impl Catalog {
             next_table_oid: AtomicU32::new(0),
             next_index_oid: AtomicU32::new(0),
             bpm,
-            tables: HashMap::new(),
-            table_names: HashMap::new(),
-            indexes: HashMap::new(),
-            index_names: HashMap::new(),
+            tables: RwLock::new(HashMap::new()),
+            table_names: RwLock::new(HashMap::new()),
+            indexes: RwLock::new(HashMap::new()),
+            index_names: RwLock::new(HashMap::new()),
         }
     }
 
@@ -69,8 +74,11 @@ impl Catalog {
         self.next_index_oid.fetch_add(1, AcqRel)
     }
 
-    pub fn create_table(&mut self, name: String, schema: Schema) -> Result<u32, CatalogError> {
-        if self.table_names.contains_key(&name) {
+    pub fn create_table(&self, name: String, schema: Schema) -> Result<u32, CatalogError> {
+        let mut tables = self.tables.write().unwrap();
+        let mut table_names = self.table_names.write().unwrap();
+
+        if table_names.contains_key(&name) {
             return Err(CatalogError::TableExists);
         }
 
@@ -82,29 +90,52 @@ impl Catalog {
         };
         let oid = self.next_table_oid();
 
-        self.tables.insert(oid, Arc::new(tinfo));
-        self.table_names.insert(name, oid);
+        tables.insert(oid, Arc::new(tinfo));
+        table_names.insert(name, oid);
         Ok(oid)
     }
 
-    pub fn table_oid(&self, name: &str) -> Result<u32, CatalogError> {
-        if !self.table_names.contains_key(name) {
-            return Err(CatalogError::TableDoesNotExist);
+    /// Drops a table by oid, along with any indexes associated with it.
+    /// Returns `Ok(true)` if the table existed and was dropped, `Ok(false)` otherwise.
+    pub fn drop_table(&self, oid: u32) -> Result<bool, CatalogError> {
+        let mut tables = self.tables.write().unwrap();
+        let mut table_names = self.table_names.write().unwrap();
+        let mut indexes = self.indexes.write().unwrap();
+        let mut index_names = self.index_names.write().unwrap();
+
+        let Some(tinfo) = tables.remove(&oid) else {
+            return Ok(false);
+        };
+        table_names.remove(&tinfo.name);
+
+        // drop any indexes on this table
+        if let Some(table_indexes) = index_names.remove(&tinfo.name) {
+            for (_iname, ioid) in table_indexes {
+                indexes.remove(&ioid);
+            }
         }
-        Ok(*self.table_names.get(name).unwrap())
+        Ok(true)
+    }
+
+    pub fn table_oid(&self, name: &str) -> Result<u32, CatalogError> {
+        let table_names = self.table_names.read().unwrap();
+        table_names
+            .get(name)
+            .copied()
+            .ok_or(CatalogError::TableDoesNotExist)
     }
 
     pub fn get_table(&self, oid: u32) -> Result<Arc<TableInfo>, CatalogError> {
-        if !self.tables.contains_key(&oid) {
-            return Err(CatalogError::TableDoesNotExist);
-        }
-        let table = self.tables.get(&oid).unwrap();
-        Ok(table.clone())
+        let tables = self.tables.read().unwrap();
+        tables
+            .get(&oid)
+            .cloned()
+            .ok_or(CatalogError::TableDoesNotExist)
     }
 
     /// TODO: populate the index if the table it is being created for has data in it
     pub fn create_index(
-        &mut self,
+        &self,
         bpm: Arc<BufferPoolManager>,
         table_oid: u32,
         name: String, // index name
@@ -112,8 +143,8 @@ impl Catalog {
         index_type: IndexType,
     ) -> Result<u32, CatalogError> {
         let (table_name, indexed_cols, indexed_col_idxs, table_bitmap_len) = {
-            let tinfo = self
-                .tables
+            let tables = self.tables.read().unwrap();
+            let tinfo = tables
                 .get(&table_oid)
                 .ok_or(CatalogError::TableDoesNotExist)?;
 
@@ -135,7 +166,10 @@ impl Catalog {
             )
         };
 
-        if let Some(table_indexes) = self.index_names.get(&table_name) {
+        let mut indexes = self.indexes.write().unwrap();
+        let mut index_names = self.index_names.write().unwrap();
+
+        if let Some(table_indexes) = index_names.get(&table_name) {
             if table_indexes.contains_key(&name) {
                 return Err(CatalogError::IndexExists);
             }
@@ -152,46 +186,62 @@ impl Catalog {
         .map_err(|_| CatalogError::IndexCreationError(("failed to create index").to_string()))?;
         let oid = self.next_index_oid();
         let info = IndexInfo {
+            oid,
             name: name.clone(),
             table_oid,
             index,
         };
-        self.indexes.insert(oid, Arc::new(info));
-        self.index_names
-            .entry(table_name)
-            .or_default()
-            .insert(name, oid);
+        indexes.insert(oid, Arc::new(info));
+        index_names.entry(table_name).or_default().insert(name, oid);
         Ok(oid)
     }
 
+    /// Drops an index by oid. Returns `Ok(true)` if the index existed and was dropped.
+    pub fn drop_index(&self, oid: u32) -> Result<bool, CatalogError> {
+        let tables = self.tables.read().unwrap();
+        let mut indexes = self.indexes.write().unwrap();
+        let mut index_names = self.index_names.write().unwrap();
+
+        let Some(info) = indexes.remove(&oid) else {
+            return Ok(false);
+        };
+
+        // remove from index_names: look up the table name via table_oid
+        if let Some(tinfo) = tables.get(&info.table_oid) {
+            if let Some(table_indexes) = index_names.get_mut(&tinfo.name) {
+                table_indexes.remove(&info.name);
+            }
+        }
+        Ok(true)
+    }
+
     pub fn index_oid(&self, table_name: &str, index_name: &str) -> Result<u32, CatalogError> {
-        let indexes = self
-            .index_names
+        let index_names = self.index_names.read().unwrap();
+        let indexes = index_names
             .get(table_name)
             .ok_or(CatalogError::TableDoesNotExist)?;
 
-        let oid = indexes
+        indexes
             .get(index_name)
-            .ok_or(CatalogError::IndexDoesNotExist)?;
-
-        Ok(*oid)
+            .copied()
+            .ok_or(CatalogError::IndexDoesNotExist)
     }
 
     pub fn get_index(&self, oid: u32) -> Result<Arc<IndexInfo>, CatalogError> {
-        let index = self
-            .indexes
+        let indexes = self.indexes.read().unwrap();
+        indexes
             .get(&oid)
-            .ok_or(CatalogError::IndexDoesNotExist)?;
-
-        Ok(index.clone())
+            .cloned()
+            .ok_or(CatalogError::IndexDoesNotExist)
     }
 
     pub fn get_table_indexes(&self, table_oid: u32) -> Result<Vec<Arc<IndexInfo>>, CatalogError> {
-        if !self.tables.contains_key(&table_oid) {
+        let tables = self.tables.read().unwrap();
+        if !tables.contains_key(&table_oid) {
             return Err(CatalogError::TableDoesNotExist);
         }
-        Ok(self
-            .indexes
+        let indexes = self.indexes.read().unwrap();
+        Ok(indexes
             .values()
             .filter(|info| info.table_oid == table_oid)
             .cloned()
@@ -199,11 +249,17 @@ impl Catalog {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Schema {
     pub cols: Vec<Column>,
     pub data_len: usize, // payload size only (sum of column sizes); does not include the bitmap prefix
     pub bitmap_len: usize, // bytes of null bitmap that prefix every encoded tuple
+    /// hacky way to track how many columns are from the left join table
+    /// note this assumes 2-way joins only
+    /// this is needed to correctly resolve column indices after a join, since
+    /// after a join the combined schema does not make any distinction between
+    /// the left table's columns and the right table.
+    pub join_offset: Option<usize>,
 }
 
 impl Schema {
@@ -228,6 +284,7 @@ impl Schema {
             cols,
             data_len: offset,
             bitmap_len,
+            join_offset: None,
         }
     }
 
@@ -282,10 +339,10 @@ pub fn is_null(data: &[u8], col_idx: usize) -> bool {
 
 #[derive(Debug, Clone)]
 pub struct Column {
-    name: String,
-    dtype: DataType,
-    offset: usize, // offset into the payload region (after the bitmap prefix)
-    inlined: bool, // whether the data is inlined (true for fixed-width data, false for variable-length)
+    pub name: String,
+    pub dtype: DataType,
+    pub offset: usize, // offset into the payload region (after the bitmap prefix)
+    pub inlined: bool, // whether the data is inlined (true for fixed-width data, false for variable-length)
 }
 
 /// Defines the value types we support.
@@ -304,7 +361,7 @@ pub enum Value {
 }
 
 impl Value {
-    fn data_type(&self) -> DataType {
+    pub fn data_type(&self) -> DataType {
         match self {
             Value::BOOLEAN(_) => DataType::BOOLEAN,
             Value::INT(_) => DataType::INT,

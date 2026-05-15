@@ -1,10 +1,11 @@
 use crate::buffer_pool::BufferPoolManager;
 use crate::catalog::Catalog;
 use crate::processor::executor::{
-    AggregationExecutor, DeleteExecutor, Executor, ExternalMergeSortExecutor, HashJoinExecutor,
-    IndexScanExecutor, InsertExecutor, LimitExecutor, NestedIndexJoinExecutor,
-    NestedLoopJoinExecutor, SeqScanExecutor, SortExecutor, UpdateExecutor, ValuesExecutor,
-    WindowFunctionExecutor,
+    AggregationExecutor, CreateIndexExecutor, CreateTableExecutor, DeleteExecutor,
+    DropIndexExecutor, DropTableExecutor, Executor, ExternalMergeSortExecutor, FilterExecutor,
+    HashJoinExecutor, IndexScanExecutor, InsertExecutor, LimitExecutor, NestedIndexJoinExecutor,
+    NestedLoopJoinExecutor, ProjectionExecutor, SeqScanExecutor, SortExecutor, UpdateExecutor,
+    ValuesExecutor, WindowFunctionExecutor,
 };
 use crate::processor::plan::Plan;
 use std::sync::Arc;
@@ -64,6 +65,18 @@ pub fn create_executor<'a>(
             let child = create_executor(catalog, bpm, &p.child);
             Box::new(WindowFunctionExecutor::new(p, child))
         }
+        Plan::Filter(p) => {
+            let child = create_executor(catalog, bpm, &p.child);
+            Box::new(FilterExecutor::new(p, child))
+        }
+        Plan::Projection(p) => {
+            let child = create_executor(catalog, bpm, &p.child);
+            Box::new(ProjectionExecutor::new(p, child))
+        }
+        Plan::CreateTable(p) => Box::new(CreateTableExecutor::new(catalog, p)),
+        Plan::DropTable(p) => Box::new(DropTableExecutor::new(catalog, p)),
+        Plan::CreateIndex(p) => Box::new(CreateIndexExecutor::new(catalog, p, bpm.clone())),
+        Plan::DropIndex(p) => Box::new(DropIndexExecutor::new(catalog, p)),
     }
 }
 
@@ -98,7 +111,7 @@ mod tests {
 
     #[test]
     fn insert_then_seq_scan_returns_inserted_rows() {
-        let (mut catalog, bpm, _dir) = make_catalog();
+        let (catalog, bpm, _dir) = make_catalog();
         let table_oid = catalog
             .create_table("t".to_string(), make_schema())
             .expect("create table");

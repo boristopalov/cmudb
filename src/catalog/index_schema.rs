@@ -19,9 +19,9 @@ pub enum IndexValue {
 /// We do not allow nulls in indexes!!!
 pub struct TableIndex {
     indexed_cols: Vec<Column>, // offsets are into the table tuple's payload region
-    indexed_col_idxs: Vec<usize>, // each indexed column's position in the table schema (for null-bit lookup)
-    table_bitmap_len: usize,      // bytes of bitmap prefix on tuples from the indexed table
-    pub schema: Schema,           // schema of the index key, not the tuple
+    pub indexed_col_idxs: Vec<usize>, // each indexed column's position in the table schema (for null-bit lookup)
+    table_bitmap_len: usize,          // bytes of bitmap prefix on tuples from the indexed table
+    pub schema: Schema,               // schema of the index key, not the tuple
     key_size: usize,
     idx: Box<dyn Index>,
 }

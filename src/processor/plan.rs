@@ -12,6 +12,8 @@ pub enum Plan {
     Update(UpdatePlanNode),
     Delete(DeletePlanNode),
     IndexScan(IndexScanPlanNode),
+    Filter(FilterPlanNode),
+    Projection(ProjectionPlanNode),
     Aggregation(AggregationPlanNode),
     NestedLoopJoin(NestedLoopJoinPlanNode),
     NestedIndexJoin(NestedIndexJoinPlanNode),
@@ -20,6 +22,10 @@ pub enum Plan {
     ExternalMergeSort(ExternalMergeSortPlanNode),
     Limit(LimitPlanNode),
     WindowFunction(WindowFunctionPlanNode),
+    CreateTable(CreateTablePlanNode),
+    DropTable(DropTablePlanNode),
+    CreateIndex(CreateIndexPlanNode),
+    DropIndex(DropIndexPlanNode),
 }
 
 pub struct SeqScanPlanNode {
@@ -65,6 +71,7 @@ pub struct FilterPlanNode {
 }
 
 pub struct ProjectionPlanNode {
+    pub schema: Schema,
     pub expressions: Vec<Expression>,
     pub child: Box<Plan>,
 }
@@ -159,6 +166,28 @@ pub struct LimitPlanNode {
     pub limit: u32,
 }
 
+pub struct CreateTablePlanNode {
+    pub table_name: String,
+    pub schema: Schema,
+    pub if_not_exists: bool,
+}
+
+pub struct DropTablePlanNode {
+    pub table_oid: u32,
+    pub if_exists: bool,
+}
+
+pub struct CreateIndexPlanNode {
+    pub index_name: String,
+    pub table_oid: u32,
+    pub key_columns: Vec<u32>,
+}
+
+pub struct DropIndexPlanNode {
+    pub index_oid: u32,
+    pub if_exists: bool,
+}
+
 #[derive(Clone)]
 pub enum Expression {
     Constant(Option<Value>),
@@ -175,6 +204,20 @@ pub enum Expression {
 }
 
 impl Expression {
+    /// The planner needs to know the data type of expressions
+    /// at plan-time
+    pub fn dtype(&self) -> Option<DataType> {
+        match self {
+            Expression::Column { dtype, .. } => Some(*dtype),
+            Expression::Constant(Some(v)) => Some(v.data_type()),
+            Expression::Constant(None) => None,
+            Expression::Binary { left, right, op } => match op {
+                Op::Add | Op::Sub | Op::Mul | Op::Div => left.dtype().or_else(|| right.dtype()),
+                _ => Some(DataType::BOOLEAN),
+            },
+        }
+    }
+
     /// Evaluates am expression against a single tuple
     pub fn evaluate(&self, tuple: &Tuple, schema: &Schema) -> Result<Option<Value>, ExecutorError> {
         match self {
@@ -184,13 +227,16 @@ impl Expression {
                 return Ok(eval_binary(op, l, r));
             }
             Expression::Column {
-                tuple_idx,
-                col_idx,
-                dtype,
+                tuple_idx, col_idx, ..
             } => {
-                let c_idx = *col_idx as usize;
+                let mut idx = *col_idx as usize;
+                if *tuple_idx == 1 {
+                    idx += schema.join_offset.expect(
+                        "tuple_idx=1 column reference evaluated against a non-join schema",
+                    );
+                }
                 schema
-                    .get_value(tuple, c_idx)
+                    .get_value(tuple, idx)
                     .map_err(|_| ExecutorError("error when evaluating".to_string()))
             }
             Expression::Constant(v) => Ok(v.clone()),
