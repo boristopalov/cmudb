@@ -8,10 +8,11 @@ This is, roughly, a Rust port of CMU's BusTub (https://github.com/cmu-db/bustub)
 - B+ tree indexes with optimistic latch coupling
 - An in-memory catalog
 - Most executors described in the CMU course
+- parser (using sqlparser crate)
+- binder
+- planner
 
 ## What's missing:
-- parser, which will be more-or-less dropped in us the datafusion sqlparser crate
-- binder
 - optimizer
 - mvcc
 - support for more types, only a few basic types are supported (int, booleans, floats, timestamps)
