@@ -1,6 +1,6 @@
 # cmudb
 
-This is a Rust implementation of a relation DBMS. It takes heavy inspiration from CMU's BusTub (https://github.com/cmu-db/bustub).
+This is a Rust implementation of a relational DBMS. It takes heavy inspiration from CMU's BusTub (https://github.com/cmu-db/bustub).
 
 ## What's done:
 - disk-backed pages for tables
