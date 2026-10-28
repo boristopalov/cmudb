@@ -287,8 +287,6 @@ impl TableHeap {
         })
     }
 
-    /// Scan only slots present at creation. Later deletions remain visible;
-    /// this bounds appends without providing transaction snapshot isolation.
     pub fn iter(&self) -> TableHeapIterator {
         let tail = self.tail.lock();
         TableHeapIterator {
