@@ -1,7 +1,7 @@
 use crate::buf::{BufReader, BufWriter, BufferError};
 use crate::buffer_pool::{BpmError, BufferPoolManager};
 use crate::disk::PAGE_SIZE;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use std::fmt;
 use std::sync::Arc;
 
@@ -88,7 +88,6 @@ impl TablePage {
         directory_end + tuple_len <= self.free_space_offset as usize
     }
 
-    /// Stage all fallible encoding before changing the buffer-pool page.
     fn insert(&mut self, tuple: &Tuple, data: &mut [u8]) -> Result<u32, TablePageError> {
         if !self.can_insert(tuple.data.len()) {
             return Err(TablePageError("tuple does not fit on page".to_string()));
@@ -181,8 +180,6 @@ pub struct Tuple {
 pub struct TableHeap {
     bpm: Arc<BufferPoolManager>,
     pub first_page_id: usize, // the page where the table starts
-    // Lock order: heap state, then at most one buffer-pool page guard. All
-    // mutations and scan-bound capture use this lock; get/scan only read pages.
     tail: Mutex<Tail>,
 }
 
@@ -268,17 +265,18 @@ impl Iterator for TableHeapIterator {
 
 impl TableHeap {
     pub fn new(bpm: Arc<BufferPoolManager>) -> Result<Self, TableHeapError> {
-        let mut page_guard = bpm
-            .new_page()
-            .map_err(|e| TableHeapError(format!("failed to allocate first page: {e}")))?;
-        let page_id = page_guard
-            .page_id()
-            .ok_or_else(|| TableHeapError("new page has no page_id".to_string()))?;
-        u32::try_from(page_id)
-            .map_err(|_| TableHeapError("page ID exceeds RID capacity".to_string()))?;
-        let initial = TablePage::empty();
-        initial.encode(page_guard.data_mut())?;
-        drop(page_guard);
+        let page_id = {
+            let mut page_guard = bpm
+                .new_page()
+                .map_err(|e| TableHeapError(format!("failed to allocate first page: {e}")))?;
+            let page_id = page_guard
+                .page_id()
+                .ok_or_else(|| TableHeapError("new page has no page_id".to_string()))?;
+            u32::try_from(page_id)
+                .map_err(|_| TableHeapError("page ID exceeds RID capacity".to_string()))?;
+            TablePage::empty().encode(page_guard.data_mut())?;
+            page_id
+        };
         Ok(Self {
             bpm,
             first_page_id: page_id,
@@ -292,8 +290,6 @@ impl TableHeap {
     /// Scan only slots present at creation. Later deletions remain visible;
     /// this bounds appends without providing transaction snapshot isolation.
     pub fn iter(&self) -> TableHeapIterator {
-        // Slots are append-only, including tombstones. Capture both limits under
-        // the insertion lock so even an empty scan excludes subsequent inserts.
         let tail = self.tail.lock();
         TableHeapIterator {
             bpm: self.bpm.clone(),
@@ -306,15 +302,19 @@ impl TableHeap {
     }
 
     pub fn insert(&self, t: &Tuple) -> Result<RecordId, TableHeapError> {
-        self.insert_locked(t, &mut self.tail.lock())
+        let mut tail = self.tail.lock();
+        self.insert_locked(t, &mut tail)
     }
 
-    /// Return the current insertion page under the heap mutation lock.
     pub fn last_page_id(&self) -> usize {
         self.tail.lock().page_id
     }
 
-    fn insert_locked(&self, t: &Tuple, tail: &mut Tail) -> Result<RecordId, TableHeapError> {
+    fn insert_locked(
+        &self,
+        t: &Tuple,
+        tail: &mut MutexGuard<'_, Tail>,
+    ) -> Result<RecordId, TableHeapError> {
         if t.data.len() > TablePage::MAX_TUPLE_SIZE {
             return Err(TableHeapError(format!(
                 "tuple of size {} exceeds maximum {}",
@@ -322,52 +322,54 @@ impl TableHeap {
                 TablePage::MAX_TUPLE_SIZE
             )));
         }
-        let mut guard = self.bpm.write_page(tail.page_id)?;
-        let mut page = TablePage::decode(guard.data_mut())?;
-        if page.can_insert(t.data.len()) {
-            let slot_id = page.insert(t, guard.data_mut())?;
-            tail.num_tuples = page.num_tuples as u32;
-            return Ok(RecordId {
-                page_id: tail.page_id as u32,
-                slot_id,
-            });
-        }
-        drop(guard);
-
-        // Initialize before publication. Release each guard before requesting
-        // another, allowing growth even with a single buffer-pool frame.
-        let mut new_guard = self.bpm.new_page()?;
-        let new_id = new_guard
-            .page_id()
-            .ok_or_else(|| TableHeapError("new page has no page_id".to_string()))?;
-        let new_id_u32 = u32::try_from(new_id)
-            .map_err(|_| TableHeapError("page ID exceeds RID capacity".to_string()))?;
-        let mut new_page = TablePage::empty();
-        let slot_id = new_page.insert(t, new_guard.data_mut())?;
-        drop(new_guard);
-
-        // A failed reacquisition leaves an unreachable allocation, but does not
-        // change the existing chain or tail. There is no page reclamation API.
-        let mut old_guard = self.bpm.write_page(tail.page_id)?;
-        // Only the link changes; preserve all tuple bytes and tombstones. This
-        // copy and the state update are infallible once the guard is acquired.
-        old_guard.data_mut()[..4].copy_from_slice(&new_id_u32.to_le_bytes());
-        tail.page_id = new_id;
-        tail.num_tuples = 1;
-        Ok(RecordId {
-            page_id: new_id_u32,
-            slot_id,
-        })
+        let slot_id = {
+            let mut guard = self.bpm.write_page(tail.page_id)?;
+            let mut page = TablePage::decode(guard.data_mut())?;
+            if page.can_insert(t.data.len()) {
+                Some(page.insert(t, guard.data_mut())?)
+            } else {
+                None
+            }
+        };
+        let (page_id, slot_id) = match slot_id {
+            Some(slot_id) => (tail.page_id as u32, slot_id),
+            None => {
+                let (new_id, slot_id) = {
+                    let mut guard = self.bpm.new_page()?;
+                    let page_id = guard
+                        .page_id()
+                        .ok_or_else(|| TableHeapError("new page has no page_id".to_string()))?;
+                    let page_id = u32::try_from(page_id)
+                        .map_err(|_| TableHeapError("page ID exceeds RID capacity".to_string()))?;
+                    let slot_id = TablePage::empty().insert(t, guard.data_mut())?;
+                    (page_id, slot_id)
+                };
+                {
+                    let mut guard = self.bpm.write_page(tail.page_id)?;
+                    guard.data_mut()[..4].copy_from_slice(&new_id.to_le_bytes());
+                }
+                (new_id, slot_id)
+            }
+        };
+        **tail = Tail {
+            page_id: page_id as usize,
+            num_tuples: slot_id + 1,
+        };
+        Ok(RecordId { page_id, slot_id })
     }
 
     /// Logically deletes a tuple from the table heap by marking the tuple as tombstoned.
     /// Note that this does not physically reclaim space on disk.
     pub fn delete(&self, rid: &RecordId) -> Result<(), TableHeapError> {
-        let _tail = self.tail.lock();
-        self.delete_locked(rid)
+        let tail = self.tail.lock();
+        self.delete_locked(rid, &tail)
     }
 
-    fn delete_locked(&self, rid: &RecordId) -> Result<(), TableHeapError> {
+    fn delete_locked(
+        &self,
+        rid: &RecordId,
+        _tail: &MutexGuard<'_, Tail>,
+    ) -> Result<(), TableHeapError> {
         let mut page_guard = self.bpm.write_page(rid.page_id as usize).map_err(|e| {
             TableHeapError(format!(
                 "failed to acquire write lock on page {} for delete of {rid}: {e}",
@@ -438,13 +440,10 @@ impl TableHeap {
         new: &'a Tuple,
     ) -> Result<(RecordId, &'a Tuple), TableHeapError> {
         let mut tail = self.tail.lock();
-        // Validate before inserting, and serialize against other deletes/updates.
         self.get(rid)?;
         let new_rid = self.insert_locked(new, &mut tail)?;
-        if let Err(err) = self.delete_locked(&rid) {
-            // Best-effort cleanup if accessing the original fails after insert.
-            // Full atomicity across I/O failures requires transaction recovery.
-            if let Err(cleanup) = self.delete_locked(&new_rid) {
+        if let Err(err) = self.delete_locked(&rid, &tail) {
+            if let Err(cleanup) = self.delete_locked(&new_rid, &tail) {
                 return Err(TableHeapError(format!(
                     "update could not delete original: {}; replacement {new_rid} cleanup failed: {}",
                     err.0, cleanup.0
