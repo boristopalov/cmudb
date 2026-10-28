@@ -1,6 +1,7 @@
 use crate::buf::{BufReader, BufWriter, BufferError};
 use crate::buffer_pool::{BpmError, BufferPoolManager};
 use crate::disk::PAGE_SIZE;
+use parking_lot::{Mutex, MutexGuard};
 use std::fmt;
 use std::sync::Arc;
 
@@ -68,6 +69,46 @@ pub struct TablePage {
 }
 
 impl TablePage {
+    const HEADER_SIZE: usize = 12;
+    const SLOT_SIZE: usize = 9;
+    const MAX_TUPLE_SIZE: usize = PAGE_SIZE - Self::HEADER_SIZE - Self::SLOT_SIZE;
+
+    fn empty() -> Self {
+        Self {
+            next_page_id: 0,
+            num_tuples: 0,
+            num_deleted_tuples: 0,
+            free_space_offset: PAGE_SIZE as u32,
+            tuples_meta: Vec::new(),
+        }
+    }
+
+    fn can_insert(&self, tuple_len: usize) -> bool {
+        let directory_end = Self::HEADER_SIZE + (self.tuples_meta.len() + 1) * Self::SLOT_SIZE;
+        directory_end + tuple_len <= self.free_space_offset as usize
+    }
+
+    fn insert(&mut self, tuple: &Tuple, data: &mut [u8]) -> Result<u32, TablePageError> {
+        if !self.can_insert(tuple.data.len()) {
+            return Err(TablePageError("tuple does not fit on page".to_string()));
+        }
+        let offset = self.next_free_offset();
+        let size = tuple.data.len() as u32;
+        let slot = self.num_tuples as u32;
+        self.insert_tuple_metadata(TupleMeta {
+            offset,
+            size,
+            is_deleted: 0,
+        });
+        self.num_tuples += 1;
+        let mut staged = [0; PAGE_SIZE];
+        staged.copy_from_slice(data);
+        self.encode(&mut staged)?;
+        staged[(offset - size) as usize..offset as usize].copy_from_slice(&tuple.data);
+        data.copy_from_slice(&staged);
+        Ok(slot)
+    }
+
     pub fn decode(data: &[u8]) -> Result<Self, TablePageError> {
         let mut reader = BufReader::new(data)?;
         let next_page_id = reader.read_u32_le()?;
@@ -139,7 +180,12 @@ pub struct Tuple {
 pub struct TableHeap {
     bpm: Arc<BufferPoolManager>,
     pub first_page_id: usize, // the page where the table starts
-    pub last_page_id: usize,  // the page where we insert new tuples into
+    tail: Mutex<Tail>,
+}
+
+struct Tail {
+    page_id: usize,
+    num_tuples: u32,
 }
 
 /// TableHeapIterator streams back tuples of (Tuple, RecordId) from the table heap.
@@ -149,6 +195,8 @@ pub struct TableHeapIterator {
     current_page_id: u32,
     current_slot_id: u32,
     last_page_id: u32,
+    last_page_slots: u32,
+    finished: bool,
 }
 
 impl Iterator for TableHeapIterator {
@@ -156,12 +204,17 @@ impl Iterator for TableHeapIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if self.current_page_id > self.last_page_id {
+            if self.finished
+                || (self.current_page_id == self.last_page_id
+                    && self.current_slot_id >= self.last_page_slots)
+            {
+                self.finished = true;
                 return None;
             }
             let page_guard = match self.bpm.read_page(self.current_page_id as usize) {
                 Ok(g) => g,
                 Err(e) => {
+                    self.finished = true;
                     return Some(Err(TableHeapError(format!(
                         "failed to read page {} during scan: {e}",
                         self.current_page_id
@@ -172,6 +225,7 @@ impl Iterator for TableHeapIterator {
             let page = match TablePage::decode(page_guard.data()) {
                 Ok(p) => p,
                 Err(e) => {
+                    self.finished = true;
                     return Some(Err(TableHeapError(format!(
                         "failed to decode page {} during scan: {}",
                         self.current_page_id, e.0
@@ -179,7 +233,8 @@ impl Iterator for TableHeapIterator {
                 }
             };
             if self.current_slot_id as usize >= page.tuples_meta.len() {
-                if page.next_page_id == 0 {
+                if self.current_page_id == self.last_page_id || page.next_page_id == 0 {
+                    self.finished = true;
                     return None;
                 }
                 self.current_page_id = page.next_page_id;
@@ -210,83 +265,109 @@ impl Iterator for TableHeapIterator {
 
 impl TableHeap {
     pub fn new(bpm: Arc<BufferPoolManager>) -> Result<Self, TableHeapError> {
-        let mut page_guard = bpm
-            .new_page()
-            .map_err(|e| TableHeapError(format!("failed to allocate first page: {e}")))?;
-        let page_id = page_guard
-            .page_id()
-            .ok_or_else(|| TableHeapError("new page has no page_id".to_string()))?;
-        let initial = TablePage {
-            next_page_id: 0,
-            num_tuples: 0,
-            num_deleted_tuples: 0,
-            free_space_offset: PAGE_SIZE as u32,
-            tuples_meta: Vec::new(),
+        let page_id = {
+            let mut page_guard = bpm
+                .new_page()
+                .map_err(|e| TableHeapError(format!("failed to allocate first page: {e}")))?;
+            let page_id = page_guard
+                .page_id()
+                .ok_or_else(|| TableHeapError("new page has no page_id".to_string()))?;
+            u32::try_from(page_id)
+                .map_err(|_| TableHeapError("page ID exceeds RID capacity".to_string()))?;
+            TablePage::empty().encode(page_guard.data_mut())?;
+            page_id
         };
-        initial.encode(page_guard.data_mut())?;
-        drop(page_guard);
         Ok(Self {
             bpm,
             first_page_id: page_id,
-            last_page_id: page_id,
+            tail: Mutex::new(Tail {
+                page_id,
+                num_tuples: 0,
+            }),
         })
     }
 
     pub fn iter(&self) -> TableHeapIterator {
+        let tail = self.tail.lock();
         TableHeapIterator {
             bpm: self.bpm.clone(),
             current_page_id: self.first_page_id as u32,
             current_slot_id: 0,
-            last_page_id: self.last_page_id as u32,
+            last_page_id: tail.page_id as u32,
+            last_page_slots: tail.num_tuples,
+            finished: false,
         }
     }
 
     pub fn insert(&self, t: &Tuple) -> Result<RecordId, TableHeapError> {
-        let mut page_guard = self.bpm.write_page(self.last_page_id).map_err(|e| {
-            TableHeapError(format!(
-                "failed to acquire write lock on last page {} for insert: {e}",
-                self.last_page_id
-            ))
-        })?;
-        let data = page_guard.data_mut();
-        let mut table_page = TablePage::decode(&data)?;
-        let tuple_len = t.data.len();
-        let offset = table_page.next_free_offset();
+        let mut tail = self.tail.lock();
+        self.insert_locked(t, &mut tail)
+    }
 
-        if (offset as usize) < tuple_len {
+    pub fn last_page_id(&self) -> usize {
+        self.tail.lock().page_id
+    }
+
+    fn insert_locked(
+        &self,
+        t: &Tuple,
+        tail: &mut MutexGuard<'_, Tail>,
+    ) -> Result<RecordId, TableHeapError> {
+        if t.data.len() > TablePage::MAX_TUPLE_SIZE {
             return Err(TableHeapError(format!(
-                "tuple of size {tuple_len} does not fit on page {} (free_space_offset={offset})",
-                self.last_page_id
+                "tuple of size {} exceeds maximum {}",
+                t.data.len(),
+                TablePage::MAX_TUPLE_SIZE
             )));
         }
-
-        let meta = TupleMeta {
-            offset,
-            size: tuple_len as u32,
-            is_deleted: 0,
+        let slot_id = {
+            let mut guard = self.bpm.write_page(tail.page_id)?;
+            let mut page = TablePage::decode(guard.data_mut())?;
+            if page.can_insert(t.data.len()) {
+                Some(page.insert(t, guard.data_mut())?)
+            } else {
+                None
+            }
         };
-
-        let start = (offset - meta.size) as usize;
-        let end = offset as usize;
-
-        table_page.insert_tuple_metadata(meta);
-        table_page.num_tuples += 1;
-
-        // write the tuple into the page
-        data[start..end].copy_from_slice(&t.data);
-
-        let slot_id = (table_page.tuples_meta.len() - 1) as u32;
-        table_page.encode(data)?;
-
-        Ok(RecordId {
-            page_id: self.last_page_id as u32,
-            slot_id,
-        })
+        let (page_id, slot_id) = match slot_id {
+            Some(slot_id) => (tail.page_id as u32, slot_id),
+            None => {
+                let (new_id, slot_id) = {
+                    let mut guard = self.bpm.new_page()?;
+                    let page_id = guard
+                        .page_id()
+                        .ok_or_else(|| TableHeapError("new page has no page_id".to_string()))?;
+                    let page_id = u32::try_from(page_id)
+                        .map_err(|_| TableHeapError("page ID exceeds RID capacity".to_string()))?;
+                    let slot_id = TablePage::empty().insert(t, guard.data_mut())?;
+                    (page_id, slot_id)
+                };
+                {
+                    let mut guard = self.bpm.write_page(tail.page_id)?;
+                    guard.data_mut()[..4].copy_from_slice(&new_id.to_le_bytes());
+                }
+                (new_id, slot_id)
+            }
+        };
+        **tail = Tail {
+            page_id: page_id as usize,
+            num_tuples: slot_id + 1,
+        };
+        Ok(RecordId { page_id, slot_id })
     }
 
     /// Logically deletes a tuple from the table heap by marking the tuple as tombstoned.
     /// Note that this does not physically reclaim space on disk.
     pub fn delete(&self, rid: &RecordId) -> Result<(), TableHeapError> {
+        let tail = self.tail.lock();
+        self.delete_locked(rid, &tail)
+    }
+
+    fn delete_locked(
+        &self,
+        rid: &RecordId,
+        _tail: &MutexGuard<'_, Tail>,
+    ) -> Result<(), TableHeapError> {
         let mut page_guard = self.bpm.write_page(rid.page_id as usize).map_err(|e| {
             TableHeapError(format!(
                 "failed to acquire write lock on page {} for delete of {rid}: {e}",
@@ -349,44 +430,25 @@ impl TableHeap {
         Ok((rid, t))
     }
 
-    // pub fn update(&self, rid: RecordId, new: Tuple) -> Result<(RecordId, Tuple), TableHeapError> {
-    //     let mut page_guard = self.bpm.write_page(rid.page_id as usize).unwrap();
-    //     let data = page_guard.data_mut();
-    //     let mut table_page = TablePage::decode(&data)?;
-    //     let meta = table_page
-    //         .tuples_meta
-    //         .get_mut(rid.slot_id as usize)
-    //         .unwrap();
-    //     if meta.is_deleted == 1 {
-    //         return Err(TableHeapError(("record has been deleted").to_string()));
-    //     }
-
-    //     // update the tuple metadata
-    //     // the offset remains the same, just make sure the size is updated
-    //     meta.size = new.data.len() as u32;
-    //     let start = (meta.offset - meta.size) as usize;
-    //     let end = meta.offset as usize;
-
-    //     // update the tuple bytes
-    //     data[start..end].copy_from_slice(&new.data);
-
-    //     let t = Tuple {
-    //         data: new.data,
-    //         schema: None,
-    //     };
-
-    //     // TODO: call table_page.encode()
-    //     Ok((rid, t))
-    // }
-
-    /// Poor man's update: deletes the old record, then inserts the new tuple
+    /// Append the replacement before tombstoning the original, so insertion
+    /// failures (including oversized tuples and allocation failures) preserve it.
     pub fn update<'a>(
         &self,
         rid: RecordId,
         new: &'a Tuple,
     ) -> Result<(RecordId, &'a Tuple), TableHeapError> {
-        self.delete(&rid)?;
-        let new_rid = self.insert(&new)?;
+        let mut tail = self.tail.lock();
+        self.get(rid)?;
+        let new_rid = self.insert_locked(new, &mut tail)?;
+        if let Err(err) = self.delete_locked(&rid, &tail) {
+            if let Err(cleanup) = self.delete_locked(&new_rid, &tail) {
+                return Err(TableHeapError(format!(
+                    "update could not delete original: {}; replacement {new_rid} cleanup failed: {}",
+                    err.0, cleanup.0
+                )));
+            }
+            return Err(err);
+        }
         Ok((new_rid, new))
     }
 }
