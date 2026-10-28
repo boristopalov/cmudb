@@ -77,19 +77,69 @@ fn cached_then_io_read_paths() {
 #[test]
 fn no_free_frame_when_all_pinned() {
     let (bpm, _tmp) = make_bpm(1);
+    let mut pinned = bpm.new_page().expect("pin the only frame");
+    pinned.data_mut()[0] = 42;
+
+    // A miss must fail to reserve a frame before attempting disk IO.
     let err = bpm.read_page(1).unwrap_err();
     assert!(
-        matches!(err, BpmError::NoFreeFrame | BpmError::FramePinned),
+        matches!(err, BpmError::NoFreeFrame),
         "unexpected error: {err}"
     );
+    assert!(matches!(
+        bpm.write_page(1).unwrap_err(),
+        BpmError::NoFreeFrame
+    ));
+    assert!(matches!(bpm.new_page().unwrap_err(), BpmError::NoFreeFrame));
+
+    drop(pinned);
+    drop(bpm.new_page().expect("released frame should be evictable"));
+    let reread = bpm.read_page(0).expect("evicted page should persist");
+    assert_eq!(reread.data()[0], 42);
+}
+
+#[test]
+fn frame_stays_pinned_until_last_read_guard_drops() {
+    let (bpm, _tmp) = make_bpm(1);
+    {
+        let mut page = bpm.new_page().unwrap();
+        page.data_mut()[0] = 7;
+    }
+
+    let first = bpm.read_page(0).unwrap();
+    let second = bpm.read_page(0).unwrap();
+    assert!(matches!(bpm.new_page().unwrap_err(), BpmError::NoFreeFrame));
+
+    drop(first);
+    assert!(matches!(bpm.new_page().unwrap_err(), BpmError::NoFreeFrame));
+    assert_eq!(second.data()[0], 7);
+
+    drop(second);
+    drop(
+        bpm.new_page()
+            .expect("last read guard should release frame"),
+    );
+    let reread = bpm.read_page(0).expect("evicted page should persist");
+    assert_eq!(reread.data()[0], 7);
 }
 
 #[test]
 fn page_not_found_when_not_inserted() {
     let (bpm, _tmp) = make_bpm(1);
+
+    // An empty pool has a free frame, so a missing page reaches disk IO.
+    let err = bpm.read_page(1).unwrap_err();
+    assert!(
+        matches!(err, BpmError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound),
+        "unexpected error: {err}"
+    );
+
     bpm.new_page().unwrap(); // this immediately unpins since we don't assign this to anything
     let err = bpm.read_page(1).unwrap_err();
-    assert!(matches!(err, BpmError::Io(_)), "unexpected error: {err}");
+    assert!(
+        matches!(err, BpmError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
