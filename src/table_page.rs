@@ -295,6 +295,14 @@ mod tests {
     }
 
     #[test]
+    fn new_rejects_free_space_offset_past_page_end() {
+        let mut buf = [0u8; PAGE_SIZE];
+        TablePage::init(&mut buf[..]);
+        put_u32_le(&mut buf, FREE_SPACE_OFF, PAGE_SIZE as u32 + 1);
+        assert!(TablePageRef::new(&buf[..]).is_err());
+    }
+
+    #[test]
     fn tuple_bytes_rejects_out_of_range_slot() {
         let mut buf = [0u8; PAGE_SIZE];
         let mut page = TablePage::init(&mut buf[..]);

@@ -364,26 +364,15 @@ impl BPlusTree {
         let mut ctx = TreeContext::new(header_page, header.root_page_id);
         self.latch_path_to_leaf(&mut ctx, &key, safe_for_remove)?;
         let mut leaf_page = ctx.write_set.pop_back().ok_or(LATCH_NOT_HELD)?;
-        let leaf_is_root = page_id_of(&leaf_page)? == ctx.root_page_id;
-        let (leaf_is_empty, leaf_is_underfull) = {
-            let mut view = LeafPageView::new(leaf_page.data_mut(), self.key_len)?;
-            view.remove_key(&key.0)?;
-            (view.size() == 0, view.is_underfull())
-        };
-
-        if leaf_is_root {
-            if leaf_is_empty {
-                header.root_page_id = INVALID_PAGE_ID;
-                header.first_leaf_id = INVALID_PAGE_ID;
-                let header_page = ctx.header.as_mut().ok_or(HEADER_LATCH_RELEASED)?;
-                Self::store_header(header_page, &header)?;
-            }
+        if self.remove_in_place_if_final(&mut ctx, &mut header, &mut leaf_page, &key)? {
             return Ok(());
         }
-        if !leaf_is_underfull {
+        let mut leaf = LeafPage::decode(leaf_page.data(), self.key_len)?;
+        leaf.remove_key(&key)?;
+        if !leaf.is_underfull() {
+            leaf.encode(leaf_page.data_mut(), self.key_len)?;
             return Ok(());
         }
-        let leaf = LeafPage::decode(leaf_page.data(), self.key_len)?;
 
         let mut parent_page = ctx.write_set.pop_back().ok_or(LATCH_NOT_HELD)?;
         let mut parent = InternalPage::decode(parent_page.data_mut(), self.key_len)?;
@@ -410,6 +399,32 @@ impl BPlusTree {
             parent = grandparent;
         }
         Ok(())
+    }
+
+    /// Removes `key` from the latched leaf's bytes when nothing after the removal can fail: the
+    /// leaf is the root, or it stays above min size. Returns `Ok(false)` without touching the
+    /// leaf otherwise, so the caller removes from a decoded copy and only writes it back once
+    /// rebalancing has latched every page it needs.
+    fn remove_in_place_if_final(
+        &self,
+        ctx: &mut TreeContext<'_>,
+        header: &mut HeaderPage,
+        leaf_page: &mut PageMut<'_>,
+        key: &IndexKey,
+    ) -> Result<bool, IndexError> {
+        let leaf_is_root = page_id_of(leaf_page)? == ctx.root_page_id;
+        let mut leaf = LeafPageView::new(leaf_page.data_mut(), self.key_len)?;
+        if !leaf_is_root && leaf.size() <= leaf.min_size() {
+            return Ok(false);
+        }
+        leaf.remove_key(&key.0)?;
+        if leaf_is_root && leaf.size() == 0 {
+            header.root_page_id = INVALID_PAGE_ID;
+            header.first_leaf_id = INVALID_PAGE_ID;
+            let header_page = ctx.header.as_mut().ok_or(HEADER_LATCH_RELEASED)?;
+            Self::store_header(header_page, header)?;
+        }
+        Ok(true)
     }
 
     fn sibling_of(parent: &InternalPage, child_idx: usize) -> Result<(usize, PageId), IndexError> {
