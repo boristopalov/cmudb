@@ -8,6 +8,7 @@ pub mod planner;
 pub mod processor;
 pub mod replacer;
 pub mod table_heap;
+pub mod table_page;
 
 /// Convenience helper to construct a buffer pool manager with caller-provided components.
 pub fn create_buffer_pool_manager(

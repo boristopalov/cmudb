@@ -1,6 +1,5 @@
-use crate::buf::{BufReader, BufWriter, BufferError};
 use crate::buffer_pool::{BpmError, BufferPoolManager};
-use crate::disk::PAGE_SIZE;
+use crate::table_page::{NO_NEXT_PAGE, TablePage, TablePageError, TablePageMut, TablePageRef};
 use parking_lot::{Mutex, MutexGuard};
 use std::fmt;
 use std::sync::Arc;
@@ -8,18 +7,9 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct TableHeapError(pub String);
 
-#[derive(Debug)]
-pub struct TablePageError(String);
-
 impl From<TablePageError> for TableHeapError {
     fn from(err: TablePageError) -> Self {
         TableHeapError(err.0)
-    }
-}
-
-impl From<BufferError> for TablePageError {
-    fn from(err: BufferError) -> Self {
-        TablePageError(format!("buffer codec error: {err:?}"))
     }
 }
 
@@ -45,140 +35,6 @@ impl RecordId {
 impl fmt::Display for RecordId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "page_id: {}, slot_id: {}", self.page_id, self.slot_id)
-    }
-}
-
-/// Slot directory entry: the tuple occupies `data[offset - size..offset]` of its page.
-pub struct TupleMeta {
-    offset: u32,
-    size: u32,
-    is_deleted: bool,
-}
-
-/// A slotted page of a table heap: a header and slot directory at the front, and tuple bytes packed
-/// from the end of the page toward the front. The whole header and directory are decoded into this
-/// struct on read and encoded back on write.
-pub struct TablePage {
-    /// The page that continues this table, or `None` on the last page.
-    next_page_id: Option<u32>,
-    num_tuples: u16,
-    num_deleted_tuples: u16,
-    /// Start of the tuple area; the next tuple is written just below it.
-    free_space_offset: u32,
-    tuples_meta: Vec<TupleMeta>,
-}
-
-impl TablePage {
-    const NO_NEXT_PAGE: u32 = u32::MAX;
-    const HEADER_SIZE: usize = size_of::<u32>() + 2 * size_of::<u16>() + size_of::<u32>();
-    const SLOT_SIZE: usize = 2 * size_of::<u32>() + size_of::<u8>();
-    const MAX_TUPLE_SIZE: usize = PAGE_SIZE - Self::directory_end(1);
-
-    const fn directory_end(num_slots: usize) -> usize {
-        Self::HEADER_SIZE + num_slots * Self::SLOT_SIZE
-    }
-
-    fn empty() -> Self {
-        Self {
-            next_page_id: None,
-            num_tuples: 0,
-            num_deleted_tuples: 0,
-            free_space_offset: PAGE_SIZE as u32,
-            tuples_meta: Vec::new(),
-        }
-    }
-
-    fn can_insert(&self, tuple_len: usize) -> bool {
-        Self::directory_end(self.tuples_meta.len() + 1) + tuple_len
-            <= self.free_space_offset as usize
-    }
-
-    fn insert(&mut self, tuple: &Tuple, data: &mut [u8]) -> Result<u32, TablePageError> {
-        if !self.can_insert(tuple.data.len()) {
-            return Err(TablePageError("tuple does not fit on page".to_string()));
-        }
-        let offset = self.next_free_offset();
-        let size = tuple.data.len() as u32;
-        let slot = self.num_tuples as u32;
-        self.insert_tuple_metadata(TupleMeta {
-            offset,
-            size,
-            is_deleted: false,
-        });
-        self.num_tuples += 1;
-        let mut staged = [0; PAGE_SIZE];
-        staged.copy_from_slice(data);
-        self.encode(&mut staged)?;
-        staged[(offset - size) as usize..offset as usize].copy_from_slice(&tuple.data);
-        data.copy_from_slice(&staged);
-        Ok(slot)
-    }
-
-    pub fn decode(data: &[u8]) -> Result<Self, TablePageError> {
-        let mut reader = BufReader::new(data)?;
-        let next_page_id = Some(reader.read_u32_le()?).filter(|&id| id != Self::NO_NEXT_PAGE);
-        let num_tuples = reader.read_u16_le()?;
-        let num_deleted_tuples = reader.read_u16_le()?;
-        let free_space_offset = reader.read_u32_le()?;
-        let mut tuples_meta: Vec<TupleMeta> = Vec::with_capacity(num_tuples as usize);
-        for i in 0..num_tuples {
-            tuples_meta.push(TupleMeta {
-                offset: reader.read_u32_le().map_err(|e| {
-                    TablePageError(format!("failed to read offset for slot {i}: {e:?}"))
-                })?,
-                size: reader.read_u32_le().map_err(|e| {
-                    TablePageError(format!("failed to read size for slot {i}: {e:?}"))
-                })?,
-                is_deleted: reader.read_u8().map_err(|e| {
-                    TablePageError(format!("failed to read tombstone for slot {i}: {e:?}"))
-                })? != 0,
-            });
-        }
-        Ok(Self {
-            next_page_id,
-            num_tuples,
-            num_deleted_tuples,
-            free_space_offset,
-            tuples_meta,
-        })
-    }
-
-    /// Writes the header and slot directory back into `data`. Tuple bytes (which
-    /// live in `data[free_space_offset..PAGE_SIZE]`) are written directly by
-    /// callers and are not touched here.
-    pub fn encode(&self, data: &mut [u8]) -> Result<(), TablePageError> {
-        let mut writer = BufWriter::new(data)?;
-        writer.write_u32_le(self.next_page_id.unwrap_or(Self::NO_NEXT_PAGE))?;
-        writer.write_u16_le(self.num_tuples)?;
-        writer.write_u16_le(self.num_deleted_tuples)?;
-        writer.write_u32_le(self.free_space_offset)?;
-        for meta in &self.tuples_meta {
-            writer.write_u32_le(meta.offset)?;
-            writer.write_u32_le(meta.size)?;
-            writer.write_u8(meta.is_deleted as u8)?;
-        }
-        debug_assert_eq!(
-            writer.pos(),
-            Self::directory_end(self.tuples_meta.len()),
-            "HEADER_SIZE and SLOT_SIZE must match the encoded layout"
-        );
-        if writer.pos() > self.free_space_offset as usize {
-            return Err(TablePageError(format!(
-                "slot directory ends at {} but tuple area starts at {}",
-                writer.pos(),
-                self.free_space_offset
-            )));
-        }
-        Ok(())
-    }
-
-    fn insert_tuple_metadata(&mut self, meta: TupleMeta) {
-        self.free_space_offset -= meta.size;
-        self.tuples_meta.push(meta);
-    }
-
-    fn next_free_offset(&self) -> u32 {
-        self.free_space_offset
     }
 }
 
@@ -234,18 +90,20 @@ impl Iterator for TableHeapIterator {
                 }
             };
 
-            let page = match TablePage::decode(page_guard.data()) {
+            let page = match TablePageRef::new(page_guard.data()) {
                 Ok(p) => p,
                 Err(e) => {
                     self.finished = true;
                     return Some(Err(TableHeapError(format!(
-                        "failed to decode page {} during scan: {}",
+                        "failed to read page {} during scan: {}",
                         self.current_page_id, e.0
                     ))));
                 }
             };
-            if self.current_slot_id as usize >= page.tuples_meta.len() {
-                match page.next_page_id {
+
+            let slot = self.current_slot_id;
+            let Some(meta) = page.slot(slot) else {
+                match page.next_page_id() {
                     Some(next) if self.current_page_id != self.last_page_id => {
                         self.current_page_id = next;
                         self.current_slot_id = 0;
@@ -256,17 +114,21 @@ impl Iterator for TableHeapIterator {
                         return None;
                     }
                 }
-            }
-
-            let slot = self.current_slot_id;
-            let meta = &page.tuples_meta[slot as usize];
+            };
             self.current_slot_id += 1;
             if meta.is_deleted {
                 continue;
             }
-            let start = (meta.offset - meta.size) as usize;
-            let end = meta.offset as usize;
-            let data = page_guard.data()[start..end].to_vec();
+            let data = match page.tuple_bytes(&meta) {
+                Ok(bytes) => bytes.to_vec(),
+                Err(e) => {
+                    self.finished = true;
+                    return Some(Err(TableHeapError(format!(
+                        "corrupt slot {slot} on page {} during scan: {}",
+                        self.current_page_id, e.0
+                    ))));
+                }
+            };
 
             return Some(Ok((
                 Tuple { data },
@@ -286,7 +148,7 @@ impl TableHeap {
                 .new_page()
                 .map_err(|e| TableHeapError(format!("failed to allocate first page: {e}")))?;
             let page_id = record_page_id(page_guard.page_id())?;
-            TablePage::empty().encode(page_guard.data_mut())?;
+            TablePageMut::init(page_guard.data_mut());
             page_id as usize
         };
         Ok(Self {
@@ -325,18 +187,18 @@ impl TableHeap {
         t: &Tuple,
         tail: &mut MutexGuard<'_, Tail>,
     ) -> Result<RecordId, TableHeapError> {
-        if t.data.len() > TablePage::MAX_TUPLE_SIZE {
+        if t.data.len() > TablePageRef::MAX_TUPLE_SIZE {
             return Err(TableHeapError(format!(
                 "tuple of size {} exceeds maximum {}",
                 t.data.len(),
-                TablePage::MAX_TUPLE_SIZE
+                TablePageRef::MAX_TUPLE_SIZE
             )));
         }
         let slot_id = {
             let mut guard = self.bpm.write_page(tail.page_id)?;
-            let mut page = TablePage::decode(guard.data_mut())?;
+            let mut page = TablePageMut::new(guard.data_mut())?;
             if page.can_insert(t.data.len()) {
-                Some(page.insert(t, guard.data_mut())?)
+                Some(page.insert(&t.data)?)
             } else {
                 None
             }
@@ -347,14 +209,12 @@ impl TableHeap {
                 let (new_id, slot_id) = {
                     let mut guard = self.bpm.new_page()?;
                     let page_id = record_page_id(guard.page_id())?;
-                    let slot_id = TablePage::empty().insert(t, guard.data_mut())?;
+                    let slot_id = TablePage::init(guard.data_mut()).insert(&t.data)?;
                     (page_id, slot_id)
                 };
                 {
                     let mut guard = self.bpm.write_page(tail.page_id)?;
-                    let mut old_tail = TablePage::decode(guard.data_mut())?;
-                    old_tail.next_page_id = Some(new_id);
-                    old_tail.encode(guard.data_mut())?;
+                    TablePageMut::new(guard.data_mut())?.set_next_page_id(new_id);
                 }
                 (new_id, slot_id)
             }
@@ -383,26 +243,19 @@ impl TableHeap {
                 rid.page_id
             ))
         })?;
-        let data = page_guard.data_mut();
-        let mut table_page = TablePage::decode(data)?;
-        let num_slots = table_page.tuples_meta.len();
-
-        let meta = table_page
-            .tuples_meta
-            .get_mut(rid.slot_id as usize)
-            .ok_or_else(|| {
-                TableHeapError(format!(
-                    "slot {} does not exist on page {} (page has {num_slots} slots)",
-                    rid.slot_id, rid.page_id
-                ))
-            })?;
-
+        let mut table_page = TablePageMut::new(page_guard.data_mut())?;
+        let meta = table_page.slot(rid.slot_id).ok_or_else(|| {
+            TableHeapError(format!(
+                "slot {} does not exist on page {} (page has {} slots)",
+                rid.slot_id,
+                rid.page_id,
+                table_page.num_tuples()
+            ))
+        })?;
         if meta.is_deleted {
             return Err(TableHeapError(format!("record {rid} already deleted")));
         }
-        meta.is_deleted = true;
-        table_page.num_deleted_tuples += 1;
-        table_page.encode(data)?;
+        table_page.mark_deleted(rid.slot_id)?;
         Ok(())
     }
 
@@ -413,25 +266,20 @@ impl TableHeap {
                 rid.page_id
             ))
         })?;
-        let data = page_guard.data();
-        let table_page = TablePage::decode(data)?;
-        let num_slots = table_page.tuples_meta.len();
-        let meta = table_page
-            .tuples_meta
-            .get(rid.slot_id as usize)
-            .ok_or_else(|| {
-                TableHeapError(format!(
-                    "slot {} does not exist on page {} (page has {num_slots} slots)",
-                    rid.slot_id, rid.page_id
-                ))
-            })?;
+        let table_page = TablePageRef::new(page_guard.data())?;
+        let meta = table_page.slot(rid.slot_id).ok_or_else(|| {
+            TableHeapError(format!(
+                "slot {} does not exist on page {} (page has {} slots)",
+                rid.slot_id,
+                rid.page_id,
+                table_page.num_tuples()
+            ))
+        })?;
         if meta.is_deleted {
             return Err(TableHeapError(format!("record {rid} has been deleted")));
         }
 
-        let start = (meta.offset - meta.size) as usize;
-        let end = meta.offset as usize;
-        let bytes = page_guard.data()[start..end].to_vec();
+        let bytes = table_page.tuple_bytes(&meta)?.to_vec();
 
         let t = Tuple { data: bytes };
         Ok((rid, t))
@@ -465,7 +313,7 @@ fn record_page_id(page_id: Option<usize>) -> Result<u32, TableHeapError> {
     let page_id = page_id.ok_or_else(|| TableHeapError("new page has no page_id".to_string()))?;
     u32::try_from(page_id)
         .ok()
-        .filter(|&id| id != TablePage::NO_NEXT_PAGE)
+        .filter(|&id| id != NO_NEXT_PAGE)
         .ok_or_else(|| TableHeapError(format!("page id {page_id} exceeds RID capacity")))
 }
 
@@ -603,9 +451,9 @@ mod tests {
         assert_eq!(heap.first_page_id, 0);
         let guard = heap.bpm.read_page(heap.first_page_id).unwrap();
         assert!(
-            TablePage::decode(guard.data())
+            TablePageRef::new(guard.data())
                 .unwrap()
-                .next_page_id
+                .next_page_id()
                 .is_none()
         );
     }
@@ -614,14 +462,14 @@ mod tests {
     fn full_page_links_to_a_new_tail_page() {
         let (heap, _dir) = make_heap();
         let big = Tuple {
-            data: vec![1; TablePage::MAX_TUPLE_SIZE],
+            data: vec![1; TablePageRef::MAX_TUPLE_SIZE],
         };
         let first = heap.insert(&big).unwrap();
         let second = heap.insert(&big).unwrap();
         assert_ne!(first.page_id, second.page_id);
         let guard = heap.bpm.read_page(first.page_id as usize).unwrap();
         assert_eq!(
-            TablePage::decode(guard.data()).unwrap().next_page_id,
+            TablePageRef::new(guard.data()).unwrap().next_page_id(),
             Some(second.page_id)
         );
         drop(guard);
