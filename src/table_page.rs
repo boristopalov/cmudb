@@ -259,8 +259,14 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> TablePage<B> {
     pub fn update_meta(&mut self, slot: u32, meta: TupleMeta) -> Result<(), TablePageError> {
         let current = self.existing_slot(slot)?;
         let deleted = match (current.meta.is_deleted, meta.is_deleted) {
-            (false, true) => self.num_deleted_tuples().saturating_add(1),
-            (true, false) => self.num_deleted_tuples().saturating_sub(1),
+            (false, true) => self
+                .num_deleted_tuples()
+                .checked_add(1)
+                .ok_or_else(|| TablePageError("deleted-tuple counter overflow".to_string()))?,
+            (true, false) => self
+                .num_deleted_tuples()
+                .checked_sub(1)
+                .ok_or_else(|| TablePageError("deleted-tuple counter underflow".to_string()))?,
             _ => self.num_deleted_tuples(),
         };
         let base = Self::slot_base(slot);
@@ -390,6 +396,45 @@ mod tests {
         assert_eq!(page.tuple_bytes(&s0).unwrap(), b"new");
         assert_eq!(s0.meta, meta);
         assert_eq!(page.tuple_bytes(&s1).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn mark_deleted_rejects_an_overflowing_deleted_counter() {
+        let mut buf = [0u8; PAGE_SIZE];
+        let mut page = TablePage::init(&mut buf[..]);
+        page.insert(b"x").unwrap();
+        put_u16_le(&mut buf, NUM_DELETED_OFF, u16::MAX);
+        let mut page = TablePageMut::new(&mut buf[..]).unwrap();
+        assert!(
+            page.mark_deleted(0).is_err(),
+            "counter overflow is reported"
+        );
+        assert!(
+            !page.slot(0).unwrap().meta.is_deleted,
+            "a rejected delete leaves the slot live"
+        );
+    }
+
+    #[test]
+    fn update_meta_rejects_an_underflowing_deleted_counter() {
+        let mut buf = [0u8; PAGE_SIZE];
+        let mut page = TablePage::init(&mut buf[..]);
+        page.insert(b"x").unwrap();
+        page.mark_deleted(0).unwrap();
+        put_u16_le(&mut buf, NUM_DELETED_OFF, 0);
+        let mut page = TablePageMut::new(&mut buf[..]).unwrap();
+        let live = TupleMeta {
+            is_deleted: false,
+            ..page.slot(0).unwrap().meta
+        };
+        assert!(
+            page.update_meta(0, live).is_err(),
+            "counter underflow is reported"
+        );
+        assert!(
+            page.slot(0).unwrap().meta.is_deleted,
+            "a rejected update leaves the slot deleted"
+        );
     }
 
     #[test]
