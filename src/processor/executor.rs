@@ -632,6 +632,8 @@ impl<'a> NestedLoopJoinExecutor<'a> {
 
 impl<'a> Executor for NestedLoopJoinExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
+        self.left.open()?;
+        self.right.open()?;
         while let Some((tup, _)) = self.right.next()? {
             self.right_tuples.push(tup);
         }
@@ -751,6 +753,7 @@ impl<'a> NestedIndexJoinExecutor<'a> {
 
 impl<'a> Executor for NestedIndexJoinExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
+        self.child.open()?;
         let info = self.catalog.get_index(self.plan.index_oid)?;
         self.index = Some(info);
 
@@ -1339,6 +1342,7 @@ impl<'a> Executor for WindowFunctionExecutor<'a> {
         // if no partition expressions are provided,
         // it's just a single partition with all the tuples
         // need to make sure to sort first
+        self.child.open()?;
         let mut tups: Vec<Tuple> = vec![];
         while let Some((t, _)) = self.child.next()? {
             tups.push(t);
@@ -1514,7 +1518,7 @@ impl<'a> FilterExecutor<'a> {
 
 impl<'a> Executor for FilterExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
-        Ok(())
+        self.child.open()
     }
 
     fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
