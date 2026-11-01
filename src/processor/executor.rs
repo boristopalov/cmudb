@@ -6,9 +6,9 @@ use crate::catalog::{
 use crate::disk::PAGE_SIZE;
 use crate::index::{IndexError, IndexIter};
 use crate::processor::plan::{
-    AggType, AggregationPlanNode, CreateIndexPlanNode, CreateTablePlanNode, DeletePlanNode,
-    DropIndexPlanNode, DropTablePlanNode, Expression, ExternalMergeSortPlanNode, FilterPlanNode,
-    HashJoinPlanNode, IndexScanPlanNode, InsertPlanNode, JoinType, LimitPlanNode,
+    AggType, AggregationPlanNode, Arithmetic, CreateIndexPlanNode, CreateTablePlanNode,
+    DeletePlanNode, DropIndexPlanNode, DropTablePlanNode, Expression, ExternalMergeSortPlanNode,
+    FilterPlanNode, HashJoinPlanNode, IndexScanPlanNode, InsertPlanNode, JoinType, LimitPlanNode,
     NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, ProjectionPlanNode, SeqScanPlanNode,
     SortPlanNode, UpdatePlanNode, ValuesPlanNode, WindowFunctionPlanNode,
 };
@@ -468,7 +468,7 @@ impl<'a> Executor for AggregationExecutor<'a> {
                 )
             });
             for (state, (expr, _)) in entry.0.iter_mut().zip(self.plan.aggregates.iter()) {
-                state.update(expr.evaluate(&tuple, schema)?);
+                state.update(expr.evaluate(&tuple, schema)?)?;
             }
         }
         self.iter = Some(agg_hash_table.into_iter());
@@ -486,7 +486,7 @@ impl<'a> Executor for AggregationExecutor<'a> {
         let mut out: Vec<Option<Value>> = Vec::with_capacity(key.0.len() + val.0.len());
         out.extend(key.0);
         for v in val.0 {
-            out.push(v.consume());
+            out.push(v.value()?);
         }
 
         let tuple = self.schema().encode_tuple(&out)?;
@@ -547,56 +547,42 @@ impl AggState {
     }
 
     /// Folds one input value in. NULLs are skipped, so `COUNT(col)` counts non-NULL values;
-    /// RANK ignores values and moves through `update_rank`.
-    fn update(&mut self, v: Option<Value>) {
-        let Some(v) = v else { return };
+    /// RANK ignores values and moves through `update_rank`. Errors when a SUM or AVG
+    /// overflows INT.
+    fn update(&mut self, v: Option<Value>) -> Result<(), ExecutorError> {
+        let Some(v) = v else { return Ok(()) };
         match self {
             Self::Count(count) => *count += 1,
-            Self::Sum(current) => {
-                *current = Some(current.take().map_or(v, |c| c + v));
-            }
+            Self::Sum(current) => *current = Some(add_to(*current, v)?),
             Self::Avg { sum, count } => {
-                *sum = Some(sum.take().map_or(v, |s| s + v));
+                *sum = Some(add_to(*sum, v)?);
                 *count += 1;
             }
-            Self::Max(current) => {
-                *current = Some(current.take().map_or(v, |c| c.max(v)));
-            }
-            Self::Min(current) => {
-                *current = Some(current.take().map_or(v, |c| c.min(v)));
-            }
+            Self::Max(current) => *current = Some(current.map_or(v, |c| c.max(v))),
+            Self::Min(current) => *current = Some(current.map_or(v, |c| c.min(v))),
             Self::Rank(_) => {}
         }
+        Ok(())
     }
 
-    fn consume(self) -> Option<Value> {
-        match self {
-            Self::Sum(v) | Self::Max(v) | Self::Min(v) => v,
-            Self::Count(c) => Some(Value::INT(c)),
-            Self::Avg { sum, count } => {
-                if count == 0 {
-                    None
-                } else {
-                    sum.map(|s| s / Value::INT(count))
-                }
-            }
-            Self::Rank(r) => Some(Value::INT(r)),
-        }
-    }
-
-    fn peek(&self) -> Option<Value> {
-        match self {
+    /// The aggregate over the values folded in so far. AVG of INTs truncates toward zero.
+    fn value(&self) -> Result<Option<Value>, ExecutorError> {
+        Ok(match self {
             Self::Sum(v) | Self::Max(v) | Self::Min(v) => *v,
-            Self::Count(c) => Some(Value::INT(*c)),
-            Self::Avg { sum, count } => {
-                if *count == 0 {
-                    None
-                } else {
-                    sum.map(|s| s / Value::INT(*count))
-                }
-            }
-            Self::Rank(r) => Some(Value::INT(*r)),
-        }
+            Self::Count(c) | Self::Rank(c) => Some(Value::INT(*c)),
+            Self::Avg { sum: None, .. } => None,
+            Self::Avg {
+                sum: Some(sum),
+                count,
+            } => Some(Arithmetic::Div.apply(*sum, Value::INT(*count))?),
+        })
+    }
+}
+
+fn add_to(total: Option<Value>, v: Value) -> Result<Value, ExecutorError> {
+    match total {
+        Some(total) => Arithmetic::Add.apply(total, v),
+        None => Ok(v),
     }
 }
 
@@ -1616,12 +1602,14 @@ fn flush_peer_group(
 ) -> Result<(), ExecutorError> {
     for buf_tup in buffer.iter() {
         for (state, (expr, _)) in aggregates.iter_mut().zip(plan_aggs.iter()) {
-            state.update(expr.evaluate(buf_tup, child_schema)?);
+            state.update(expr.evaluate(buf_tup, child_schema)?)?;
         }
     }
     for buf_tup in buffer.drain(..) {
         let mut combined = row_values(child_schema, &buf_tup)?;
-        combined.extend(aggregates.iter().map(AggState::peek));
+        for agg in aggregates.iter() {
+            combined.push(agg.value()?);
+        }
         let out = out_schema.encode_tuple(&combined)?;
         output.push(out);
     }
@@ -1783,29 +1771,44 @@ mod tests {
     #[test]
     fn count_skips_nulls_and_rank_ignores_values() {
         let mut count = AggState::new(&AggType::COUNT);
-        count.update(Some(Value::INT(7)));
-        count.update(None);
-        count.update(Some(Value::INT(8)));
-        assert_eq!(count.consume(), Some(Value::INT(2)));
+        count.update(Some(Value::INT(7))).unwrap();
+        count.update(None).unwrap();
+        count.update(Some(Value::INT(8))).unwrap();
+        assert_eq!(count.value().unwrap(), Some(Value::INT(2)));
 
         let mut rank = AggState::new(&AggType::RANK);
-        rank.update(Some(Value::INT(100)));
-        assert_eq!(rank.peek(), Some(Value::INT(1)));
+        rank.update(Some(Value::INT(100))).unwrap();
+        assert_eq!(rank.value().unwrap(), Some(Value::INT(1)));
         rank.update_rank(false, 5);
         assert_eq!(
-            rank.peek(),
+            rank.value().unwrap(),
             Some(Value::INT(1)),
             "same peer group keeps its rank"
         );
         rank.update_rank(true, 5);
-        assert_eq!(rank.consume(), Some(Value::INT(5)));
+        assert_eq!(rank.value().unwrap(), Some(Value::INT(5)));
+    }
+
+    #[test]
+    fn avg_of_float_values_is_a_float() {
+        let mut avg = AggState::new(&AggType::AVG);
+        avg.update(Some(Value::FLOAT(1.5.into()))).unwrap();
+        avg.update(Some(Value::FLOAT(2.0.into()))).unwrap();
+        assert_eq!(avg.value().unwrap(), Some(Value::FLOAT(1.75.into())));
+    }
+
+    #[test]
+    fn sum_that_overflows_int_is_an_error() {
+        let mut sum = AggState::new(&AggType::SUM);
+        sum.update(Some(Value::INT(i32::MAX))).unwrap();
+        assert!(sum.update(Some(Value::INT(1))).is_err());
     }
 
     #[test]
     fn avg_of_only_nulls_is_null() {
         let mut avg = AggState::new(&AggType::AVG);
-        avg.update(None);
-        assert_eq!(avg.consume(), None);
+        avg.update(None).unwrap();
+        assert_eq!(avg.value().unwrap(), None);
     }
 
     #[test]
