@@ -16,6 +16,8 @@ use cmudb::replacer::ArcReplacer;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+#[cfg(test)]
+use tempfile::TempDir;
 use tempfile::tempdir;
 
 const NUM_FRAMES: usize = 64;
@@ -97,13 +99,29 @@ struct Session<'a> {
     txn: Option<ExplicitTxn>,
 }
 
-/// The transaction opened by `BEGIN`.
+/// The transaction opened by `BEGIN`, or one whose rollback has yet to succeed.
 enum ExplicitTxn {
     Open(Arc<Transaction>),
     /// A statement failed. Its writes are already rolled back. As in Postgres, every later
     /// statement is refused until the user ends the block with `ROLLBACK` (or `COMMIT`, which
     /// rolls back too), so a partial transaction cannot pass for a whole one.
     Failed,
+    /// Rolling `txn` back failed (a buffer pool error), so its rows are still locked. The
+    /// session keeps it and retries the abort before the next statement, until it succeeds.
+    /// `explicit` says whether it came from `BEGIN`, in which case the block then becomes
+    /// `Failed` and still needs a `ROLLBACK`.
+    AbortPending {
+        txn: Arc<Transaction>,
+        explicit: bool,
+    },
+}
+
+/// Why `Session::finish` failed.
+enum FinishError {
+    /// The transaction is rolled back and its rows released.
+    RolledBack(String),
+    /// The abort failed too, so the transaction still holds its rows.
+    AbortFailed(String),
 }
 
 impl Session<'_> {
@@ -112,6 +130,7 @@ impl Session<'_> {
     fn run(&mut self, dialect: &GenericDialect, sql: &str) -> Result<(), String> {
         let ast = Parser::parse_sql(dialect, sql).map_err(|e| format!("parse: {e}"))?;
         for stmt in ast {
+            self.retry_pending_abort()?;
             match stmt {
                 Statement::StartTransaction { .. } => {
                     if self.txn.is_some() {
@@ -122,26 +141,25 @@ impl Session<'_> {
                     ));
                     println!("BEGIN");
                 }
-                Statement::Commit { .. } => match self.txn.take() {
-                    Some(ExplicitTxn::Open(txn)) => {
-                        self.finish(&txn, true)?;
-                        println!("COMMIT");
+                Statement::Commit { .. } | Statement::Rollback { .. } => {
+                    let commit = matches!(stmt, Statement::Commit { .. });
+                    match self.txn.take() {
+                        Some(ExplicitTxn::Open(txn)) => {
+                            self.finish_or_keep(txn, commit, true)?;
+                            println!("{}", if commit { "COMMIT" } else { "ROLLBACK" });
+                        }
+                        Some(ExplicitTxn::Failed) => println!("ROLLBACK"),
+                        Some(pending @ ExplicitTxn::AbortPending { .. }) => {
+                            self.txn = Some(pending);
+                            return Err("rollback of the transaction is still pending".to_string());
+                        }
+                        None => return Err("no transaction in progress".to_string()),
                     }
-                    Some(ExplicitTxn::Failed) => println!("ROLLBACK"),
-                    None => return Err("no transaction in progress".to_string()),
-                },
-                Statement::Rollback { .. } => match self.txn.take() {
-                    Some(ExplicitTxn::Open(txn)) => {
-                        self.finish(&txn, false)?;
-                        println!("ROLLBACK");
-                    }
-                    Some(ExplicitTxn::Failed) => println!("ROLLBACK"),
-                    None => return Err("no transaction in progress".to_string()),
-                },
+                }
                 stmt => {
                     let (txn, autocommit) = match &self.txn {
                         Some(ExplicitTxn::Open(txn)) => (txn.clone(), false),
-                        Some(ExplicitTxn::Failed) => {
+                        Some(ExplicitTxn::Failed | ExplicitTxn::AbortPending { .. }) => {
                             return Err("current transaction is aborted, statements are \
                                         ignored until ROLLBACK"
                                 .to_string());
@@ -149,14 +167,16 @@ impl Session<'_> {
                         None => (self.txn_mgr.begin(IsolationLevel::SnapshotIsolation), true),
                     };
                     match self.run_statement(&txn, &stmt) {
-                        Ok(()) if autocommit => self.finish(&txn, true)?,
+                        Ok(()) if autocommit => self.finish_or_keep(txn, true, false)?,
                         Ok(()) => {}
                         Err(e) => {
-                            self.finish(&txn, false)?;
+                            if !autocommit {
+                                self.txn = Some(ExplicitTxn::Failed);
+                            }
+                            self.finish_or_keep(txn, false, !autocommit)?;
                             if autocommit {
                                 return Err(format!("{e} (rolled back)"));
                             }
-                            self.txn = Some(ExplicitTxn::Failed);
                             return Err(format!("{e} (transaction aborted; ROLLBACK to end it)"));
                         }
                     }
@@ -186,16 +206,55 @@ impl Session<'_> {
         Ok(())
     }
 
+    /// Aborts the transaction whose earlier rollback failed. Until that succeeds no other
+    /// statement runs, since the transaction still holds its rows.
+    fn retry_pending_abort(&mut self) -> Result<(), String> {
+        let Some(ExplicitTxn::AbortPending { txn, explicit }) = &self.txn else {
+            return Ok(());
+        };
+        self.txn_mgr
+            .abort(txn)
+            .map_err(|e| format!("rollback of the earlier transaction failed again: {e}"))?;
+        self.txn = explicit.then_some(ExplicitTxn::Failed);
+        Ok(())
+    }
+
+    /// Runs `finish`, and keeps `txn` in the session as `AbortPending` if its abort failed,
+    /// so that its rows are released by a later retry rather than held forever.
+    fn finish_or_keep(
+        &mut self,
+        txn: Arc<Transaction>,
+        commit: bool,
+        explicit: bool,
+    ) -> Result<(), String> {
+        match self.finish(&txn, commit) {
+            Ok(()) => Ok(()),
+            Err(FinishError::RolledBack(e)) => Err(e),
+            Err(FinishError::AbortFailed(e)) => {
+                self.txn = Some(ExplicitTxn::AbortPending { txn, explicit });
+                Err(format!(
+                    "{e} (rollback will be retried before the next statement)"
+                ))
+            }
+        }
+    }
+
     /// Commits or aborts `txn`, then collects garbage. The outcome is settled before
     /// collection runs, so a collection failure is only a warning.
-    fn finish(&self, txn: &Transaction, commit: bool) -> Result<(), String> {
+    fn finish(&self, txn: &Transaction, commit: bool) -> Result<(), FinishError> {
         if commit {
             if let Err(e) = self.txn_mgr.commit(txn) {
-                self.txn_mgr.abort(txn).map_err(|e| format!("abort: {e}"))?;
-                return Err(format!("commit: {e} (transaction rolled back)"));
+                self.txn_mgr
+                    .abort(txn)
+                    .map_err(|a| FinishError::AbortFailed(format!("commit: {e}; abort: {a}")))?;
+                return Err(FinishError::RolledBack(format!(
+                    "commit: {e} (transaction rolled back)"
+                )));
             }
         } else {
-            self.txn_mgr.abort(txn).map_err(|e| format!("abort: {e}"))?;
+            self.txn_mgr
+                .abort(txn)
+                .map_err(|e| FinishError::AbortFailed(format!("abort: {e}")))?;
         }
         if let Err(e) = self.txn_mgr.garbage_collect() {
             eprintln!("warning: garbage collection failed: {e}");
@@ -355,5 +414,109 @@ mod tests {
         assert_eq!(result, Ok(()));
         let oid = catalog.table_oid("t").expect("table t was created");
         assert_eq!(catalog.get_table(oid).unwrap().heap.iter().count(), 1);
+    }
+
+    fn small_pool(frames: usize) -> (Arc<cmudb::buffer_pool::BufferPoolManager>, TempDir) {
+        let dir = tempdir().expect("tempdir");
+        let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).expect("disk");
+        let bpm = Arc::new(create_buffer_pool_manager(
+            frames,
+            ArcReplacer::new(frames),
+            DiskScheduler::new(dm),
+        ));
+        (bpm, dir)
+    }
+
+    fn value_of_a(catalog: &Catalog, mgr: &TransactionManager) -> Vec<u8> {
+        let table = catalog.get_table(catalog.table_oid("t").unwrap()).unwrap();
+        let (_, rid) = table.heap.iter().next().unwrap().unwrap();
+        let t = mgr.begin(IsolationLevel::SnapshotIsolation);
+        let row = cmudb::concurrency::mvcc::read_visible(&t, mgr, &table.heap, rid)
+            .unwrap()
+            .unwrap();
+        mgr.commit(&t).unwrap();
+        row.data
+    }
+
+    /// Pinning every frame leaves no room to latch the table page, so both the commit and the
+    /// abort after it fail. The session keeps the transaction and releases its row on retry.
+    /// The autocommit case commits through `finish_or_keep` directly, since the frames have to
+    /// be pinned between the statement and its commit.
+    fn commit_and_abort_fail_then_retry(explicit: bool) {
+        let (bpm, _dir) = small_pool(4);
+        let catalog = Catalog::new(bpm.clone());
+        let mgr = Arc::new(TransactionManager::new(bpm.clone()));
+        let mut session = Session {
+            catalog: &catalog,
+            bpm: bpm.clone(),
+            txn_mgr: mgr.clone(),
+            txn: None,
+        };
+        let sql = |session: &mut Session, q: &str| session.run(&GenericDialect {}, q);
+        sql(
+            &mut session,
+            "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);",
+        )
+        .unwrap();
+        let before = value_of_a(&catalog, &mgr);
+
+        let update = "UPDATE t SET a = 2;";
+        let autocommit_txn = if explicit {
+            sql(&mut session, "BEGIN;").unwrap();
+            sql(&mut session, update).unwrap();
+            None
+        } else {
+            let txn = mgr.begin(IsolationLevel::SnapshotIsolation);
+            let stmt = Parser::parse_sql(&GenericDialect {}, update).unwrap();
+            session.run_statement(&txn, &stmt[0]).unwrap();
+            Some(txn)
+        };
+        let pins: Vec<_> = std::iter::from_fn(|| bpm.new_page().ok()).collect();
+        let failed = match autocommit_txn {
+            None => sql(&mut session, "COMMIT;"),
+            Some(txn) => session.finish_or_keep(txn, true, false),
+        };
+        assert!(failed.is_err(), "commit fails with every frame pinned");
+        assert!(
+            matches!(session.txn, Some(ExplicitTxn::AbortPending { .. })),
+            "the session keeps the transaction whose abort failed"
+        );
+        assert!(
+            sql(&mut session, "SELECT * FROM t;").is_err(),
+            "nothing runs while the retried abort keeps failing"
+        );
+        drop(pins);
+
+        if explicit {
+            assert!(
+                sql(&mut session, "SELECT * FROM t;").is_err(),
+                "after the abort succeeds the block still needs ROLLBACK"
+            );
+            sql(&mut session, "ROLLBACK;").unwrap();
+        } else {
+            sql(&mut session, "SELECT * FROM t;").expect("the retried abort succeeds");
+        }
+        assert!(session.txn.is_none());
+        assert_eq!(
+            value_of_a(&catalog, &mgr),
+            before,
+            "the update was rolled back"
+        );
+        sql(&mut session, "UPDATE t SET a = 3;").expect("the row is writable again");
+        assert_eq!(
+            mgr.watermark(),
+            mgr.last_commit_ts(),
+            "no transaction is left running"
+        );
+    }
+
+    #[test]
+    fn failed_explicit_commit_keeps_the_transaction_until_rollback_succeeds() {
+        commit_and_abort_fail_then_retry(true);
+    }
+
+    #[test]
+    fn failed_autocommit_keeps_the_transaction_until_its_abort_succeeds() {
+        commit_and_abort_fail_then_retry(false);
     }
 }
