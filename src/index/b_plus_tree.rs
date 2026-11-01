@@ -136,18 +136,13 @@ impl BPlusTree {
         bpm: Arc<BufferPoolManager>,
     ) -> Result<Self, IndexError> {
         let key_len_usize =
-            usize::try_from(key_len).map_err(|_| IndexError::Insert(InsertError::InvalidKey))?;
-        if key_len_usize == 0 {
-            return Err(IndexError::Insert(InsertError::InvalidKey));
-        }
-
-        let leaf_capacity = LeafPage::max_size_for_layout(key_len_usize)
-            .ok_or(IndexError::Insert(InsertError::InvalidKey))?;
-        let internal_capacity = InternalPage::max_size_for_layout(key_len_usize)
-            .ok_or(IndexError::Insert(InsertError::InvalidKey))?;
-        if leaf_capacity == 0 || internal_capacity == 0 {
-            return Err(IndexError::Insert(InsertError::InvalidKey));
-        }
+            usize::try_from(key_len).map_err(|_| IndexError::UnsupportedKeyLength(key_len))?;
+        let (Some(leaf_capacity), Some(internal_capacity)) = (
+            LeafPage::max_size_for_layout(key_len_usize),
+            InternalPage::max_size_for_layout(key_len_usize),
+        ) else {
+            return Err(IndexError::UnsupportedKeyLength(key_len));
+        };
 
         let header_page_id = {
             let mut page = bpm.new_page()?;
@@ -179,7 +174,10 @@ impl BPlusTree {
         let page = self.bpm.read_page(self.header_page_id)?;
         let header = HeaderPage::decode(page.data())?;
         if header.key_len != self.key_len {
-            return Err(IndexError::Insert(InsertError::InvalidKey));
+            return Err(IndexError::KeyLength {
+                expected: self.key_len as usize,
+                actual: header.key_len as usize,
+            });
         }
         Ok(header)
     }
@@ -188,7 +186,10 @@ impl BPlusTree {
         if key.0.len() == self.key_len as usize {
             Ok(())
         } else {
-            Err(IndexError::Insert(InsertError::InvalidKey))
+            Err(IndexError::KeyLength {
+                expected: self.key_len as usize,
+                actual: key.0.len(),
+            })
         }
     }
 
@@ -1189,6 +1190,38 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn wrong_key_length_is_a_key_length_error_for_every_operation() {
+        let (bpm, _tmp) = make_bpm(10);
+        let tree = BPlusTree::new("idx".to_string(), 8, bpm).unwrap();
+        let short = IndexKey(vec![1, 2, 3]);
+        let rid = IndexValue::IndexValue(RecordId {
+            page_id: 1,
+            slot_id: 1,
+        });
+        let is_key_length = |e: IndexError| {
+            matches!(
+                e,
+                IndexError::KeyLength {
+                    expected: 8,
+                    actual: 3
+                }
+            )
+        };
+        assert!(is_key_length(tree.insert(short.clone(), rid).unwrap_err()));
+        assert!(is_key_length(tree.remove(short.clone()).unwrap_err()));
+        assert!(is_key_length(tree.search(&short).unwrap_err()));
+    }
+
+    #[test]
+    fn key_lengths_that_cannot_fit_a_page_are_rejected() {
+        let (bpm, _tmp) = make_bpm(10);
+        for key_len in [0, 1 << 20] {
+            let err = BPlusTree::new("idx".to_string(), key_len, bpm.clone()).unwrap_err();
+            assert!(matches!(err, IndexError::UnsupportedKeyLength(l) if l == key_len));
+        }
     }
 
     #[test]
