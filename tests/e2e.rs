@@ -111,3 +111,38 @@ fn scan_driven_sql_update_visits_each_original_row_once() {
         }
     }
 }
+
+#[test]
+fn where_and_join_queries_over_table_scans_open_their_children() {
+    use cmudb::processor::executor::collect_rows;
+
+    let dir = tempdir().unwrap();
+    let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).unwrap();
+    let bpm = Arc::new(create_buffer_pool_manager(
+        16,
+        ArcReplacer::new(16),
+        DiskScheduler::new(dm),
+    ));
+    let catalog = Catalog::new(bpm.clone());
+    let context = new_test_context(&catalog);
+    let run_sql = |sql: &str| {
+        let ast = Parser::parse_sql(&GenericDialect, sql).unwrap();
+        let mut rows = Vec::new();
+        for statement in context.binder.bind(ast).unwrap() {
+            let plan = context.planner.plan(statement).unwrap();
+            let mut exec = create_executor(&catalog, &bpm, &plan);
+            exec.open().unwrap();
+            rows = collect_rows(&mut *exec).unwrap();
+            exec.close().unwrap();
+        }
+        rows
+    };
+
+    run_sql("CREATE TABLE t (a INTEGER, b INTEGER)");
+    run_sql("INSERT INTO t VALUES (1, 2), (3, 4), (5, 6)");
+    assert_eq!(run_sql("SELECT a FROM t WHERE b > 3").len(), 2);
+    assert_eq!(
+        run_sql("SELECT * FROM t AS x JOIN t AS y ON x.a = y.a").len(),
+        3
+    );
+}
