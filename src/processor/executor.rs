@@ -542,8 +542,12 @@ impl AggState {
     }
 
     fn update(&mut self, v: Option<Value>) {
+        // COUNT(col) skips NULLs; COUNT(*) is bound to a non-null constant,
+        // so it still counts every row.
         if let Self::Count(count) = self {
-            *count += 1;
+            if v.is_some() {
+                *count += 1;
+            }
             return;
         }
 

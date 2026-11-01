@@ -123,7 +123,6 @@ fn aggregates_with_and_without_group_by() {
 }
 
 #[test]
-#[ignore = "known bug: COUNT(col) counts NULLs (returns 4, expected 3)"]
 fn count_column_skips_nulls() {
     let db = emp_db();
     assert_eq!(ints(&db.exec("SELECT COUNT(bonus) FROM emp")), vec![[3]]);
