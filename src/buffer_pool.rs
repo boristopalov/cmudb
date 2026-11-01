@@ -371,33 +371,34 @@ impl BufferPoolManager {
     }
 
     pub fn read_page(self: &Arc<Self>, page_id: usize) -> PageRefResult {
-        // case 1: page is cached
-        let mut meta = self.meta.lock();
         info!("tid={} read_page page_id={page_id}", Self::tid());
-        if let Some(frame_id) = meta.page_table.get(&page_id).copied() {
+        let mut meta = loop {
+            let mut meta = self.meta.lock();
+            let Some(frame_id) = meta.page_table.get(&page_id).copied() else {
+                break meta;
+            };
             info!(
                 "tid={} read_page cache hit page_id={page_id} frame_id={frame_id}",
                 Self::tid()
             );
-
             meta.replacer.record_access(frame_id, page_id);
             meta.replacer.set_evictable(frame_id, false);
             drop(meta);
 
-            let frame_lock = self.frames.get(frame_id).ok_or(BpmError::FrameMissing)?;
-
-            let frame = frame_lock.read();
-            if frame.page_id == Some(page_id) {
-                frame.pin_count.fetch_add(1, Ordering::AcqRel);
-
-                return Ok(PageRef {
-                    frame_guard: ManuallyDrop::new(frame),
-                    frame_id,
-                    bpm: Arc::clone(&self),
-                });
-            } else {
-                return Err(BpmError::FrameMissing);
+            let frame = self
+                .frames
+                .get(frame_id)
+                .ok_or(BpmError::FrameMissing)?
+                .read();
+            if frame.page_id != Some(page_id) {
+                continue;
             }
+            frame.pin_count.fetch_add(1, Ordering::AcqRel);
+            return Ok(PageRef {
+                frame_guard: ManuallyDrop::new(frame),
+                frame_id,
+                bpm: Arc::clone(self),
+            });
         };
 
         // case 2: page not cached -- issue an io request and load into memory
@@ -700,5 +701,37 @@ mod tests {
             drop(bpm.write_page(page_id).unwrap());
         });
         assert!(finished, "frame write lock was leaked by the guard drop");
+    }
+
+    #[test]
+    fn concurrent_reads_never_report_a_missing_frame_for_a_cached_page() {
+        let (bpm, _dir) = make_bpm(2);
+        let page_count = 6;
+        for _ in 0..page_count {
+            drop(bpm.new_page().unwrap());
+        }
+        let missing_frames = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..6)
+            .map(|worker| {
+                let bpm = Arc::clone(&bpm);
+                let missing_frames = Arc::clone(&missing_frames);
+                thread::spawn(move || {
+                    for round in 0..3_000 {
+                        let page_id = (worker * 7 + round) % page_count;
+                        if let Err(BpmError::FrameMissing) = bpm.read_page(page_id) {
+                            missing_frames.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert_eq!(
+            missing_frames.load(Ordering::Relaxed),
+            0,
+            "read_page reported FrameMissing for a page that exists"
+        );
     }
 }
