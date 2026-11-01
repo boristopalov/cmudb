@@ -1,23 +1,33 @@
 # The loop between our agents. Agents live in .claude/agents/<name>.md.
 #
-# Each stage says how it starts today:
-#   enforced_by: a workflow or check in the consuming repo runs it automatically.
-#   manual:      a person or a Claude session starts it, loading the agent by name.
+# Linear is the queue. Issue states:
+#   Backlog      new or needs a decision; triage works these
+#   Todo         ready; any agent may pick it up
+#   In Progress  an agent is working on it or its PR is open
+#   Done         Boris merged the PR
+#
+# Each stage says how it starts:
+#   enforced_by: a workflow in the consuming repo runs it automatically.
+#   scheduled:   the coordinator's scheduled run starts it.
 # Nothing here is executed by a runtime; this file is the spec, and the
-# workflows it names are what actually runs.
+# workflows and scheduled run it names are what actually run.
 version: 1
+
+queue: { linear: { project: cmudb, team: BOR } }
 
 stages:
   triage:
     agent: triage
-    trigger: { linear: { state: Todo } }
-    manual: true
-    next: implement            # when triage decides "implement"
+    trigger: { linear: { state: Backlog } }
+    scheduled: true
+    next: implement            # by moving the issue to Todo
 
   implement:
     agent: implement
-    trigger: { triage: implement }
-    manual: true
+    trigger: { linear: { state: Todo } }
+    scheduled: true
+    max_parallel: 2
+    sets_state: In Progress
     output: pull_request
     next: [review, test]
 
@@ -25,20 +35,26 @@ stages:
     agent: review
     trigger: { github: { pull_request: [opened, synchronize, reopened, ready_for_review] } }
     enforced_by: .github/workflows/claude-review.yml
+    next: implement            # findings go back to the PR's implementer
 
   test:
     agent: test
     trigger: { gate_failed: coverage }
-    manual: true
+    scheduled: true
 
   benchmark:
     agent: benchmark
-    trigger: { on_request: true }   # never in CI
-    manual: true
+    trigger: { on_request: true }   # by hand, never in CI
 
-# A PR merges only when every gate passes. Boris merges; agents never do.
+# A PR is merge-ready when every gate passes. Boris merges; agents never do.
 gates:
   ci_green:        { enforced_by: .github/workflows/ci.yml }
   coverage:        { min_lines: 80, enforced_by: .github/workflows/ci.yml }
-  review_findings: { rule: "no unresolved correctness or concurrency findings", manual: true }
-  merge:           { by: human, manual: true }
+  review_findings: { rule: "no open correctness or concurrency findings" }
+  merge:           { by: boris }
+
+# When the loop pings Boris. Everything else, agents handle.
+ping_boris:
+  - a PR is merge-ready
+  - an issue is flagged "Needs Boris:"
+  - work is stuck (CI red or a review finding unresolved after two attempts)
