@@ -4,12 +4,12 @@ use std::{
     collections::HashMap,
     fmt,
     fs::{File, OpenOptions},
-    io::{self, Read, Seek},
+    io,
     os::unix::fs::FileExt,
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicU32, Ordering},
         mpsc::{self, SendError},
     },
     thread::{self, JoinHandle},
@@ -130,15 +130,51 @@ impl Drop for DiskScheduler {
 }
 
 #[derive(Debug)]
+struct PageStore {
+    db_file: File,
+    page_offsets: HashMap<usize, u64>,
+    free_offsets: Vec<u64>,
+}
+
+impl PageStore {
+    fn offset_of(&self, id: usize) -> io::Result<u64> {
+        self.page_offsets.get(&id).copied().ok_or_else(|| {
+            warn!("read_page: page_id={id} missing from lookup table");
+            io::Error::new(io::ErrorKind::NotFound, format!("page {id} missing"))
+        })
+    }
+
+    fn offset_for_write(&mut self, id: usize) -> io::Result<u64> {
+        if let Some(&offset) = self.page_offsets.get(&id) {
+            return Ok(offset);
+        }
+        if let Some(offset) = self.free_offsets.pop() {
+            info!("write_page: reusing free offset={offset} for page_id={id}");
+            return Ok(offset);
+        }
+        self.db_file.metadata().map(|m| m.len())
+    }
+
+    fn log_page_mapping(&self, context: &str) {
+        warn!(
+            "{context}; page_id->offset mapping: {:?}",
+            self.page_offsets
+        );
+    }
+}
+
+#[derive(Debug)]
 pub struct DiskManager {
-    num_flushes: AtomicU32, // this is for log flushes, i think
-    num_writes: AtomicU32,  // this is for page writes
-    num_deletes: AtomicU32,
-    log_file: Mutex<File>,
-    page_lookup_table: Mutex<HashMap<usize, u64>>, // maps page IDs to file offsets in the db file
-    free_slots: Mutex<Vec<u64>>,                   // keeps tracks of free offsets ("slots")
-    should_flush_log: AtomicBool,
-    db_file: Mutex<File>,
+    num_writes: AtomicU32,
+    store: Mutex<PageStore>,
+}
+
+fn create_log_file_if_missing(log_path: &Path) -> io::Result<()> {
+    OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(log_path)
+        .map(drop)
 }
 
 impl DiskManager {
@@ -147,117 +183,46 @@ impl DiskManager {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(db_path)?;
-        let log_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(log_path)?;
+        create_log_file_if_missing(log_path.as_ref())?;
 
         Ok(Self {
-            num_flushes: AtomicU32::new(0),
             num_writes: AtomicU32::new(0),
-            num_deletes: AtomicU32::new(0),
-            log_file: Mutex::new(log_file),
-            page_lookup_table: Mutex::new(HashMap::new()),
-            free_slots: Mutex::new(Vec::new()),
-            should_flush_log: AtomicBool::new(false),
-            db_file: Mutex::new(db_file),
+            store: Mutex::new(PageStore {
+                db_file,
+                page_offsets: HashMap::new(),
+                free_offsets: Vec::new(),
+            }),
         })
     }
 
-    pub fn read_page(&self, id: usize, mut buf: PageData) -> std::io::Result<PageData> {
-        debug_assert_eq!(buf.len(), PAGE_SIZE);
-        let table = self.page_lookup_table.lock();
-
-        let offset = match table.get(&id) {
-            Some(offset) => *offset,
-            None => {
-                warn!("read_page: page_id={id} missing from lookup table");
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("page {id} missing"),
-                ));
-            }
-        };
-
+    pub fn read_page(&self, id: usize, mut buf: PageData) -> io::Result<PageData> {
+        let store = self.store.lock();
+        let offset = store.offset_of(id)?;
         info!("read_page: page_id={id} offset={offset}");
-
-        let mut file = self.db_file.lock();
-        let result: io::Result<()> = (|| {
-            file.seek(io::SeekFrom::Start(offset))?;
-            file.read_exact(&mut *buf)?;
-            Ok(())
-        })();
-
-        if let Err(ref e) = result {
-            self.log_page_mapping(&format!(
+        if let Err(e) = store.db_file.read_exact_at(&mut *buf, offset) {
+            store.log_page_mapping(&format!(
                 "read_page error page_id={id} offset={offset} err={e}"
             ));
+            return Err(e);
         }
-
-        result.map(|_| buf)
+        Ok(buf)
     }
 
-    pub fn write_page(&self, id: usize, mut data: PageData) -> std::io::Result<PageData> {
-        debug_assert_eq!(data.len(), PAGE_SIZE);
-        let file = self.db_file.lock();
-        let mut table = self.page_lookup_table.lock();
-        let mut free_slots = self.free_slots.lock();
-
-        if let Some(&offset) = table.get(&id) {
-            let res = file.write_all_at(&mut *data, offset);
-            if let Err(ref e) = res {
-                self.log_page_mapping(&format!(
-                    "write_page error page_id={id} offset={offset} err={e}"
-                ));
-            }
-            res?;
-            table.insert(id, offset);
-            info!("write_page: appended page_id={id} at offset={offset}");
-            self.num_writes.fetch_add(1, Ordering::AcqRel);
-            return Ok(data);
-        };
-
-        match free_slots.pop() {
-            // we have a free slot
-            Some(slot) => {
-                let res = file.write_all_at(&mut *data, slot);
-                if let Err(ref e) = res {
-                    self.log_page_mapping(&format!(
-                        "write_page error page_id={id} offset={slot} err={e}"
-                    ));
-                }
-                res?;
-                table.insert(id, slot);
-                info!("write_page: reused slot offset={slot} for page_id={id}");
-                slot
-            }
-            // free_slots is empty, directly append to the end of the file
-            None => {
-                let offset = file.metadata()?.len();
-                let res = file.write_all_at(&mut *data, offset);
-                if let Err(ref e) = res {
-                    self.log_page_mapping(&format!(
-                        "write_page error page_id={id} offset={offset} err={e}"
-                    ));
-                }
-                res?;
-                table.insert(id, offset);
-                info!("write_page: appended page_id={id} at offset={offset}");
-                offset
-            }
-        };
+    pub fn write_page(&self, id: usize, data: PageData) -> io::Result<PageData> {
+        let mut store = self.store.lock();
+        let offset = store.offset_for_write(id)?;
+        if let Err(e) = store.db_file.write_all_at(&*data, offset) {
+            store.log_page_mapping(&format!(
+                "write_page error page_id={id} offset={offset} err={e}"
+            ));
+            return Err(e);
+        }
+        store.page_offsets.insert(id, offset);
+        info!("write_page: wrote page_id={id} at offset={offset}");
         self.num_writes.fetch_add(1, Ordering::AcqRel);
-
         Ok(data)
-    }
-
-    // pub fn delete_page(&self, id: usize) {}
-
-    fn log_page_mapping(&self, context: &str) {
-        let snapshot = self.page_lookup_table.lock().clone();
-        warn!("{context}; page_id->offset mapping: {:?}", snapshot);
     }
 }
 
@@ -302,10 +267,70 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dm = manager(&dir);
         dm.write_page(1, page(1)).unwrap();
-        dm.free_slots.lock().push(0);
+        dm.store.lock().free_offsets.push(0);
         dm.write_page(2, page(2)).unwrap();
-        assert_eq!(dm.page_lookup_table.lock().get(&2), Some(&0));
+        assert_eq!(dm.store.lock().page_offsets.get(&2), Some(&0));
         assert_eq!(*dm.read_page(2, page(0)).unwrap(), [2; PAGE_SIZE]);
+    }
+
+    fn finishes_within(limit: std::time::Duration, work: impl FnOnce() + Send + 'static) -> bool {
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            work();
+            let _ = done_tx.send(());
+        });
+        done_rx.recv_timeout(limit).is_ok()
+    }
+
+    #[test]
+    fn read_error_is_returned_instead_of_deadlocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let dm = manager(&dir);
+        dm.write_page(1, page(1)).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("db"))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let (result_tx, result_rx) = mpsc::channel();
+        let finished = finishes_within(std::time::Duration::from_secs(5), move || {
+            let _ = result_tx.send(dm.read_page(1, page(0)).map(|_| ()));
+        });
+        assert!(finished, "read_page hung while reporting an I/O error");
+        let err = result_rx.recv().unwrap().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn concurrent_reads_and_writes_do_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let dm = Arc::new(manager(&dir));
+        for id in 0..8 {
+            dm.write_page(id, page(id as u8)).unwrap();
+        }
+        let finished = finishes_within(std::time::Duration::from_secs(20), move || {
+            let workers: Vec<_> = (0..8)
+                .map(|worker| {
+                    let dm = dm.clone();
+                    thread::spawn(move || {
+                        for round in 0..2_000 {
+                            let id = (worker + round) % 8;
+                            if worker % 2 == 0 {
+                                dm.write_page(id, page(id as u8)).unwrap();
+                            } else {
+                                let data = dm.read_page(id, page(0)).unwrap();
+                                assert_eq!(*data, [id as u8; PAGE_SIZE], "page {id} was torn");
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for w in workers {
+                w.join().unwrap();
+            }
+        });
+        assert!(finished, "concurrent read_page/write_page deadlocked");
     }
 
     #[test]
