@@ -378,37 +378,30 @@ impl<'a> Binder<'a> {
                     self.agg_ctx.borrow_mut().take()
                 };
 
-                let projections = self.resolve_projections(&s.projection, &scope)?;
-                let sort = match q.order_by.as_ref() {
-                    None => None,
-                    Some(ob) => match &ob.kind {
-                        OrderByKind::Expressions(exprs) => Some(
-                            exprs
-                                .iter()
-                                .map(|oe| self.resolve_expr(&oe.expr, &scope))
-                                .collect::<Result<_, _>>()?,
-                        ),
-                        OrderByKind::All(_) => {
-                            return Err(BinderError("ORDER BY ALL not supported".into()));
-                        }
-                    },
-                };
-                let limit = resolve_limit(q.limit_clause.as_ref())?;
-
-                // Pull out the aggregates registered while resolving the
-                // projection / ORDER BY, then restore any outer agg-ctx.
-                let (group_bys, aggregates) = if aggregating {
-                    let ctx = self
-                        .agg_ctx
-                        .borrow_mut()
-                        .take()
-                        .expect("agg_ctx was just installed");
-                    *self.agg_ctx.borrow_mut() = prev_ctx;
-                    (ctx.group_bys, ctx.aggregates)
-                } else {
-                    *self.agg_ctx.borrow_mut() = prev_ctx;
-                    (vec![], vec![])
-                };
+                let resolved = (|| -> Result<_, BinderError> {
+                    let projections = self.resolve_projections(&s.projection, &scope)?;
+                    let sort = match q.order_by.as_ref() {
+                        None => None,
+                        Some(ob) => match &ob.kind {
+                            OrderByKind::Expressions(exprs) => Some(
+                                exprs
+                                    .iter()
+                                    .map(|oe| self.resolve_expr(&oe.expr, &scope))
+                                    .collect::<Result<_, _>>()?,
+                            ),
+                            OrderByKind::All(_) => {
+                                return Err(BinderError("ORDER BY ALL not supported".into()));
+                            }
+                        },
+                    };
+                    let limit = resolve_limit(q.limit_clause.as_ref())?;
+                    Ok((projections, sort, limit))
+                })();
+                let installed_ctx = self.agg_ctx.replace(prev_ctx);
+                let (projections, sort, limit) = resolved?;
+                let (group_bys, aggregates) = installed_ctx
+                    .map(|ctx| (ctx.group_bys, ctx.aggregates))
+                    .unwrap_or_default();
 
                 Ok(BoundStatement::Select(BoundSelect {
                     scope,
@@ -968,5 +961,25 @@ mod tests {
             };
             assert_eq!(column_refs(&sel.projections), vec![(0, 0), (0, 1), (1, 0)]);
         }
+    }
+
+    #[test]
+    fn failed_aggregating_select_does_not_leak_into_the_next_statement() {
+        let (catalog, _dir) = catalog_with_tables(&[("t", &["a", "b"])]);
+        let binder = Binder::new(&catalog);
+        let parse = |sql: &str| {
+            Parser::parse_sql(&GenericDialect {}, sql)
+                .unwrap()
+                .remove(0)
+        };
+        assert!(
+            binder
+                .bind_statement(&parse("SELECT a, b FROM t GROUP BY a"))
+                .is_err()
+        );
+        assert!(
+            binder.bind_statement(&parse("UPDATE t SET a = b")).is_ok(),
+            "a later statement must not see the failed SELECT's GROUP BY"
+        );
     }
 }
