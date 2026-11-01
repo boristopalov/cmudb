@@ -415,6 +415,37 @@ fn unique_index_across_versions_and_transactions() {
     }
 }
 
+/// An index entry left behind when a row moves to a new key only blocks that old key while
+/// the move is uncommitted, because an abort would bring the key back.
+#[test]
+fn old_key_of_a_moved_row_is_free_once_the_move_commits() {
+    let db = Db::new();
+    accounts(&db, &[(5, 50)]);
+
+    let mover = db.begin();
+    db.exec(&mover, "UPDATE accounts SET id = 6 WHERE id = 5")
+        .unwrap();
+    let early = db.begin();
+    let err = db
+        .exec(&early, "INSERT INTO accounts VALUES (5, 1)")
+        .unwrap_err();
+    assert!(
+        err.contains("write-write conflict"),
+        "the move could still roll back and reclaim the key: {err}"
+    );
+    db.abort(&early);
+
+    let late = db.begin();
+    db.commit(&mover);
+    db.exec(&late, "INSERT INTO accounts VALUES (5, 2)")
+        .expect("a committed move leaves only a stale entry for the old key");
+    db.commit(&late);
+
+    let check = db.begin();
+    assert_eq!(db.query(&check, ALL), rows(&[&[5, 2], &[6, 50]]));
+    db.commit(&check);
+}
+
 #[test]
 fn garbage_collection_keeps_what_running_snapshots_need() {
     let db = Db::new();

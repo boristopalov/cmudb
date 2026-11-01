@@ -186,7 +186,9 @@ fn sorted(indexes: &[Arc<IndexInfo>]) -> Vec<&Arc<IndexInfo>> {
 /// Call with the index's unique latch held.
 ///
 /// It judges the newest version behind each entry, not the one `txn` can see, so two live
-/// rows with the same key cannot both commit.
+/// rows with the same key cannot both commit. A row another transaction is still writing
+/// conflicts even when its new version left the key, since an abort could bring the key
+/// back. A committed row that no longer holds the key is a stale entry and is skipped.
 fn check_unique(
     txn: &Transaction,
     heap: &TableHeap,
@@ -208,6 +210,10 @@ fn check_unique(
             };
             (meta, index.key_of_tuple(&t).as_ref() == Some(&key))
         })?;
+        let pending_elsewhere = is_txn_id(meta.ts) && meta.ts != txn.id();
+        if !holds_key && !pending_elsewhere {
+            continue;
+        }
         check_write(txn, rid, meta)?;
         if !meta.is_deleted && holds_key {
             return Err(MvccError::DuplicateKey(info.name.clone()));
