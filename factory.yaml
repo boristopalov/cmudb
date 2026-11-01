@@ -114,6 +114,7 @@ gates:
       verdict: pass
       risk: [low, medium]
       confidence: high
+    never_self_merge: ['.github/**', 'agents/**', '.claude/**', 'codex/**', factory.yaml, rubric.md]
     otherwise: boris
     stacked: bottom_first
 
