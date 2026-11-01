@@ -1,4 +1,10 @@
-# The loop between our agents. Agents live in .claude/agents/<name>.md.
+# The loop between our agents.
+#
+# Each role is a plain prompt in agents/<name>.md plus the settings under
+# `agents:` below. `targets:` maps those neutral settings to each harness;
+# generate.py writes the files each harness reads (.claude/agents/ for
+# Claude Code, codex/AGENTS.md for Codex). Edit agents/ and this file, never
+# the generated files.
 #
 # Linear is the queue. Issue states:
 #   Backlog      new or needs a decision; triage works these
@@ -14,6 +20,47 @@
 version: 1
 
 queue: { linear: { project: cmudb, team: BOR } }
+
+# model: strong or fast. tools: all, or a list of read, shell, edit, pr_comment.
+agents:
+  triage:
+    description: Triages the project's Linear issues so agents know what they may pick up. Use on new or Backlog issues, or on a scheduled pass.
+    model: fast
+    tools: all
+  implement:
+    description: Implements a triaged work item and opens a pull request. Use when the acceptance criteria are clear.
+    model: strong
+    tools: all
+  review:
+    description: Reviews a pull request's changes and reports real problems ranked by severity. Read-only; comments but never edits or approves.
+    model: strong
+    tools: [read, shell, pr_comment]
+  test:
+    description: Adds tests to raise coverage and catch regressions on a branch or PR. Use when coverage is below the gate or a change lacks tests.
+    model: fast
+    tools: all
+  benchmark:
+    description: Measures performance of a change against a baseline. Runs by hand, never in CI.
+    model: fast
+    tools: all
+  judge:
+    description: Evaluates past agent sessions and their PRs against rubric.md for failure modes, and proposes changes to the factory in an agent-factory PR. Runs weekly.
+    model: strong
+    tools: all
+
+targets:
+  claude-code:
+    models: { strong: opus, fast: sonnet }
+    tools:
+      read: [Read, Grep, Glob]
+      shell: [Bash]
+      edit: [Edit, Write]
+      pr_comment: [mcp__github_inline_comment__create_inline_comment]
+  codex:
+    # Codex uses the model in your Codex config; set one here to pin it.
+    models: {}
+    # Roles without edit say to start Codex with --sandbox read-only;
+    # AGENTS.md can't enforce that itself.
 
 stages:
   triage:
@@ -45,6 +92,14 @@ stages:
   benchmark:
     agent: benchmark
     trigger: { on_request: true }   # by hand, never in CI
+
+  judge:
+    agent: judge
+    trigger: { schedule: weekly }   # never in CI
+    scheduled: true
+    inputs: [recent agent sessions, their PRs and diffs, rubric.md, ledger.md]
+    limits: { max_proposals: 3, min_sessions: 2, cooldown_weeks: 2 }
+    output: findings report, plus a pull_request on agent-factory
 
 # A PR is merge-ready when every gate passes. Boris merges; agents never do.
 gates:
