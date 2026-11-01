@@ -295,6 +295,32 @@ fn unique_index_rejects_duplicate_key() {
 }
 
 #[test]
+fn index_lookups_with_a_constant_of_another_numeric_type_match_a_scan() {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE t (id INTEGER, v INTEGER)");
+    db.exec("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
+    let scanned = ints(&db.exec("SELECT v FROM t WHERE id = 2.0"));
+    assert_eq!(scanned, vec![[20]]);
+    db.exec("CREATE INDEX t_id ON t (id)");
+    assert_eq!(ints(&db.exec("SELECT v FROM t WHERE id = 2.0")), scanned);
+    assert_eq!(ints(&db.exec("SELECT v FROM t WHERE 2.0 = id")), scanned);
+    assert!(db.exec("SELECT v FROM t WHERE id = 2.5").is_empty());
+
+    db.exec("CREATE TABLE f (x FLOAT, w INTEGER)");
+    db.exec("INSERT INTO f VALUES (2.0, 200), (2.5, 250)");
+    db.exec("CREATE INDEX f_x ON f (x)");
+    assert_eq!(ints(&db.exec("SELECT w FROM f WHERE x = 2")), vec![[200]]);
+    assert_eq!(
+        ints(&db.exec("SELECT f.w, t.v FROM f JOIN t ON f.x = t.id")),
+        vec![[200, 20]]
+    );
+    assert_eq!(
+        ints(&db.exec("SELECT t.v, f.w FROM t JOIN f ON t.id = f.x")),
+        vec![[20, 200]]
+    );
+}
+
+#[test]
 fn create_index_backfills_existing_rows() {
     let db = emp_db();
     db.exec("CREATE INDEX emp_id ON emp (id)");

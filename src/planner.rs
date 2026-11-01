@@ -267,6 +267,7 @@ impl<'a> Planner<'a> {
         filter: Option<Expression>,
     ) -> (Plan, Option<Expression>) {
         if let Some((col_idx, value)) = filter.as_ref().and_then(column_equals_constant)
+            && value.data_type() == ts.schema.cols[col_idx as usize].dtype
             && let Some(index_oid) = self.index_for_cols(ts.oid, &[col_idx as usize])
         {
             return (
@@ -303,10 +304,15 @@ impl<'a> Planner<'a> {
         });
 
         let index_join = match join.join_type {
-            JoinType::Inner => left_right_equi_join(&join.predicate).and_then(|(outer, inner)| {
-                self.index_for_cols(right_ts.oid, &[inner as usize])
-                    .map(|index_oid| (outer, index_oid))
-            }),
+            JoinType::Inner => left_right_equi_join(&join.predicate)
+                .filter(|&(outer, inner)| {
+                    left_ts.schema.cols[outer as usize].dtype
+                        == right_ts.schema.cols[inner as usize].dtype
+                })
+                .and_then(|(outer, inner)| {
+                    self.index_for_cols(right_ts.oid, &[inner as usize])
+                        .map(|index_oid| (outer, index_oid))
+                }),
             JoinType::Left => None,
         };
         if let Some((outer_col, index_oid)) = index_join {
@@ -424,6 +430,8 @@ fn aggregation_output_schema(
 }
 
 /// `(col_idx, value)` when `filter` is `col = value` or `value = col` on the scanned table.
+/// An index lookup encodes `value` with its own type, so callers use the index only when
+/// `value` has the column's type; mixed INT and FLOAT equality goes through a filtered scan.
 fn column_equals_constant(filter: &Expression) -> Option<(u32, Value)> {
     let Expression::Binary {
         left,
