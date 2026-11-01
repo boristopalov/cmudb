@@ -246,6 +246,9 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> TablePage<B> {
         if current.meta.is_deleted {
             return Err(TablePageError(format!("slot {slot} already deleted")));
         }
+        if self.num_deleted_tuples() == u16::MAX {
+            return Err(TablePageError("deleted-tuple counter overflow".to_string()));
+        }
         self.update_meta(
             slot,
             TupleMeta {
@@ -256,17 +259,15 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> TablePage<B> {
     }
 
     /// Overwrites the MVCC metadata of `slot`, keeping the deleted-tuple counter in sync.
+    ///
+    /// Once the slot exists this cannot fail: the counter saturates rather than erroring, so
+    /// undo bookkeeping done just before the write (pushing or popping a version) stays in
+    /// step with the slot.
     pub fn update_meta(&mut self, slot: u32, meta: TupleMeta) -> Result<(), TablePageError> {
         let current = self.existing_slot(slot)?;
         let deleted = match (current.meta.is_deleted, meta.is_deleted) {
-            (false, true) => self
-                .num_deleted_tuples()
-                .checked_add(1)
-                .ok_or_else(|| TablePageError("deleted-tuple counter overflow".to_string()))?,
-            (true, false) => self
-                .num_deleted_tuples()
-                .checked_sub(1)
-                .ok_or_else(|| TablePageError("deleted-tuple counter underflow".to_string()))?,
+            (false, true) => self.num_deleted_tuples().saturating_add(1),
+            (true, false) => self.num_deleted_tuples().saturating_sub(1),
             _ => self.num_deleted_tuples(),
         };
         let base = Self::slot_base(slot);
@@ -416,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn update_meta_rejects_an_underflowing_deleted_counter() {
+    fn update_meta_saturates_a_corrupt_deleted_counter() {
         let mut buf = [0u8; PAGE_SIZE];
         let mut page = TablePage::init(&mut buf[..]);
         page.insert(b"x").unwrap();
@@ -427,14 +428,10 @@ mod tests {
             is_deleted: false,
             ..page.slot(0).unwrap().meta
         };
-        assert!(
-            page.update_meta(0, live).is_err(),
-            "counter underflow is reported"
-        );
-        assert!(
-            page.slot(0).unwrap().meta.is_deleted,
-            "a rejected update leaves the slot deleted"
-        );
+        page.update_meta(0, live)
+            .expect("an MVCC metadata write on an existing slot never fails");
+        assert!(!page.slot(0).unwrap().meta.is_deleted);
+        assert_eq!(page.num_deleted_tuples(), 0);
     }
 
     #[test]
