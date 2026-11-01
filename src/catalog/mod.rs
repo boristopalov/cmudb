@@ -133,7 +133,7 @@ impl Catalog {
             .ok_or(CatalogError::TableDoesNotExist)
     }
 
-    /// TODO: populate the index if the table it is being created for has data in it
+    /// Creates an index over `col_names` of the table and fills it with the table's existing rows.
     pub fn create_index(
         &self,
         bpm: Arc<BufferPoolManager>,
@@ -142,7 +142,7 @@ impl Catalog {
         col_names: &[&str],
         index_type: IndexType,
     ) -> Result<u32, CatalogError> {
-        let (table_name, table_schema, indexed_col_idxs) = {
+        let (table, indexed_col_idxs) = {
             let tables = self.tables.read().unwrap();
             let tinfo = tables
                 .get(&table_oid)
@@ -156,13 +156,13 @@ impl Catalog {
                         .ok_or(CatalogError::ColumnNotFound)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            (tinfo.name.clone(), tinfo.schema.clone(), indexed_col_idxs)
+            (tinfo.clone(), indexed_col_idxs)
         };
 
         let mut indexes = self.indexes.write().unwrap();
         let mut index_names = self.index_names.write().unwrap();
 
-        if let Some(table_indexes) = index_names.get(&table_name) {
+        if let Some(table_indexes) = index_names.get(&table.name) {
             if table_indexes.contains_key(&name) {
                 return Err(CatalogError::IndexExists);
             }
@@ -171,11 +171,19 @@ impl Catalog {
         let index = TableIndex::new(
             bpm,
             name.clone(),
-            table_schema,
+            table.schema.clone(),
             indexed_col_idxs,
             index_type,
         )
-        .map_err(|_| CatalogError::IndexCreationError(("failed to create index").to_string()))?;
+        .map_err(|e| CatalogError::IndexCreationError(format!("failed to create index: {e}")))?;
+        for row in table.heap.iter() {
+            let (tuple, rid) = row.map_err(|e| {
+                CatalogError::IndexCreationError(format!("failed to scan table: {}", e.0))
+            })?;
+            index.insert(&tuple, rid).map_err(|e| {
+                CatalogError::IndexCreationError(format!("failed to index row {rid}: {e}"))
+            })?;
+        }
         let oid = self.next_index_oid();
         let info = IndexInfo {
             oid,
@@ -184,7 +192,10 @@ impl Catalog {
             index,
         };
         indexes.insert(oid, Arc::new(info));
-        index_names.entry(table_name).or_default().insert(name, oid);
+        index_names
+            .entry(table.name.clone())
+            .or_default()
+            .insert(name, oid);
         Ok(oid)
     }
 
@@ -608,4 +619,76 @@ fn order_preserving_encoding_sorts_like_value_ord() {
             }
         }
     }
+}
+
+#[cfg(test)]
+fn test_catalog() -> (Catalog, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dm = crate::disk::DiskManager::new(dir.path().join("db"), dir.path().join("log"))
+        .expect("disk manager");
+    let bpm = Arc::new(crate::create_buffer_pool_manager(
+        32,
+        crate::replacer::ArcReplacer::new(32),
+        crate::disk::DiskScheduler::new(dm),
+    ));
+    (Catalog::new(bpm), dir)
+}
+
+#[test]
+fn create_index_backfills_rows_already_in_the_table() {
+    let (catalog, _dir) = test_catalog();
+    let schema = Schema::new(vec![
+        (DataType::INT, "id".to_string()),
+        (DataType::INT, "v".to_string()),
+    ]);
+    let oid = catalog.create_table("t".into(), schema.clone()).unwrap();
+    let table = catalog.get_table(oid).unwrap();
+    let mut rids = Vec::new();
+    for id in 0..5 {
+        let tuple = schema
+            .encode_tuple(&[Some(Value::INT(id)), Some(Value::INT(id * 10))])
+            .unwrap();
+        rids.push(table.heap.insert(&tuple).unwrap());
+    }
+
+    let ioid = catalog
+        .create_index(
+            catalog.bpm.clone(),
+            oid,
+            "t_id".into(),
+            &["id"],
+            IndexType::BPlusTree,
+        )
+        .unwrap();
+
+    let index = catalog.get_index(ioid).unwrap();
+    for (id, rid) in rids.iter().enumerate() {
+        assert_eq!(
+            index.index.search(&[Value::INT(id as i32)]).unwrap(),
+            Some(*rid),
+            "row with id {id} must be findable through the new index"
+        );
+    }
+}
+
+#[test]
+fn create_index_fails_and_registers_nothing_when_existing_rows_have_duplicate_keys() {
+    let (catalog, _dir) = test_catalog();
+    let schema = Schema::new(vec![(DataType::INT, "id".to_string())]);
+    let oid = catalog.create_table("t".into(), schema.clone()).unwrap();
+    let table = catalog.get_table(oid).unwrap();
+    let dup = schema.encode_tuple(&[Some(Value::INT(1))]).unwrap();
+    table.heap.insert(&dup).unwrap();
+    table.heap.insert(&dup).unwrap();
+
+    let result = catalog.create_index(
+        catalog.bpm.clone(),
+        oid,
+        "t_id".into(),
+        &["id"],
+        IndexType::BPlusTree,
+    );
+
+    assert!(matches!(result, Err(CatalogError::IndexCreationError(_))));
+    assert!(catalog.get_table_indexes(oid).unwrap().is_empty());
 }

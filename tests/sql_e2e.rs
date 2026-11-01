@@ -295,7 +295,6 @@ fn unique_index_rejects_duplicate_key() {
 }
 
 #[test]
-#[ignore = "known gap: CREATE INDEX does not backfill rows already in the table"]
 fn create_index_backfills_existing_rows() {
     let db = emp_db();
     db.exec("CREATE INDEX emp_id ON emp (id)");
@@ -446,8 +445,8 @@ fn creating_a_table_twice_fails_and_data_is_kept() {
     let db = emp_db();
     assert!(db.try_exec("CREATE TABLE emp (id INTEGER)").is_err());
     assert_eq!(ints(&db.exec("SELECT COUNT(*) FROM emp")), vec![[4]]);
-    db.exec("CREATE INDEX i ON emp (dept)");
-    assert!(db.try_exec("CREATE INDEX i ON emp (dept)").is_err());
+    db.exec("CREATE INDEX i ON emp (id)");
+    assert!(db.try_exec("CREATE INDEX i ON emp (id)").is_err());
 }
 
 #[test]
