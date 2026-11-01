@@ -116,23 +116,12 @@ impl<'a> PageRef<'a> {
 
 impl<'a> Drop for PageRef<'a> {
     fn drop(&mut self) {
-        let current = self.frame_guard.pin_count.load(Ordering::Acquire);
-        if current == 0 {
-            warn!(
-                "tried to unpin a frame with 0 pins frame_id={}",
-                self.frame_guard.frame_id
-            );
-            return;
-        }
-        let prev = self.frame_guard.pin_count.fetch_sub(1, Ordering::AcqRel);
-        let frame_id = self.frame_guard.frame_id.clone();
-        info!("dropping frame guard; page_id={:?}", self.page_id());
-        unsafe {
-            ManuallyDrop::drop(&mut self.frame_guard);
-        }
-        let mut meta = self.bpm.meta.lock();
-        if prev == 1 {
-            meta.replacer.set_evictable(frame_id, true);
+        let frame_id = self.frame_guard.frame_id;
+        let released_last_pin = self.frame_guard.unpin();
+        // SAFETY: `frame_guard` is dropped exactly once, here in `Drop::drop`, and is never read afterwards.
+        unsafe { ManuallyDrop::drop(&mut self.frame_guard) };
+        if released_last_pin {
+            self.bpm.mark_evictable_after_frame_released(frame_id);
         }
     }
 }
@@ -153,22 +142,12 @@ impl<'a> PageMut<'a> {
 
 impl<'a> Drop for PageMut<'a> {
     fn drop(&mut self) {
-        let current = self.frame_guard.pin_count.load(Ordering::Acquire);
-        if current == 0 {
-            warn!(
-                "tried to unpin a frame with 0 pins frame_id={}",
-                self.frame_guard.frame_id
-            );
-            return;
-        }
-        let prev = self.frame_guard.pin_count.fetch_sub(1, Ordering::AcqRel);
-        let frame_id = self.frame_guard.frame_id.clone();
-        unsafe {
-            ManuallyDrop::drop(&mut self.frame_guard);
-        }
-        let mut meta = self.bpm.meta.lock();
-        if prev == 1 {
-            meta.replacer.set_evictable(frame_id, true);
+        let frame_id = self.frame_guard.frame_id;
+        let released_last_pin = self.frame_guard.unpin();
+        // SAFETY: `frame_guard` is dropped exactly once, here in `Drop::drop`, and is never read afterwards.
+        unsafe { ManuallyDrop::drop(&mut self.frame_guard) };
+        if released_last_pin {
+            self.bpm.mark_evictable_after_frame_released(frame_id);
         }
     }
 }
@@ -208,6 +187,23 @@ type PageRefResult<'a> = Result<PageRef<'a>, BpmError>;
 type PageMutResult<'a> = Result<PageMut<'a>, BpmError>;
 
 impl FrameHeader {
+    fn unpin(&self) -> bool {
+        match self
+            .pin_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pins| {
+                pins.checked_sub(1)
+            }) {
+            Ok(previous_pins) => previous_pins == 1,
+            Err(_) => {
+                warn!(
+                    "tried to unpin a frame with 0 pins frame_id={}",
+                    self.frame_id
+                );
+                false
+            }
+        }
+    }
+
     pub fn clear(&mut self) {
         self.dirty.store(false, Ordering::Release);
         self.pin_count.store(0, Ordering::Release);
@@ -606,6 +602,10 @@ impl BufferPoolManager {
         meta.replacer.set_evictable(frame_id, true);
     }
 
+    fn mark_evictable_after_frame_released(&self, frame_id: usize) {
+        self.meta.lock().replacer.set_evictable(frame_id, true);
+    }
+
     fn get_next_page_id(&self) -> usize {
         self.next_page_id
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
@@ -658,5 +658,47 @@ impl BufferPoolManager {
         // if we get here we should have successfully flushed
         frame.dirty.store(false, Ordering::Release);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::disk::{DiskManager, DiskScheduler};
+    use crate::replacer::ArcReplacer;
+    use std::time::Duration;
+
+    fn make_bpm(num_frames: usize) -> (Arc<BufferPoolManager>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).unwrap();
+        let bpm = BufferPoolManager::new(
+            num_frames,
+            ArcReplacer::new(num_frames),
+            DiskScheduler::new(dm),
+        );
+        (Arc::new(bpm), dir)
+    }
+
+    fn finishes_within(limit: Duration, work: impl FnOnce() + Send + 'static) -> bool {
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            work();
+            let _ = done_tx.send(());
+        });
+        done_rx.recv_timeout(limit).is_ok()
+    }
+
+    #[test]
+    fn dropping_a_guard_with_zero_pins_still_releases_the_frame_lock() {
+        let (bpm, _dir) = make_bpm(1);
+        let page = bpm.new_page().unwrap();
+        let page_id = page.page_id().unwrap();
+        page.frame_guard.pin_count.store(0, Ordering::Release);
+        drop(page);
+
+        let finished = finishes_within(Duration::from_secs(5), move || {
+            drop(bpm.write_page(page_id).unwrap());
+        });
+        assert!(finished, "frame write lock was leaked by the guard drop");
     }
 }
