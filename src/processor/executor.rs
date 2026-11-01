@@ -1236,11 +1236,10 @@ impl<'a> Executor for WindowFunctionExecutor<'a> {
             };
             if flush_now {
                 flush_peer_group(
+                    self.plan,
                     &mut peer_buffer,
                     &mut partition_aggregates,
-                    &self.plan.aggregates,
                     child_schema,
-                    &self.plan.schema,
                     &mut output_tuples,
                 )?;
             }
@@ -1263,11 +1262,10 @@ impl<'a> Executor for WindowFunctionExecutor<'a> {
 
         if !peer_buffer.is_empty() {
             flush_peer_group(
+                self.plan,
                 &mut peer_buffer,
                 &mut partition_aggregates,
-                &self.plan.aggregates,
                 child_schema,
-                &self.plan.schema,
                 &mut output_tuples,
             )?;
         }
@@ -1595,28 +1593,30 @@ impl<'a> Executor for DropIndexExecutor<'a> {
     }
 }
 
-/// Folds every buffered peer row into `aggregates`, then emits each of those rows followed
-/// by the aggregates' current values, draining `buffer`.
+/// Folds every buffered peer row into `aggregates`, then emits each of those rows as the
+/// plan's `columns` followed by the aggregates' current values, draining `buffer`.
 fn flush_peer_group(
+    plan: &WindowFunctionPlanNode,
     buffer: &mut Vec<Tuple>,
     aggregates: &mut [AggState],
-    plan_aggs: &[(Expression, AggType)],
     child_schema: &Schema,
-    out_schema: &Schema,
     output: &mut Vec<Tuple>,
 ) -> Result<(), ExecutorError> {
     for buf_tup in buffer.iter() {
-        for (state, (expr, _)) in aggregates.iter_mut().zip(plan_aggs.iter()) {
+        for (state, (expr, _)) in aggregates.iter_mut().zip(plan.aggregates.iter()) {
             state.update(expr.evaluate(buf_tup, child_schema)?)?;
         }
     }
     for buf_tup in buffer.drain(..) {
-        let mut combined = row_values(child_schema, &buf_tup)?;
+        let mut combined = plan
+            .columns
+            .iter()
+            .map(|e| e.evaluate(&buf_tup, child_schema))
+            .collect::<Result<Vec<_>, _>>()?;
         for agg in aggregates.iter() {
             combined.push(agg.value()?);
         }
-        let out = out_schema.encode_tuple(&combined)?;
-        output.push(out);
+        output.push(plan.schema.encode_tuple(&combined)?);
     }
     Ok(())
 }
@@ -1791,6 +1791,31 @@ mod tests {
         let mut agg = AggregationExecutor::new(&plan, values_child(&rows));
         let err = agg.open().unwrap_err();
         assert!(err.0.contains("division by zero"), "{}", err.0);
+    }
+
+    #[test]
+    fn window_output_is_its_columns_followed_by_its_aggregates() {
+        let schema = int_schema(&["dept", "amount"]);
+        let rows = values_plan(&schema, &[&[1, 10], &[1, 30], &[2, 5]]);
+        let doubled_amount = Expression::Binary {
+            left: Box::new(col(1)),
+            right: Box::new(Expression::Constant(Some(Value::INT(2)))),
+            op: crate::processor::plan::Op::Mul,
+        };
+        let out_schema = int_schema(&["doubled", "dept_total"]);
+        let plan = WindowFunctionPlanNode {
+            schema: out_schema.clone(),
+            child: Box::new(values_plan(&schema, &[])),
+            order_by_exprs: None,
+            partition_by_exprs: Some(vec![col(0)]),
+            aggregates: vec![(col(1), AggType::SUM)],
+            columns: vec![doubled_amount],
+        };
+        let mut window = WindowFunctionExecutor::new(&plan, values_child(&rows));
+        assert_eq!(
+            decode_ints(&out_schema, drain(&mut window)),
+            vec![vec![20, 40], vec![60, 40], vec![10, 5]]
+        );
     }
 
     #[test]
