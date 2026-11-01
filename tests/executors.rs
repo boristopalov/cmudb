@@ -218,7 +218,6 @@ fn window_partition_without_order_gives_partition_totals() {
             AggType::AVG,
         ],
     );
-    // rows within a partition come back in input order; sort to compare
     let mut rows = ints(&db.run_plan(&plan).unwrap());
     rows.sort();
     assert_eq!(
@@ -250,7 +249,6 @@ fn window_with_order_by_computes_running_sum_and_rank_with_ties() {
             vec![1, 10, 10, 1],
             vec![1, 20, 30, 2],
             vec![1, 30, 60, 3],
-            // tied peers share both the running total and the rank
             vec![2, 5, 10, 1],
             vec![2, 5, 10, 1],
             vec![2, 7, 17, 3],
@@ -283,9 +281,11 @@ fn drop_index_then_drop_table() {
     .unwrap();
     assert!(db.catalog.get_index(index_oid).is_err());
     assert!(db.catalog.get_table_indexes(table_oid).unwrap().is_empty());
-    // With the index gone, the same predicate falls back to a sequential scan.
-    assert_eq!(ints(&db.exec("SELECT v FROM t WHERE id = 1")), vec![[10]]);
-    // Dropping again fails unless IF EXISTS.
+    assert_eq!(
+        ints(&db.exec("SELECT v FROM t WHERE id = 1")),
+        vec![[10]],
+        "falls back to a sequential scan once the index is gone"
+    );
     let again = Plan::DropIndex(DropIndexPlanNode {
         index_oid,
         if_exists: false,
@@ -317,7 +317,6 @@ fn drop_index_then_drop_table() {
         if_exists: true,
     });
     db.run_plan(&again).unwrap();
-    // The name can be reused.
     db.exec("CREATE TABLE t (id INTEGER)");
 }
 

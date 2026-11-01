@@ -15,8 +15,8 @@ fn make_heap(frames: usize) -> (TableHeap, Arc<BufferPoolManager>, TempDir) {
         ArcReplacer::new(frames),
         DiskScheduler::new(dm),
     ));
-    // The table need not start at page zero.
-    drop(bpm.new_page().unwrap());
+    let page_before_the_heap = bpm.new_page().unwrap();
+    drop(page_before_the_heap);
     let heap = TableHeap::new(bpm.clone()).unwrap();
     (heap, bpm, dir)
 }
@@ -114,13 +114,11 @@ fn unavailable_frame_during_insert_or_update_preserves_existing_rows() {
         data: vec![7; PAGE_SIZE - 12 - 9],
     };
     let rid = heap.insert(&original).unwrap();
-    // Evict the table and pin the only frame, making insertion fail with a
-    // buffer-pool error rather than an oversized-tuple rejection.
-    let pinned = bpm.new_page().unwrap();
+    let pin_only_frame_so_heap_cannot_load_its_page = bpm.new_page().unwrap();
     let replacement = Tuple { data: vec![8; 100] };
     assert!(heap.insert(&replacement).is_err());
     assert!(heap.update(rid, &replacement).is_err());
-    drop(pinned);
+    drop(pin_only_frame_so_heap_cannot_load_its_page);
     assert_eq!(heap.last_page_id(), heap.first_page_id);
     assert_eq!(heap.get(rid).unwrap().1.data, original.data);
     let (new_rid, _) = heap.update(rid, &replacement).unwrap();

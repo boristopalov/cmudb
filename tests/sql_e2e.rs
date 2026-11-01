@@ -75,12 +75,10 @@ fn where_clause_comparisons_and_boolean_logic() {
 #[test]
 fn where_clause_treats_null_as_not_true() {
     let db = emp_db();
-    // active is NULL for id 4: neither `active = true` nor `active = false` matches it.
     let t = ints(&db.exec("SELECT id FROM emp WHERE active = true"));
     let f = ints(&db.exec("SELECT id FROM emp WHERE active = false"));
     assert_eq!(t, vec![[1], [3]]);
     assert_eq!(f, vec![[2]]);
-    // NULL OR true is true; NULL AND false is false.
     assert_eq!(
         ints(&db.exec("SELECT id FROM emp WHERE active = true OR id = 4")),
         vec![[1], [3], [4]]
@@ -99,7 +97,6 @@ fn projection_evaluates_arithmetic() {
     assert_eq!(ints(&db.exec("SELECT 1 + 2")), vec![[3]]);
     let floats = db.exec("SELECT bonus * 2.0 FROM emp WHERE id = 2");
     assert_eq!(floats, vec![vec![Some(Value::FLOAT(5.0.into()))]]);
-    // NULL propagates through arithmetic.
     assert_eq!(
         db.exec("SELECT bonus + 1.0 FROM emp WHERE id = 3"),
         vec![vec![None]]
@@ -142,12 +139,10 @@ fn aggregates_with_and_without_group_by() {
             vec![30, 1, 400, 400, 400, 400],
         ]
     );
-    // SUM skips NULLs.
     assert_eq!(
         db.exec("SELECT SUM(bonus) FROM emp"),
         vec![vec![Some(Value::FLOAT(8.0.into()))]]
     );
-    // Filtered aggregate.
     assert_eq!(
         ints(&db.exec("SELECT COUNT(*) FROM emp WHERE dept = 10")),
         vec![[2]]
@@ -219,14 +214,12 @@ fn inner_and_left_joins_without_index_use_nested_loop_join() {
         vec![int(4), None],
         "unmatched left row is NULL-padded"
     );
-    // Non-equality join predicate.
     assert_eq!(
         ints(&db.exec(
             "SELECT emp.id, dept.id FROM emp JOIN dept ON emp.dept < dept.id WHERE emp.id = 4"
         )),
         vec![[4, 40]]
     );
-    // Join + filter + aggregate.
     assert_eq!(
         ints(&db.exec(
             "SELECT COUNT(*) FROM emp JOIN dept ON emp.dept = dept.id WHERE dept.name > 1000"
@@ -274,7 +267,6 @@ fn index_scan_and_index_maintenance_through_dml() {
     );
     assert_eq!(ints(&db.exec("SELECT v FROM t WHERE id = 3")), vec![[31]]);
 
-    // Updating the key column moves the index entry.
     assert_eq!(
         ints(&db.exec("UPDATE t SET id = 33 WHERE id = 3")),
         vec![[1]]
@@ -345,8 +337,8 @@ fn update_and_delete_without_index() {
 
 #[test]
 fn many_rows_span_pages_and_survive_eviction() {
-    // 4 frames forces the heap and sort to spill pages through the disk manager.
-    let db = Db::new(4);
+    const FRAMES_FEWER_THAN_TABLE_PAGES: usize = 4;
+    let db = Db::new(FRAMES_FEWER_THAN_TABLE_PAGES);
     db.exec("CREATE TABLE big (id INTEGER, v INTEGER)");
     let values: Vec<String> = (0..2000)
         .rev()

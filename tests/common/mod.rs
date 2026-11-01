@@ -20,7 +20,6 @@ use tempfile::TempDir;
 pub type Row = Vec<Option<Value>>;
 
 pub struct Db {
-    // Field order matters: the catalog must drop before the buffer pool and dir.
     pub catalog: Catalog,
     pub bpm: Arc<BufferPoolManager>,
     _dir: TempDir,
@@ -48,8 +47,6 @@ impl Db {
     pub fn try_exec(&self, sql: &str) -> Result<Vec<Row>, String> {
         let ast = Parser::parse_sql(&GenericDialect, sql).map_err(|e| format!("parse: {e}"))?;
         let mut out = Vec::new();
-        // Bind each statement only after the previous one ran, so later
-        // statements can see tables created by earlier ones.
         for stmt in ast {
             let bound = Binder::new(&self.catalog)
                 .bind(vec![stmt])

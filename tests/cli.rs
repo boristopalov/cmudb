@@ -3,6 +3,8 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+const CONTINUATION_PROMPT: &str = "    -> ";
+
 fn run_shell(input: &str) -> (String, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_cmudb"))
         .stdin(Stdio::piped())
@@ -50,7 +52,7 @@ fn shell_runs_ddl_dml_and_prints_a_table() {
         "UPDATE 1",
         "DELETE 1",
         "(1 row)",
-        "    -> ", // continuation prompt for the multi-line SELECT
+        CONTINUATION_PROMPT,
     ] {
         assert!(out.contains(expected), "missing {expected:?} in:\n{out}");
     }
