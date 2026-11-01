@@ -14,6 +14,25 @@ use std::collections::HashSet;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
+fn leaf_has_spare_entry(leaf: &LeafPage) -> bool {
+    leaf.keys.len() > leaf.min_size() as usize
+}
+
+fn internal_has_spare_key(node: &InternalPage) -> bool {
+    node.keys.len() > node.min_size() as usize
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rebalance {
+    Redistributed,
+    Merged,
+}
+
+const MISSING_PARENT_LATCH: IndexError =
+    IndexError::Structure("underfull node's parent latch was released during descent");
+const EMPTY_SIBLING: IndexError =
+    IndexError::Structure("sibling chosen to lend an entry has none to give");
+
 #[derive(Debug)]
 pub struct BPlusTree {
     pub header_page_id: PageId,
@@ -364,8 +383,8 @@ impl BPlusTree {
                     // i.e. we know it won't be merged with another node if removing a key from it.
                     // if a leaf is > the min size, it means it can remove another key without merging.
                     let child_is_safe = match Page::decode(next_page.data_mut(), self.key_len)? {
-                        Page::Internal(internal) => !internal.would_be_underfull(),
-                        Page::Leaf(leaf) => !leaf.would_be_underfull(),
+                        Page::Internal(internal) => internal_has_spare_key(&internal),
+                        Page::Leaf(leaf) => leaf_has_spare_entry(&leaf),
                     };
 
                     // make sure to add the child page to the write_set before dropping latches
@@ -397,173 +416,141 @@ impl BPlusTree {
             }
         };
 
-        // we know leaf is underfilled if we arrive here
-        let mut current = ctx.write_set.pop_back().unwrap();
-        let parent_page = ctx.write_set.back_mut().unwrap();
+        let mut leaf_page = ctx.write_set.pop_back().ok_or(MISSING_PARENT_LATCH)?;
+        let mut parent_page = ctx.write_set.pop_back().ok_or(MISSING_PARENT_LATCH)?;
         let mut parent = InternalPage::decode(parent_page.data_mut(), self.key_len)?;
-        // TODO: we use find_child_index here, it's doing duplicate work since we already found indices while descending
-        // probably not a huge deal but can be a performance improvement if we store the indices.
-        let parent_idx_of_leaf = parent.find_child_index(&key);
+        let mut outcome = self.rebalance_leaf(&key, leaf, &mut leaf_page, &mut parent)?;
+        parent.encode(parent_page.data_mut(), self.key_len)?;
 
-        // get a sibling of this node
-        // if the sibling can afford losing a key, move it to this node
-        // if not (i.e. sibling would be underfull if key moved), we need to merge the sibling with this node.
-        // in this case we must update the parent as it would have 1 less child after the merge, so we must remove
-        // a separator key from the parent to maintain the invariant of sep_keys.len() == children.len() - 1
-        // if this node is already the left-most child of the parent, then the sibling is the child to the right of this node
-        // otherwise it's the sibling to the left
-        let sibling_idx = if parent_idx_of_leaf == 0 {
-            1
-        } else {
-            parent_idx_of_leaf - 1
-        };
-        let sibling_is_right = sibling_idx > parent_idx_of_leaf;
-
-        // latch the sibling
-        if let Some(sibling_page_id) = parent.get_child(sibling_idx) {
-            let mut sibling_page = self.bpm.write_page(*sibling_page_id)?;
-            match LeafPage::decode(sibling_page.data_mut(), self.key_len) {
-                Ok(mut sibling) => {
-                    if sibling.would_be_underfull() {
-                        // we need to merge
-                        if sibling_is_right {
-                            leaf.absorb_right(&mut sibling);
-                            parent.remove_separator(parent_idx_of_leaf);
-                        } else {
-                            sibling.absorb_right(&mut leaf);
-                            parent.remove_separator(parent_idx_of_leaf - 1);
-                        }
-                        leaf.encode(current.data_mut(), self.key_len)?;
-                        sibling.encode(sibling_page.data_mut(), self.key_len)?;
-                        parent.encode(parent_page.data_mut(), self.key_len)?;
-                    } else {
-                        // we can redistribute from the sibling
-                        if sibling_is_right {
-                            // sibling is to the right, take its smallest entry,
-                            // and move it to the back of this node
-                            if let Some(res) = sibling.pop_first() {
-                                leaf.push_back(res.0, res.1, res.2);
-                                // update the separator key
-                                if let Some(new_sep_key) = sibling.keys.get(0) {
-                                    parent.keys[parent_idx_of_leaf] = new_sep_key.clone();
-                                } else {
-                                    error!("failed to get sibling.keys[0]")
-                                }
-                            } else {
-                                error!("tried to pop from sibling to redistribute but failed");
-                                return Err(IndexError::Remove(RemoveError::GenericError(
-                                    ("tried to pop from sibling to redistribute but failed")
-                                        .to_string(),
-                                )));
-                            }
-                        } else {
-                            // sibling is to the left, take its largest entry,
-                            // and move it to the front of this node
-                            if let Some(res) = sibling.pop_last() {
-                                leaf.push_front(res.0, res.1, res.2);
-                                // update the separator key
-                                if let Some(new_sep_key) = leaf.keys.get(0) {
-                                    parent.keys[parent_idx_of_leaf] = new_sep_key.clone();
-                                } else {
-                                    error!("failed to get leaf.keys[0]")
-                                }
-                            } else {
-                                error!("tried to pop from sibling to redistribute but failed");
-                                return Err(IndexError::Remove(RemoveError::GenericError(
-                                    ("tried to pop from sibling to redistribute but failed")
-                                        .to_string(),
-                                )));
-                            }
-                        }
-
-                        // make sure the siblings are encoded/updated
-                        sibling.encode(sibling_page.data_mut(), self.key_len)?;
-                        leaf.encode(current.data_mut(), self.key_len)?;
-                        parent.encode(parent_page.data_mut(), self.key_len)?;
-                        return Ok(());
-                    }
+        while outcome == Rebalance::Merged {
+            if parent_page.page_id() == Some(ctx.root_page_id) {
+                if parent.children.len() == 1 {
+                    header.root_page_id = parent.children[0];
+                    let header_page = ctx.header.as_mut().ok_or(MISSING_PARENT_LATCH)?;
+                    header.encode(header_page.data_mut())?;
                 }
-                Err(e) => {
-                    return Err(IndexError::from(e));
-                }
+                return Ok(());
             }
-        } else {
-            unreachable!("parent node must always have at least 2 children");
+            if !parent.is_underfull() {
+                return Ok(());
+            }
+            let mut grandparent_page = ctx.write_set.pop_back().ok_or(MISSING_PARENT_LATCH)?;
+            let mut grandparent = InternalPage::decode(grandparent_page.data_mut(), self.key_len)?;
+            outcome = self.rebalance_internal(&key, parent, &mut parent_page, &mut grandparent)?;
+            grandparent.encode(grandparent_page.data_mut(), self.key_len)?;
+            parent_page = grandparent_page;
+            parent = grandparent;
         }
+        Ok(())
+    }
 
-        // if we reach here it means we performed a merge, so we need to traverse up the stack
-        // at the beginning of each iteration, 'child' is the node that just lost the key
-        // in the first iteration, it lost a key since we merged in the logic above
-        // we traverse up the stack only while merging, so at n > 1 iterations, we have also dropped a key from parent.
-        let mut merged;
-        loop {
-            let mut child_page = ctx.write_set.pop_back().unwrap();
-            let mut child = InternalPage::decode(child_page.data_mut(), self.key_len)?;
-            if !child.is_underfull() {
-                return Ok(());
-            }
+    fn sibling_of(parent: &InternalPage, child_idx: usize) -> Result<(usize, PageId), IndexError> {
+        let sibling_idx = if child_idx == 0 { 1 } else { child_idx - 1 };
+        let sibling_id = parent
+            .get_child(sibling_idx)
+            .copied()
+            .ok_or(IndexError::Structure(
+                "underfull node has no sibling to borrow from or merge with",
+            ))?;
+        Ok((sibling_idx, sibling_id))
+    }
 
-            // parent is underfull here
-            // check if we are at the root
-            if ctx.write_set.is_empty() {
-                if child.children.len() == 1 {
-                    // root.child becomes the root
-                    if let Some(c) = child.get_child(0) {
-                        header.root_page_id = *c;
-                        header.encode(ctx.header.as_mut().unwrap().data_mut())?;
-                    }
-                }
-                return Ok(());
-            }
-            let mut parent_page = ctx.write_set.pop_back().unwrap();
-            let mut parent = InternalPage::decode(parent_page.data_mut(), self.key_len)?;
+    fn rebalance_leaf(
+        &self,
+        key: &IndexKey,
+        mut leaf: LeafPage,
+        leaf_page: &mut PageMut<'_>,
+        parent: &mut InternalPage,
+    ) -> Result<Rebalance, IndexError> {
+        let leaf_idx = parent.find_child_index(key);
+        let (sibling_idx, sibling_id) = Self::sibling_of(parent, leaf_idx)?;
+        let mut sibling_page = self.bpm.write_page(sibling_id)?;
+        let mut sibling = LeafPage::decode(sibling_page.data_mut(), self.key_len)?;
+        let sibling_is_right = sibling_idx > leaf_idx;
 
-            // again, go through the same process of either merging or redistributing.
-            // this probably could have been combined with the above logic since there's
-            // a lot of duplicated logic but it's probably easier to read this way
-            let child_idx = parent.find_child_index(&key);
-            let sibling_idx = if parent_idx_of_leaf == 0 {
-                1
+        while leaf.is_underfull() && leaf_has_spare_entry(&sibling) {
+            let borrowed = if sibling_is_right {
+                sibling.pop_first()
             } else {
-                parent_idx_of_leaf - 1
+                sibling.pop_last()
             };
-            let sibling_is_right = sibling_idx > child_idx;
-            let sibling_page_id = parent.get_child(sibling_idx).unwrap();
-            let mut sibling_page = self.bpm.write_page(*sibling_page_id)?;
-            let mut sibling = InternalPage::decode(sibling_page.data_mut(), self.key_len)?;
-
-            if sibling.would_be_underfull() {
-                // merge
-                if sibling_is_right {
-                    let sep = parent.keys[child_idx].clone();
-                    child.absorb_right(sep, &mut sibling);
-                    parent.remove_separator(child_idx);
-                } else {
-                    let sep = parent.keys[child_idx - 1].clone();
-                    sibling.absorb_right(sep, &mut child);
-                    parent.remove_separator(child_idx - 1);
-                }
-                merged = true;
-            } else {
-                // redistribute
-                if sibling_is_right {
-                    let (rotated_key, rotated_child) = sibling.pop_first_child_and_key();
-                    let old_sep = parent.replace_key(child_idx, rotated_key);
-                    child.append_key_and_child(old_sep, rotated_child);
-                } else {
-                    let (rotated_key, rotated_child) = sibling.pop_last_child_and_key();
-                    let old_sep = parent.replace_key(child_idx - 1, rotated_key);
-                    child.prepend_child_and_key(old_sep, rotated_child);
-                }
-                merged = false;
+            let (k, rid, tombstoned) = borrowed.ok_or(EMPTY_SIBLING)?;
+            let leaf_tombstones_full = leaf.tombstones.len() >= leaf.tombstone_capacity;
+            if tombstoned && leaf_tombstones_full {
+                continue;
             }
-            child.encode(child_page.data_mut(), self.key_len)?;
-            sibling.encode(sibling_page.data_mut(), self.key_len)?;
-            parent.encode(parent_page.data_mut(), self.key_len)?;
-            if !merged {
-                return Ok(());
+            if sibling_is_right {
+                leaf.push_back(k, rid, tombstoned);
+            } else {
+                leaf.push_front(k, rid, tombstoned);
             }
         }
+
+        if leaf.is_underfull() {
+            if sibling_is_right {
+                leaf.absorb_right(&mut sibling);
+                parent.remove_separator(leaf_idx);
+                leaf.encode(leaf_page.data_mut(), self.key_len)?;
+            } else {
+                sibling.absorb_right(&mut leaf);
+                parent.remove_separator(sibling_idx);
+                sibling.encode(sibling_page.data_mut(), self.key_len)?;
+            }
+            return Ok(Rebalance::Merged);
+        }
+
+        if sibling_is_right {
+            let new_separator = sibling.keys.first().ok_or(EMPTY_SIBLING)?.clone();
+            parent.replace_key(leaf_idx, new_separator);
+        } else {
+            let new_separator = leaf.keys.first().ok_or(EMPTY_SIBLING)?.clone();
+            parent.replace_key(sibling_idx, new_separator);
+        }
+        sibling.encode(sibling_page.data_mut(), self.key_len)?;
+        leaf.encode(leaf_page.data_mut(), self.key_len)?;
+        Ok(Rebalance::Redistributed)
+    }
+
+    fn rebalance_internal(
+        &self,
+        key: &IndexKey,
+        mut node: InternalPage,
+        node_page: &mut PageMut<'_>,
+        parent: &mut InternalPage,
+    ) -> Result<Rebalance, IndexError> {
+        let node_idx = parent.find_child_index(key);
+        let (sibling_idx, sibling_id) = Self::sibling_of(parent, node_idx)?;
+        let mut sibling_page = self.bpm.write_page(sibling_id)?;
+        let mut sibling = InternalPage::decode(sibling_page.data_mut(), self.key_len)?;
+        let sibling_is_right = sibling_idx > node_idx;
+
+        if !internal_has_spare_key(&sibling) {
+            if sibling_is_right {
+                let separator = parent.keys[node_idx].clone();
+                node.absorb_right(separator, &mut sibling);
+                parent.remove_separator(node_idx);
+                node.encode(node_page.data_mut(), self.key_len)?;
+            } else {
+                let separator = parent.keys[sibling_idx].clone();
+                sibling.absorb_right(separator, &mut node);
+                parent.remove_separator(sibling_idx);
+                sibling.encode(sibling_page.data_mut(), self.key_len)?;
+            }
+            return Ok(Rebalance::Merged);
+        }
+
+        if sibling_is_right {
+            let (rotated_key, rotated_child) = sibling.pop_first_child_and_key();
+            let old_separator = parent.replace_key(node_idx, rotated_key);
+            node.append_key_and_child(old_separator, rotated_child);
+        } else {
+            let (rotated_key, rotated_child) = sibling.pop_last_child_and_key();
+            let old_separator = parent.replace_key(sibling_idx, rotated_key);
+            node.prepend_child_and_key(old_separator, rotated_child);
+        }
+        sibling.encode(sibling_page.data_mut(), self.key_len)?;
+        node.encode(node_page.data_mut(), self.key_len)?;
+        Ok(Rebalance::Redistributed)
     }
 
     pub fn leaf_pages(&self) -> Result<LeafPagesIter, IndexError> {
@@ -966,7 +953,7 @@ impl Index for BPlusTree {
         let mut leaf = LeafPage::decode(lp.data_mut(), self.key_len)?;
 
         // check if the leaf would be below the minimum size if we delete a key from it
-        if leaf.would_be_underfull() {
+        if !leaf_has_spare_entry(&leaf) {
             if !leaf.key_exists(&key) {
                 return Err(IndexError::Remove(RemoveError::KeyNotFound));
             }
@@ -1437,5 +1424,324 @@ mod tests {
 
         let missing = make_key(9, key_len as usize);
         assert!(tree.search(&missing).unwrap().is_none());
+    }
+
+    mod remove_many_keys {
+        use super::*;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        use rand::seq::SliceRandom;
+        use std::collections::BTreeMap;
+
+        const SCAN_CHECK_EVERY: usize = 211;
+
+        fn key_for(n: u32, key_len: usize) -> IndexKey {
+            let mut v = vec![0u8; key_len];
+            v[..4].copy_from_slice(&n.to_be_bytes());
+            IndexKey(v)
+        }
+
+        fn rid_for(n: u32) -> RecordId {
+            RecordId {
+                page_id: n,
+                slot_id: n.wrapping_mul(7),
+            }
+        }
+
+        struct SubtreeBounds {
+            lower: Option<IndexKey>,
+            upper: Option<IndexKey>,
+        }
+
+        impl SubtreeBounds {
+            fn contains(&self, key: &IndexKey) -> bool {
+                self.lower.as_ref().is_none_or(|l| key >= l)
+                    && self.upper.as_ref().is_none_or(|u| key < u)
+            }
+        }
+
+        fn walk_subtree(
+            tree: &BPlusTree,
+            page_id: PageId,
+            bounds: SubtreeBounds,
+            depth: usize,
+            is_root: bool,
+            leaves_in_order: &mut Vec<(PageId, usize)>,
+        ) {
+            let page = tree.bpm.read_page(page_id).unwrap();
+            match Page::decode(page.data(), tree.key_len).unwrap() {
+                Page::Leaf(leaf) => {
+                    assert!(
+                        leaf.keys.iter().all(|k| bounds.contains(k)),
+                        "leaf {page_id} holds a key outside its parent's separator range"
+                    );
+                    leaves_in_order.push((page_id, depth));
+                }
+                Page::Internal(node) => {
+                    if is_root {
+                        assert!(
+                            node.children.len() >= 2,
+                            "internal root {page_id} has fewer than two children"
+                        );
+                    } else {
+                        assert!(
+                            node.keys.len() >= node.min_size() as usize,
+                            "non-root internal page {page_id} is below minimum occupancy"
+                        );
+                    }
+                    assert!(
+                        node.keys.iter().all(|k| bounds.contains(k)),
+                        "internal page {page_id} holds a separator outside its parent's range"
+                    );
+                    drop(page);
+                    for (i, &child) in node.children.iter().enumerate() {
+                        let child_bounds = SubtreeBounds {
+                            lower: if i == 0 {
+                                bounds.lower.clone()
+                            } else {
+                                Some(node.keys[i - 1].clone())
+                            },
+                            upper: node.keys.get(i).cloned().or(bounds.upper.clone()),
+                        };
+                        walk_subtree(tree, child, child_bounds, depth + 1, false, leaves_in_order);
+                    }
+                }
+            }
+        }
+
+        fn assert_tree_invariants(tree: &BPlusTree) {
+            let header = tree.read_header().unwrap();
+            if header.root_page_id == INVALID_PAGE_ID {
+                assert_eq!(
+                    header.first_leaf_id, INVALID_PAGE_ID,
+                    "empty tree still points at a first leaf"
+                );
+                return;
+            }
+            let mut leaves_in_order = Vec::new();
+            let unbounded = SubtreeBounds {
+                lower: None,
+                upper: None,
+            };
+            walk_subtree(
+                tree,
+                header.root_page_id,
+                unbounded,
+                0,
+                true,
+                &mut leaves_in_order,
+            );
+            let depths: HashSet<usize> = leaves_in_order.iter().map(|&(_, d)| d).collect();
+            assert_eq!(
+                depths.len(),
+                1,
+                "leaves sit at different depths: {depths:?}"
+            );
+            let tree_order: Vec<PageId> = leaves_in_order.iter().map(|&(id, _)| id).collect();
+            let chain_order: Vec<PageId> =
+                tree.leaf_pages().unwrap().map(|r| r.unwrap().0).collect();
+            assert_eq!(
+                tree_order, chain_order,
+                "leaf chain disagrees with in-order leaf traversal"
+            );
+        }
+
+        struct Harness {
+            tree: BPlusTree,
+            model: BTreeMap<u32, RecordId>,
+            key_len: usize,
+            ops: usize,
+            _bpm: Arc<BufferPoolManager>,
+            _tmp: tempfile::TempDir,
+        }
+
+        impl Harness {
+            fn new(key_len: usize) -> Self {
+                let (bpm, tmp) = make_bpm(64);
+                let tree = BPlusTree::new("idx".to_string(), key_len as u32, bpm.clone()).unwrap();
+                Self {
+                    tree,
+                    model: BTreeMap::new(),
+                    key_len,
+                    ops: 0,
+                    _bpm: bpm,
+                    _tmp: tmp,
+                }
+            }
+
+            fn insert(&mut self, n: u32) {
+                self.tree
+                    .insert(key_for(n, self.key_len), IndexValue::IndexValue(rid_for(n)))
+                    .unwrap_or_else(|e| panic!("insert {n} failed: {e}"));
+                self.model.insert(n, rid_for(n));
+                self.after_op(n);
+            }
+
+            fn remove(&mut self, n: u32) {
+                self.tree
+                    .remove(key_for(n, self.key_len))
+                    .unwrap_or_else(|e| panic!("remove {n} failed: {e}"));
+                self.model.remove(&n);
+                self.after_op(n);
+            }
+
+            fn after_op(&mut self, n: u32) {
+                let expected = self.model.get(&n).copied();
+                let found = self
+                    .tree
+                    .search(&key_for(n, self.key_len))
+                    .unwrap()
+                    .map(|IndexValue::IndexValue(rid)| rid);
+                assert_eq!(found, expected, "search({n}) disagrees with the model");
+                self.ops += 1;
+                if self.ops % SCAN_CHECK_EVERY == 0 {
+                    self.check_full_scan();
+                }
+            }
+
+            fn check_full_scan(&self) {
+                assert_tree_invariants(&self.tree);
+                let scanned: Vec<(IndexKey, RecordId)> = self
+                    .tree
+                    .scan((Bound::Unbounded, Bound::Unbounded))
+                    .unwrap()
+                    .map(|r| {
+                        let (k, IndexValue::IndexValue(rid)) = r.unwrap();
+                        (k, rid)
+                    })
+                    .collect();
+                let expected: Vec<(IndexKey, RecordId)> = self
+                    .model
+                    .iter()
+                    .map(|(&n, &rid)| (key_for(n, self.key_len), rid))
+                    .collect();
+                assert_eq!(
+                    scanned.len(),
+                    expected.len(),
+                    "scan length disagrees with the model after {} ops",
+                    self.ops
+                );
+                assert!(
+                    scanned == expected,
+                    "scan contents disagree with the model after {} ops",
+                    self.ops
+                );
+                for &n in self.model.keys() {
+                    assert!(
+                        self.tree
+                            .search(&key_for(n, self.key_len))
+                            .unwrap()
+                            .is_some(),
+                        "search({n}) lost a live key after {} ops",
+                        self.ops
+                    );
+                }
+            }
+        }
+
+        fn insert_then_remove_all(key_len: usize, inserts: &[u32], removes: &[u32]) {
+            let mut h = Harness::new(key_len);
+            for &n in inserts {
+                h.insert(n);
+            }
+            h.check_full_scan();
+            for &n in removes {
+                h.remove(n);
+            }
+            h.check_full_scan();
+            assert!(h.model.is_empty());
+        }
+
+        const KEY_LENS: [usize; 3] = [2000, 600, 64];
+        const N: u32 = 2500;
+
+        #[test]
+        fn sequential_insert_then_sequential_remove_keeps_tree_consistent() {
+            let keys: Vec<u32> = (0..N).collect();
+            for key_len in KEY_LENS {
+                insert_then_remove_all(key_len, &keys, &keys);
+            }
+        }
+
+        #[test]
+        fn reversed_insert_then_reversed_remove_keeps_tree_consistent() {
+            let keys: Vec<u32> = (0..N).rev().collect();
+            for key_len in KEY_LENS {
+                insert_then_remove_all(key_len, &keys, &keys);
+            }
+        }
+
+        #[test]
+        fn sequential_insert_then_reversed_remove_keeps_tree_consistent() {
+            let keys: Vec<u32> = (0..N).collect();
+            let rev: Vec<u32> = (0..N).rev().collect();
+            for key_len in KEY_LENS {
+                insert_then_remove_all(key_len, &keys, &rev);
+            }
+        }
+
+        #[test]
+        fn random_insert_then_random_remove_keeps_tree_consistent() {
+            for (seed, key_len) in KEY_LENS.into_iter().enumerate() {
+                let mut rng = StdRng::seed_from_u64(seed as u64);
+                let mut inserts: Vec<u32> = (0..N).collect();
+                inserts.shuffle(&mut rng);
+                let mut removes = inserts.clone();
+                removes.shuffle(&mut rng);
+                insert_then_remove_all(key_len, &inserts, &removes);
+            }
+        }
+
+        #[test]
+        fn removed_keys_can_be_reinserted_and_removed_again() {
+            for (seed, key_len) in KEY_LENS.into_iter().enumerate() {
+                let mut rng = StdRng::seed_from_u64(200 + seed as u64);
+                let mut h = Harness::new(key_len);
+                let mut keys: Vec<u32> = (0..N).collect();
+                keys.shuffle(&mut rng);
+                for &n in &keys {
+                    h.insert(n);
+                }
+                let evens: Vec<u32> = keys.iter().copied().filter(|n| n % 2 == 0).collect();
+                for &n in &evens {
+                    h.remove(n);
+                }
+                for &n in &evens {
+                    h.insert(n);
+                }
+                keys.shuffle(&mut rng);
+                for &n in &keys {
+                    h.remove(n);
+                }
+                h.check_full_scan();
+                assert!(h.model.is_empty());
+            }
+        }
+
+        #[test]
+        fn interleaved_inserts_and_removes_keep_tree_consistent() {
+            for (seed, key_len) in KEY_LENS.into_iter().enumerate() {
+                let mut rng = StdRng::seed_from_u64(100 + seed as u64);
+                let mut h = Harness::new(key_len);
+                let mut pool: Vec<u32> = (0..N).collect();
+                pool.shuffle(&mut rng);
+                let mut live: Vec<u32> = Vec::new();
+                for n in pool {
+                    h.insert(n);
+                    live.push(n);
+                    if live.len() > 50 && rand::Rng::random_bool(&mut rng, 0.45) {
+                        let i = rand::Rng::random_range(&mut rng, 0..live.len());
+                        let victim = live.swap_remove(i);
+                        h.remove(victim);
+                    }
+                }
+                live.shuffle(&mut rng);
+                for n in live {
+                    h.remove(n);
+                }
+                h.check_full_scan();
+                assert!(h.model.is_empty());
+            }
+        }
     }
 }

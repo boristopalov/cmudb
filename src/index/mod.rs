@@ -29,6 +29,7 @@ pub enum IndexError {
     BpmError(BpmError),
     PageError(PageCodecError),
     LatchError,
+    Structure(&'static str),
 }
 
 #[derive(Debug)]
@@ -74,6 +75,7 @@ impl fmt::Display for IndexError {
             IndexError::PageError(e) => write!(f, "page decode/encode error: {e}"),
             IndexError::LatchError => write!(f, "error reading or acquiring latch"),
             IndexError::Lookup => write!(f, "lookup error"),
+            IndexError::Structure(msg) => write!(f, "b+ tree structure violated: {msg}"),
         }
     }
 }
