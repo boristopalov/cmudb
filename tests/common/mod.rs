@@ -9,6 +9,7 @@ use cmudb::create_buffer_pool_manager;
 use cmudb::disk::{DiskManager, DiskScheduler};
 use cmudb::parser::Binder;
 use cmudb::planner::Planner;
+use cmudb::processor::executor::RowCursor;
 use cmudb::processor::executor_factory::create_executor;
 use cmudb::processor::plan::Plan;
 use cmudb::replacer::ArcReplacer;
@@ -71,15 +72,18 @@ impl Db {
         let mut rows = Vec::new();
         match plan {
             Plan::Insert(_) => {
-                if let Some((t, _)) = exec.next().map_err(|e| format!("exec: {}", e.0))? {
+                if let Some((t, _)) = RowCursor::new(exec.as_mut())
+                    .next_row()
+                    .map_err(|e| format!("exec: {}", e.0))?
+                {
                     let n = i32::from_ne_bytes(t.data.as_slice().try_into().unwrap());
                     rows.push(vec![Some(Value::INT(n))]);
                 }
             }
             Plan::Update(_) | Plan::Delete(_) => {
                 let mut n = 0;
-                while exec.next().map_err(|e| format!("exec: {}", e.0))?.is_some() {
-                    n += 1;
+                while let Some(batch) = exec.next_batch().map_err(|e| format!("exec: {}", e.0))? {
+                    n += batch.len() as i32;
                 }
                 rows.push(vec![Some(Value::INT(n))]);
             }
@@ -87,11 +91,12 @@ impl Db {
             | Plan::CreateIndex(_)
             | Plan::DropTable(_)
             | Plan::DropIndex(_) => {
-                exec.next().map_err(|e| format!("exec: {}", e.0))?;
+                exec.next_batch().map_err(|e| format!("exec: {}", e.0))?;
             }
             _ => {
                 let schema = exec.schema().clone();
-                while let Some((t, _)) = exec.next().map_err(|e| format!("exec: {}", e.0))? {
+                for row in RowCursor::new(exec.as_mut()) {
+                    let (t, _) = row.map_err(|e| format!("exec: {}", e.0))?;
                     let row = (0..schema.cols.len())
                         .map(|i| schema.get_value(&t, i).expect("decode"))
                         .collect();

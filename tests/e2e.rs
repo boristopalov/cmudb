@@ -64,16 +64,16 @@ fn scan_driven_sql_update_visits_each_original_row_once() {
                 let produces_single_status_row =
                     matches!(plan, Plan::Insert(_) | Plan::CreateTable(_));
                 if produces_single_status_row {
-                    result.extend(exec.next().unwrap());
+                    result.extend(exec.next_batch().unwrap().unwrap());
                 } else {
-                    while let Some(row) = exec.next().unwrap() {
-                        result.push(row);
+                    while let Some(batch) = exec.next_batch().unwrap() {
+                        result.extend(batch);
                         assert!(
                             result.len() <= row_count,
                             "statement revisited appended replacement rows: {sql}"
                         );
                     }
-                    assert!(exec.next().unwrap().is_none());
+                    assert!(exec.next_batch().unwrap().is_none());
                 }
                 exec.close().unwrap();
             }
