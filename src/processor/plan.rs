@@ -46,9 +46,15 @@ pub struct ValuesPlanNode {
 
 pub struct UpdatePlanNode {
     pub schema: Schema,
-    pub target_exprs: Vec<(u32, Expression)>, // 1st element is the index of the column in the tuple we want to update
+    pub assignments: Vec<ColumnAssignment>,
     pub child: Box<Plan>,
     pub table_oid: u32,
+}
+
+/// `SET <column> = <value>` for one column of an UPDATE.
+pub struct ColumnAssignment {
+    pub col_idx: u32,
+    pub value: Expression,
 }
 
 pub struct DeletePlanNode {
@@ -76,9 +82,8 @@ pub struct ProjectionPlanNode {
     pub child: Box<Plan>,
 }
 
-/// Example: SUM(a+b), MIN(c) GROUP BY c;
-/// group_bys would be len 1 vec![c]
-/// aggregates would be len 2 vec![(a+b, SUM), (c, MIN)]
+/// `SELECT SUM(a + b), MIN(c) ... GROUP BY c` has `group_bys = [c]` and
+/// `aggregates = [(a + b, SUM), (c, MIN)]`.
 pub struct AggregationPlanNode {
     pub schema: Schema,
     pub child: Box<Plan>,
@@ -92,7 +97,8 @@ pub enum AggType {
     SUM,
     AVG,
     COUNT,
-    RANK, // not an agg type but whatever
+    /// Window-only: the 1-based position of the row's peer group within its partition.
+    RANK,
 }
 
 pub struct NestedLoopJoinPlanNode {
@@ -113,7 +119,8 @@ pub struct NestedIndexJoinPlanNode {
     pub child: Box<Plan>,
     pub key_predicate: Expression,
     pub table_oid: u32,
-    pub table_schema: Schema, // the schema of the table we are joining on
+    /// Schema of the inner table that is probed through the index.
+    pub table_schema: Schema,
     pub index_oid: u32,
     pub join_type: JoinType,
 }
@@ -139,18 +146,10 @@ pub struct SortPlanNode {
     pub order_by_exprs: Vec<Expression>,
 }
 
-/// Unlike aggregate functions, window functions are "self-contained" and don't collapse columns
-/// down to the group bys + aggregates.
-/// So we need to know which columns are present ahead of time.
-/// This is how window functions work by definition.
-/// We could not specify the columns, and stream back the window function columns,
-/// plus the child columns, and have a separate projection pull from the window function,
-/// but that would be wasteful.
-///
-/// For example:  `SELECT salary * 2, AVG(salary) OVER (PARTITION BY dept) FROM emp;`
-///
-/// Without providing columns, we would return salary directly, and a project would pull and return salary * 2.
-/// If providing columns, we can directly compute salary * 2 and skip the projection
+/// Computes window aggregates without collapsing rows. For
+/// `SELECT salary * 2, AVG(salary) OVER (PARTITION BY dept) FROM emp`, `columns` is
+/// `[salary * 2]` and `aggregates` is `[(salary, AVG)]`; each output row is the
+/// `columns` values followed by one value per aggregate.
 pub struct WindowFunctionPlanNode {
     pub schema: Schema,
     pub child: Box<Plan>,
@@ -188,11 +187,17 @@ pub struct DropIndexPlanNode {
     pub if_exists: bool,
 }
 
+/// `Expression::Column::tuple_idx` of a column read from the left (or only) input.
+pub const LEFT_TUPLE: u8 = 0;
+/// `Expression::Column::tuple_idx` of a column read from the right input of a join.
+pub const RIGHT_TUPLE: u8 = 1;
+
 #[derive(Clone)]
 pub enum Expression {
     Constant(Option<Value>),
     Column {
-        tuple_idx: u8, // 0 or 1, left valiue or right value, used in joins
+        /// [`LEFT_TUPLE`] or [`RIGHT_TUPLE`].
+        tuple_idx: u8,
         col_idx: u32,
         dtype: DataType,
     },
@@ -204,8 +209,7 @@ pub enum Expression {
 }
 
 impl Expression {
-    /// The planner needs to know the data type of expressions
-    /// at plan-time
+    /// The type this expression evaluates to, or `None` for a NULL constant.
     pub fn dtype(&self) -> Option<DataType> {
         match self {
             Expression::Column { dtype, .. } => Some(*dtype),
@@ -218,32 +222,40 @@ impl Expression {
         }
     }
 
-    /// Evaluates am expression against a single tuple
+    /// Evaluates the expression against one tuple. In a join schema, right-input
+    /// columns are read at `schema.join_offset + col_idx`.
     pub fn evaluate(&self, tuple: &Tuple, schema: &Schema) -> Result<Option<Value>, ExecutorError> {
         match self {
             Expression::Binary { left, right, op } => {
                 let l = left.evaluate(tuple, schema)?;
                 let r = right.evaluate(tuple, schema)?;
-                return Ok(eval_binary(op, l, r));
+                Ok(eval_binary(op, l, r))
             }
             Expression::Column {
                 tuple_idx, col_idx, ..
             } => {
-                let mut idx = *col_idx as usize;
-                if *tuple_idx == 1 {
-                    idx += schema
-                        .join_offset
-                        .expect("tuple_idx=1 column reference evaluated against a non-join schema");
-                }
+                let idx = match *tuple_idx {
+                    LEFT_TUPLE => *col_idx as usize,
+                    RIGHT_TUPLE => {
+                        let offset = schema.join_offset.ok_or_else(|| {
+                            ExecutorError(
+                                "right-input column evaluated against a non-join schema"
+                                    .to_string(),
+                            )
+                        })?;
+                        offset + *col_idx as usize
+                    }
+                    other => return Err(invalid_tuple_idx(other)),
+                };
                 schema
                     .get_value(tuple, idx)
                     .map_err(|_| ExecutorError("error when evaluating".to_string()))
             }
-            Expression::Constant(v) => Ok(v.clone()),
+            Expression::Constant(v) => Ok(*v),
         }
     }
 
-    /// Evaluates an expression against two tuples
+    /// Evaluates the expression against the two input tuples of a join.
     pub fn evaluate_join(
         &self,
         left_tuple: &Tuple,
@@ -260,26 +272,29 @@ impl Expression {
             Expression::Column {
                 tuple_idx, col_idx, ..
             } => {
-                let (tup, sch) = match tuple_idx {
-                    0 => (left_tuple, left_schema),
-                    1 => (right_tuple, right_schema),
-                    _ => unreachable!("tuple_idx must be 0 or 1"),
+                let (tup, sch) = match *tuple_idx {
+                    LEFT_TUPLE => (left_tuple, left_schema),
+                    RIGHT_TUPLE => (right_tuple, right_schema),
+                    other => return Err(invalid_tuple_idx(other)),
                 };
                 sch.get_value(tup, *col_idx as usize)
                     .map_err(|_| ExecutorError("error when evaluating".to_string()))
             }
-            Expression::Constant(v) => Ok(v.clone()),
+            Expression::Constant(v) => Ok(*v),
         }
     }
 }
 
-/// Some invariants that we should take care of in the Binder:
-/// - reject different types of l and r
+fn invalid_tuple_idx(tuple_idx: u8) -> ExecutorError {
+    ExecutorError(format!(
+        "column tuple_idx {tuple_idx} is neither LEFT_TUPLE nor RIGHT_TUPLE"
+    ))
+}
+
 fn eval_binary(op: &Op, l: Option<Value>, r: Option<Value>) -> Option<Value> {
     use Value::*;
 
     match op {
-        // arithmetic and comparison: NULL propagates
         Op::Add => Some(l? + r?),
         Op::Sub => Some(l? - r?),
         Op::Mul => Some(l? * r?),
@@ -292,9 +307,6 @@ fn eval_binary(op: &Op, l: Option<Value>, r: Option<Value>) -> Option<Value> {
         Op::Lte => Some(BOOLEAN(l? <= r?)),
         Op::Gte => Some(BOOLEAN(l? >= r?)),
 
-        //   TRUE  AND x    = x
-        //   FALSE AND _    = FALSE
-        //   NULL  AND NULL = NULL
         Op::And => match (l, r) {
             (Some(BOOLEAN(false)), _) | (_, Some(BOOLEAN(false))) => Some(BOOLEAN(false)),
             (Some(BOOLEAN(a)), Some(BOOLEAN(b))) => Some(BOOLEAN(a && b)),
@@ -302,17 +314,12 @@ fn eval_binary(op: &Op, l: Option<Value>, r: Option<Value>) -> Option<Value> {
             _ => unreachable!("type-checked at plan time"),
         },
 
-        //   TRUE  OR _    = TRUE
-        //   FALSE OR x    = x
-        //   NULL  OR NULL = NULL
         Op::Or => match (l, r) {
             (Some(BOOLEAN(true)), _) | (_, Some(BOOLEAN(true))) => Some(BOOLEAN(true)),
             (Some(BOOLEAN(a)), Some(BOOLEAN(b))) => Some(BOOLEAN(a || b)),
             (None, _) | (_, None) => None,
             _ => unreachable!("type-checked at plan time"),
         },
-
-        Op::Like | Op::In => todo!(),
     }
 }
 
@@ -330,11 +337,128 @@ pub enum Op {
     Gte,
     And,
     Or,
-    Like,
-    In,
 }
 
-// pub struct HashJoinPlanNode {
-//     left: Box<Plan>,
-//     right: Box<Plan>,
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn constant(v: Option<Value>) -> Expression {
+        Expression::Constant(v)
+    }
+
+    fn boolean(b: bool) -> Expression {
+        constant(Some(Value::BOOLEAN(b)))
+    }
+
+    fn null() -> Expression {
+        constant(None)
+    }
+
+    fn eval(l: Expression, op: Op, r: Expression) -> Result<Option<Value>, ExecutorError> {
+        Expression::Binary {
+            left: Box::new(l),
+            right: Box::new(r),
+            op,
+        }
+        .evaluate(&Tuple { data: vec![] }, &Schema::new(vec![]))
+    }
+
+    fn eval_ok(l: Expression, op: Op, r: Expression) -> Option<Value> {
+        eval(l, op, r).expect("evaluates")
+    }
+
+    #[test]
+    fn and_follows_three_valued_logic() {
+        let t = Some(Value::BOOLEAN(true));
+        let f = Some(Value::BOOLEAN(false));
+        assert_eq!(eval_ok(boolean(true), Op::And, boolean(true)), t);
+        assert_eq!(eval_ok(boolean(true), Op::And, null()), None);
+        assert_eq!(
+            eval_ok(null(), Op::And, boolean(false)),
+            f,
+            "FALSE wins over NULL"
+        );
+        assert_eq!(
+            eval_ok(boolean(false), Op::And, null()),
+            f,
+            "FALSE wins over NULL"
+        );
+        assert_eq!(eval_ok(null(), Op::And, null()), None);
+    }
+
+    #[test]
+    fn or_follows_three_valued_logic() {
+        let t = Some(Value::BOOLEAN(true));
+        let f = Some(Value::BOOLEAN(false));
+        assert_eq!(eval_ok(boolean(false), Op::Or, boolean(false)), f);
+        assert_eq!(eval_ok(boolean(false), Op::Or, null()), None);
+        assert_eq!(
+            eval_ok(null(), Op::Or, boolean(true)),
+            t,
+            "TRUE wins over NULL"
+        );
+        assert_eq!(
+            eval_ok(boolean(true), Op::Or, null()),
+            t,
+            "TRUE wins over NULL"
+        );
+        assert_eq!(eval_ok(null(), Op::Or, null()), None);
+    }
+
+    #[test]
+    fn arithmetic_and_comparison_propagate_null() {
+        let one = || constant(Some(Value::INT(1)));
+        for op in [
+            Op::Add,
+            Op::Sub,
+            Op::Mul,
+            Op::Div,
+            Op::Eq,
+            Op::NEq,
+            Op::Lt,
+            Op::Gte,
+        ] {
+            assert_eq!(eval_ok(one(), op.clone(), null()), None);
+            assert_eq!(eval_ok(null(), op, one()), None);
+        }
+    }
+
+    #[test]
+    fn right_input_column_reads_past_the_join_offset() {
+        let mut schema = Schema::new(vec![
+            (DataType::INT, "l".to_string()),
+            (DataType::INT, "r".to_string()),
+        ]);
+        let tuple = schema
+            .encode_tuple(&[Some(Value::INT(1)), Some(Value::INT(2))])
+            .unwrap();
+        let right_col0 = Expression::Column {
+            tuple_idx: RIGHT_TUPLE,
+            col_idx: 0,
+            dtype: DataType::INT,
+        };
+        assert!(
+            right_col0.evaluate(&tuple, &schema).is_err(),
+            "a right-input column needs a join schema"
+        );
+        schema.join_offset = Some(1);
+        assert_eq!(
+            right_col0.evaluate(&tuple, &schema).unwrap(),
+            Some(Value::INT(2))
+        );
+    }
+
+    #[test]
+    fn column_with_unknown_tuple_idx_is_an_error() {
+        let schema = Schema::new(vec![(DataType::INT, "a".to_string())]);
+        let tuple = schema.encode_tuple(&[Some(Value::INT(1))]).unwrap();
+        let col = Expression::Column {
+            tuple_idx: 2,
+            col_idx: 0,
+            dtype: DataType::INT,
+        };
+        assert!(col.evaluate(&tuple, &schema).is_err());
+        assert!(col.evaluate_join(&tuple, &schema, &tuple, &schema).is_err());
+    }
+}
