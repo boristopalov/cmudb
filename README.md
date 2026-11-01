@@ -8,13 +8,14 @@ This is a Rust implementation of a relational DBMS. It takes heavy inspiration f
 - B+ tree indexes with optimistic latch coupling
 - An in-memory catalog
 - Most executors described in the CMU course
+- MVCC with snapshot isolation (`BEGIN`/`COMMIT`/`ROLLBACK` in the shell; see docs/mvcc.md)
 - parser (using sqlparser crate)
 - binder
 - planner
 
 ## What's missing:
 - optimizer
-- mvcc
+- serializable isolation
 - support for more types, only a few basic types are supported (int, booleans, floats, timestamps)
 
 
