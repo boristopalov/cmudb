@@ -526,7 +526,9 @@ impl<'a> Binder<'a> {
                     out.push(resolved);
                 }
                 SelectItem::Wildcard(_) => {
-                    for ts in scope.values() {
+                    let mut tables: Vec<&TableScope> = scope.values().collect();
+                    tables.sort_by_key(|ts| ts.idx);
+                    for ts in tables {
                         for (i, col) in ts.schema.cols.iter().enumerate() {
                             out.push(Expression::Column {
                                 tuple_idx: ts.idx,
@@ -676,11 +678,15 @@ impl<'a> Binder<'a> {
         }))
     }
 
+    /// Binds every statement against the catalog as it is now. A statement that depends on an
+    /// earlier one in the same batch (such as an INSERT into a table created just before it) fails
+    /// to bind; run statements one at a time with [`Binder::bind_statement`] instead.
     pub fn bind(&self, stmts: Vec<Statement>) -> Result<Vec<BoundStatement>, BinderError> {
-        stmts.iter().map(|s| self.resolve(s)).collect()
+        stmts.iter().map(|s| self.bind_statement(s)).collect()
     }
 
-    fn resolve(&self, stmt: &Statement) -> Result<BoundStatement, BinderError> {
+    /// Binds one statement against the catalog as it is now.
+    pub fn bind_statement(&self, stmt: &Statement) -> Result<BoundStatement, BinderError> {
         match stmt {
             Statement::Query(q) => self.resolve_select(q),
             Statement::Insert(i) => self.resolve_insert(i),
@@ -895,4 +901,72 @@ fn test() {
 #[test]
 fn test_ast() {
     let a = test();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    use super::{Binder, BoundStatement};
+    use crate::catalog::{Catalog, DataType, Schema};
+    use crate::create_buffer_pool_manager;
+    use crate::disk::{DiskManager, DiskScheduler};
+    use crate::processor::plan::Expression;
+    use crate::replacer::ArcReplacer;
+
+    fn catalog_with_tables(tables: &[(&str, &[&str])]) -> (Catalog, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).expect("disk");
+        let bpm = Arc::new(create_buffer_pool_manager(
+            16,
+            ArcReplacer::new(16),
+            DiskScheduler::new(dm),
+        ));
+        let catalog = Catalog::new(bpm);
+        for (name, cols) in tables {
+            let schema = Schema::new(
+                cols.iter()
+                    .map(|c| (DataType::INT, c.to_string()))
+                    .collect(),
+            );
+            catalog.create_table(name.to_string(), schema).unwrap();
+        }
+        (catalog, dir)
+    }
+
+    fn bind_one(catalog: &Catalog, sql: &str) -> Result<BoundStatement, String> {
+        let mut ast = Parser::parse_sql(&GenericDialect {}, sql).expect("valid SQL");
+        assert_eq!(ast.len(), 1, "expected exactly one statement");
+        Binder::new(catalog)
+            .bind_statement(&ast.remove(0))
+            .map_err(|e| e.0)
+    }
+
+    fn column_refs(exprs: &[Expression]) -> Vec<(u8, u32)> {
+        exprs
+            .iter()
+            .map(|e| match e {
+                Expression::Column {
+                    tuple_idx, col_idx, ..
+                } => (*tuple_idx, *col_idx),
+                _ => panic!("expected only column references"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn select_star_over_a_join_lists_left_columns_before_right_columns() {
+        let (catalog, _dir) = catalog_with_tables(&[("l", &["a", "b"]), ("r", &["c"])]);
+        for _ in 0..32 {
+            let Ok(BoundStatement::Select(sel)) =
+                bind_one(&catalog, "SELECT * FROM l JOIN r ON l.a = r.c")
+            else {
+                panic!("expected a bound SELECT");
+            };
+            assert_eq!(column_refs(&sel.projections), vec![(0, 0), (0, 1), (1, 0)]);
+        }
+    }
 }
