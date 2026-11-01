@@ -106,10 +106,9 @@ impl DiskScheduler {
         Ok(())
     }
 
-    /// shutdown closes the DiskRequest channel, waits for any existing requests to drain, and joins on the io thread
+    /// Stops accepting requests, lets the worker finish the queued ones, and joins it.
     pub fn shutdown(mut self) -> Result<(), DiskSchedulerError> {
-        // dropping the sender closes the channel and lets the worker drain then exit
-        self.tx.take();
+        drop(self.tx.take());
         info!("DiskScheduler: shutting down worker");
         if let Some(handle) = self.handle.take() {
             handle
@@ -122,7 +121,7 @@ impl DiskScheduler {
 
 impl Drop for DiskScheduler {
     fn drop(&mut self) {
-        self.tx.take();
+        drop(self.tx.take());
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -247,10 +246,13 @@ mod tests {
         assert_eq!(*dm.read_page(7, page(0)).unwrap(), [0xAB; PAGE_SIZE]);
         assert_eq!(*dm.read_page(3, page(0)).unwrap(), [0x01; PAGE_SIZE]);
 
-        // Rewriting a page reuses its offset instead of growing the file.
         let len = std::fs::metadata(dir.path().join("db")).unwrap().len();
         dm.write_page(7, page(0xCD)).unwrap();
-        assert_eq!(std::fs::metadata(dir.path().join("db")).unwrap().len(), len);
+        assert_eq!(
+            std::fs::metadata(dir.path().join("db")).unwrap().len(),
+            len,
+            "rewriting a page reuses its offset instead of growing the file"
+        );
         assert_eq!(*dm.read_page(7, page(0)).unwrap(), [0xCD; PAGE_SIZE]);
         assert_eq!(dm.num_writes.load(Ordering::Acquire), 3);
     }
@@ -362,6 +364,25 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_finishes_queued_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = DiskScheduler::new(manager(&dir));
+        let (tx, rx) = mpsc::channel();
+        let requests = (0..32)
+            .map(|page_id| DiskRequest {
+                page_id,
+                is_write: true,
+                data: page(page_id as u8),
+                promise: tx.clone(),
+            })
+            .collect();
+        scheduler.schedule(requests).unwrap();
+        drop(tx);
+        scheduler.shutdown().unwrap();
+        assert_eq!(rx.iter().filter(|r| r.is_ok()).count(), 32);
+    }
+
+    #[test]
     fn scheduler_survives_a_dropped_promise() {
         let dir = tempfile::tempdir().unwrap();
         let scheduler = DiskScheduler::new(manager(&dir));
@@ -375,7 +396,6 @@ mod tests {
                 promise: tx,
             }])
             .unwrap();
-        // The worker logs the failed delivery and keeps serving requests.
         let (tx, rx) = mpsc::channel();
         scheduler
             .schedule(vec![DiskRequest {
