@@ -1,0 +1,44 @@
+# The loop between our agents. Agents live in .claude/agents/<name>.md.
+#
+# Each stage says how it starts today:
+#   enforced_by: a workflow or check in the consuming repo runs it automatically.
+#   manual:      a person or a Claude session starts it, loading the agent by name.
+# Nothing here is executed by a runtime; this file is the spec, and the
+# workflows it names are what actually runs.
+version: 1
+
+stages:
+  triage:
+    agent: triage
+    trigger: { linear: { state: Todo } }
+    manual: true
+    next: implement            # when triage decides "implement"
+
+  implement:
+    agent: implement
+    trigger: { triage: implement }
+    manual: true
+    output: pull_request
+    next: [review, test]
+
+  review:
+    agent: review
+    trigger: { github: { pull_request: [opened, synchronize, reopened, ready_for_review] } }
+    enforced_by: .github/workflows/claude-review.yml
+
+  test:
+    agent: test
+    trigger: { gate_failed: coverage }
+    manual: true
+
+  benchmark:
+    agent: benchmark
+    trigger: { on_request: true }   # never in CI
+    manual: true
+
+# A PR merges only when every gate passes. Boris merges; agents never do.
+gates:
+  ci_green:        { enforced_by: .github/workflows/ci.yml }
+  coverage:        { min_lines: 80, enforced_by: .github/workflows/ci.yml }
+  review_findings: { rule: "no unresolved correctness or concurrency findings", manual: true }
+  merge:           { by: human, manual: true }
