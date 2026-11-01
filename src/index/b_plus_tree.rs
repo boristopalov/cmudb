@@ -960,8 +960,12 @@ impl Iterator for BPlusTreeIter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buf::put_u32_le;
     use crate::create_buffer_pool_manager;
     use crate::disk::{DiskManager, DiskScheduler};
+    use crate::index::b_plus_page::{
+        LEAF_FIXED_HEADER_BYTES, RECORD_ID_ENCODED_BYTES, TOMBSTONE_SLOT_ENCODED_BYTES,
+    };
     use crate::replacer::ArcReplacer;
     use crate::table_heap::RecordId;
     use tempfile::tempdir;
@@ -1040,6 +1044,50 @@ mod tests {
         bpm.write_page(right_id).unwrap().data_mut()[0] ^= 0xff;
         tree.remove(make_key(0, key_len)).unwrap();
         assert!(tree.search(&make_key(0, key_len)).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_corrupt_tombstone_makes_every_operation_fail_without_panicking() {
+        let key_len = 8usize;
+        let (bpm, _tmp) = make_bpm(8);
+        let tree = BPlusTree::new("idx".to_string(), key_len as u32, bpm.clone()).unwrap();
+        for k in 1..=3u8 {
+            let rid = RecordId {
+                page_id: u32::from(k),
+                slot_id: 0,
+            };
+            tree.insert(make_key(k, key_len), IndexValue::IndexValue(rid))
+                .unwrap();
+        }
+        tree.remove(make_key(2, key_len)).unwrap();
+        let root_leaf = tree.read_header().unwrap().root_page_id;
+        let first_tombstone = LEAF_FIXED_HEADER_BYTES
+            + 3 * (key_len + RECORD_ID_ENCODED_BYTES)
+            + TOMBSTONE_SLOT_ENCODED_BYTES;
+        put_u32_le(
+            bpm.write_page(root_leaf).unwrap().data_mut(),
+            first_tombstone,
+            40,
+        );
+
+        let corrupt = |r: &Result<_, IndexError>| {
+            matches!(r, Err(IndexError::PageError(PageCodecError::Malformed(_))))
+        };
+        assert!(corrupt(&tree.search(&make_key(1, key_len)).map(|_| ())));
+        let rid = RecordId {
+            page_id: 9,
+            slot_id: 0,
+        };
+        assert!(corrupt(
+            &tree.insert(make_key(9, key_len), IndexValue::IndexValue(rid))
+        ));
+        assert!(corrupt(&tree.remove(make_key(1, key_len)).map(|_| ())));
+        assert!(corrupt(
+            &tree
+                .scan((Bound::Unbounded, Bound::Unbounded))
+                .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+                .map(|_| ())
+        ));
     }
 
     #[test]

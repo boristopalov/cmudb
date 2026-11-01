@@ -731,10 +731,16 @@ impl LeafPage {
             }));
         }
 
-        let mut keys = Vec::with_capacity(n);
+        if size > max_size.saturating_add(1) {
+            return Err(PageCodecError::Malformed("leaf size exceeds max size"));
+        }
+        let mut keys: Vec<IndexKey> = Vec::with_capacity(n);
         let mut record_ids = Vec::with_capacity(n);
         for _ in 0..n {
             let bytes = r.read_bytes(key_len)?;
+            if keys.last().is_some_and(|prev| prev.0.as_slice() > bytes) {
+                return Err(PageCodecError::Malformed("leaf keys out of order"));
+            }
             keys.push(IndexKey(bytes.to_vec()));
             let pid = r.read_u64_le()?;
             let sid = r.read_u64_le()?;
