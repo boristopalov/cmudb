@@ -292,6 +292,43 @@ fn unique_index_rejects_duplicate_key() {
     let err = db.try_exec("INSERT INTO t VALUES (1, 2)").unwrap_err();
     assert!(err.contains("DuplicateKey"), "{err}");
     assert_eq!(ints(&db.exec("SELECT v FROM t WHERE id = 1")), vec![[1]]);
+    assert_eq!(
+        ints(&db.exec("SELECT id, v FROM t WHERE v > 0")),
+        vec![[1, 1]],
+        "the rejected row is not left in the table"
+    );
+}
+
+#[test]
+fn update_rejected_by_a_unique_index_leaves_the_table_and_every_index_unchanged() {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE t (id INTEGER, v INTEGER)");
+    db.exec("CREATE INDEX t_id ON t (id)");
+    db.exec("CREATE INDEX t_v ON t (v)");
+    db.exec("INSERT INTO t VALUES (1, 10), (2, 20)");
+
+    let err = db
+        .try_exec("UPDATE t SET v = 99, id = 2 WHERE id = 1")
+        .unwrap_err();
+    assert!(err.contains("DuplicateKey"), "{err}");
+
+    assert_eq!(
+        sorted(ints(&db.exec("SELECT id, v FROM t WHERE id > id - 1"))),
+        vec![vec![1, 10], vec![2, 20]],
+        "the table keeps both rows unchanged"
+    );
+    assert_eq!(ints(&db.exec("SELECT v FROM t WHERE id = 1")), vec![[10]]);
+    assert_eq!(ints(&db.exec("SELECT v FROM t WHERE id = 2")), vec![[20]]);
+    assert_eq!(ints(&db.exec("SELECT id FROM t WHERE v = 10")), vec![[1]]);
+    assert!(db.exec("SELECT id FROM t WHERE v = 99").is_empty());
+
+    assert_eq!(
+        ints(&db.exec("UPDATE t SET v = v + 1 WHERE id = 1")),
+        vec![[1]],
+        "an update that keeps its key is not a conflict with itself"
+    );
+    assert_eq!(ints(&db.exec("SELECT v FROM t WHERE id = 1")), vec![[11]]);
+    assert_eq!(ints(&db.exec("SELECT id FROM t WHERE v = 11")), vec![[1]]);
 }
 
 #[test]

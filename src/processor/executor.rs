@@ -4,7 +4,7 @@ use crate::catalog::{
     Catalog, CatalogError, DataType, IndexInfo, IndexType, Schema, TableInfo, Value,
 };
 use crate::disk::PAGE_SIZE;
-use crate::index::{IndexError, IndexIter};
+use crate::index::{IndexError, IndexIter, InsertError};
 use crate::processor::plan::{
     AggType, AggregationPlanNode, Arithmetic, CreateIndexPlanNode, CreateTablePlanNode,
     DeletePlanNode, DropIndexPlanNode, DropTablePlanNode, Expression, ExternalMergeSortPlanNode,
@@ -175,11 +175,13 @@ impl<'a> Executor for InsertExecutor<'a> {
             .as_ref()
             .ok_or_else(|| not_opened("InsertExecutor"))?;
 
+        let indexes = self.catalog.get_table_indexes(self.plan.table_oid)?;
         let mut count: i32 = 0;
         while let Some(res) = self.child.next()? {
+            reject_duplicate_keys(&indexes, None, &res.0)?;
             let rid = table.heap.insert(&res.0)?;
-            for idx in self.catalog.get_table_indexes(self.plan.table_oid)? {
-                idx.as_ref().index.insert(&res.0, rid)?;
+            for idx in &indexes {
+                idx.index.insert(&res.0, rid)?;
             }
             count += 1;
         }
@@ -195,6 +197,21 @@ impl<'a> Executor for InsertExecutor<'a> {
     fn close(&mut self) -> Result<(), ExecutorError> {
         Ok(())
     }
+}
+
+/// Fails with `DuplicateKey` before anything is written when `new` would collide with another
+/// row in any of `indexes`, so a rejected row leaves the table and every index as they were.
+fn reject_duplicate_keys(
+    indexes: &[Arc<IndexInfo>],
+    old: Option<&Tuple>,
+    new: &Tuple,
+) -> Result<(), ExecutorError> {
+    for idx in indexes {
+        if idx.index.conflicts(old, new)? {
+            return Err(IndexError::Insert(InsertError::DuplicateKey).into());
+        }
+    }
+    Ok(())
 }
 
 /// The single row `InsertExecutor` yields: the inserted-row count as raw native-endian
@@ -294,11 +311,13 @@ impl<'a> Executor for UpdateExecutor<'a> {
         }
 
         let new_tuple = self.schema().encode_tuple(new_values.as_ref())?;
+        let indexes = self.catalog.get_table_indexes(self.plan.table_oid)?;
+        reject_duplicate_keys(&indexes, Some(&tuple_to_update), &new_tuple)?;
         let (new_rid, _) = table.heap.update(rid, &new_tuple)?;
 
-        for idx in self.catalog.get_table_indexes(self.plan.table_oid)? {
-            idx.as_ref().index.remove(&tuple_to_update)?;
-            idx.as_ref().index.insert(&new_tuple, new_rid)?;
+        for idx in &indexes {
+            idx.index.remove(&tuple_to_update)?;
+            idx.index.insert(&new_tuple, new_rid)?;
         }
         Ok(Some((new_tuple, new_rid)))
     }

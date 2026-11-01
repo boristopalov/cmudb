@@ -102,6 +102,19 @@ impl TableIndex {
         }
     }
 
+    /// Whether storing `new` in place of `old` would hit a key another row already holds.
+    /// `old` is `None` for a new row. A NULL key column, or a key equal to `old`'s, is no
+    /// conflict.
+    pub fn conflicts(&self, old: Option<&Tuple>, new: &Tuple) -> Result<bool, IndexError> {
+        let Some(key) = self.key_of_tuple(new) else {
+            return Ok(false);
+        };
+        if old.and_then(|old| self.key_of_tuple(old)).as_ref() == Some(&key) {
+            return Ok(false);
+        }
+        Ok(self.idx.search(&key)?.is_some())
+    }
+
     /// Looks up the record stored under the key made of `vals`.
     pub fn search(&self, vals: &[Value]) -> Result<Option<RecordId>, IndexError> {
         let key = self.key_of_values(vals);
