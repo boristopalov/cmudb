@@ -142,28 +142,21 @@ impl Catalog {
         col_names: &[&str],
         index_type: IndexType,
     ) -> Result<u32, CatalogError> {
-        let (table_name, indexed_cols, indexed_col_idxs, table_bitmap_len) = {
+        let (table_name, table_schema, indexed_col_idxs) = {
             let tables = self.tables.read().unwrap();
             let tinfo = tables
                 .get(&table_oid)
                 .ok_or(CatalogError::TableDoesNotExist)?;
-
-            let mut indexed_cols = Vec::with_capacity(col_names.len());
-            let mut indexed_col_idxs = Vec::with_capacity(col_names.len());
-            for cname in col_names {
-                let idx = tinfo
-                    .schema
-                    .col_idx(cname)
-                    .ok_or(CatalogError::ColumnNotFound)?;
-                indexed_cols.push(tinfo.schema.cols[idx].clone());
-                indexed_col_idxs.push(idx);
-            }
-            (
-                tinfo.name.clone(),
-                indexed_cols,
-                indexed_col_idxs,
-                tinfo.schema.bitmap_len,
-            )
+            let indexed_col_idxs = col_names
+                .iter()
+                .map(|cname| {
+                    tinfo
+                        .schema
+                        .col_idx(cname)
+                        .ok_or(CatalogError::ColumnNotFound)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (tinfo.name.clone(), tinfo.schema.clone(), indexed_col_idxs)
         };
 
         let mut indexes = self.indexes.write().unwrap();
@@ -178,9 +171,8 @@ impl Catalog {
         let index = TableIndex::new(
             bpm,
             name.clone(),
-            indexed_cols,
+            table_schema,
             indexed_col_idxs,
-            table_bitmap_len,
             index_type,
         )
         .map_err(|_| CatalogError::IndexCreationError(("failed to create index").to_string()))?;
@@ -390,6 +382,42 @@ impl Value {
     }
 }
 
+const SIGN_BIT_32: u32 = 1 << 31;
+const SIGN_BIT_64: u64 = 1 << 63;
+
+impl Value {
+    /// Appends a big-endian encoding of the value whose bytewise order equals the `Ord` order of
+    /// `Value`, so that index keys sort like the values they encode.
+    pub fn encode_order_preserving(&self, out: &mut Vec<u8>) {
+        match self {
+            Value::BOOLEAN(b) => out.push(*b as u8),
+            Value::INT(i) => out.extend_from_slice(&((*i as u32) ^ SIGN_BIT_32).to_be_bytes()),
+            Value::FLOAT(f) => out.extend_from_slice(&order_preserving_f32_bits(f.0).to_be_bytes()),
+            Value::TIMESTAMP(t) => {
+                out.extend_from_slice(&((*t as u64) ^ SIGN_BIT_64).to_be_bytes())
+            }
+        }
+    }
+}
+
+/// Maps an `f32` to a `u32` that orders like `OrderedFloat<f32>`: every NaN maps to one value above
+/// positive infinity, and `-0.0` maps to the same value as `0.0`.
+fn order_preserving_f32_bits(f: f32) -> u32 {
+    let canonical = if f.is_nan() {
+        f32::NAN
+    } else if f == 0.0 {
+        0.0
+    } else {
+        f
+    };
+    let bits = canonical.to_bits();
+    if bits & SIGN_BIT_32 == 0 {
+        bits | SIGN_BIT_32
+    } else {
+        !bits
+    }
+}
+
 impl std::ops::Add for Value {
     type Output = Value;
     fn add(self, rhs: Value) -> Value {
@@ -450,40 +478,7 @@ pub enum DataType {
            // VECTOR(usize),
 }
 
-// TODO: this feels weird
 impl DataType {
-    pub fn encode_from_tuple(
-        &self,
-        tuple: &Tuple,
-        bitmap_len: usize,
-        offset: usize,
-        out: &mut Vec<u8>,
-    ) {
-        let off = bitmap_len + offset;
-        match self {
-            DataType::BOOLEAN => {
-                let b = tuple.data.get(off).unwrap();
-                out.push(*b);
-            }
-            DataType::INT => {
-                // assumes data is stored little-endian
-                let val = i32::from_le_bytes(tuple.data[off..off + 4].try_into().unwrap());
-                let big_e_converted = ((val as u32) ^ 0x8000_0000).to_be_bytes();
-                out.extend_from_slice(&big_e_converted);
-            }
-            DataType::FLOAT => {
-                let val = f32::from_le_bytes(tuple.data[off..off + 4].try_into().unwrap());
-                let big_e_converted = ((val as u32) ^ 0x8000_0000).to_be_bytes();
-                out.extend_from_slice(&big_e_converted);
-            }
-            DataType::TIMESTAMP => {
-                let val = i64::from_le_bytes(tuple.data[off..off + 8].try_into().unwrap());
-                let big_e_converted = ((val as u64) ^ 0x8000_0000_0000_0000).to_be_bytes();
-                out.extend_from_slice(&big_e_converted);
-            }
-        }
-    }
-
     fn size(&self) -> usize {
         match self {
             DataType::BOOLEAN => 1,
@@ -578,4 +573,39 @@ fn test_schema_encode_tuple_type_mismatch() {
         schema.encode_tuple(&bad),
         Err(CatalogError::TupleSchemaMismatch)
     ));
+}
+
+#[test]
+fn order_preserving_encoding_sorts_like_value_ord() {
+    let mut values = vec![
+        Value::FLOAT(OrderedFloat(f32::NAN)),
+        Value::FLOAT(OrderedFloat(f32::INFINITY)),
+        Value::FLOAT(OrderedFloat(3.7)),
+        Value::FLOAT(OrderedFloat(3.2)),
+        Value::FLOAT(OrderedFloat(0.0)),
+        Value::FLOAT(OrderedFloat(-0.0)),
+        Value::FLOAT(OrderedFloat(-1.5)),
+        Value::FLOAT(OrderedFloat(-3.7)),
+        Value::FLOAT(OrderedFloat(f32::NEG_INFINITY)),
+        Value::FLOAT(OrderedFloat(-f32::NAN)),
+    ];
+    values.extend([i32::MIN, -7, -1, 0, 1, 7, i32::MAX].map(Value::INT));
+    values.extend([i64::MIN, -1, 0, 1, i64::MAX].map(Value::TIMESTAMP));
+    values.extend([false, true].map(Value::BOOLEAN));
+    let encode = |v: &Value| {
+        let mut out = Vec::new();
+        v.encode_order_preserving(&mut out);
+        out
+    };
+    for a in &values {
+        for b in &values {
+            if a.data_type() == b.data_type() {
+                assert_eq!(
+                    a.cmp(b),
+                    encode(a).cmp(&encode(b)),
+                    "encoded order of {a:?} vs {b:?} must match Value order"
+                );
+            }
+        }
+    }
 }
