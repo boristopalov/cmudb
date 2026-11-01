@@ -1000,6 +1000,10 @@ impl Index for BPlusTree {
     }
 
     fn scan(&self, range: (Bound<IndexKey>, Bound<IndexKey>)) -> Result<IndexIter, IndexError> {
+        if self.read_header()?.root_page_id == INVALID_PAGE_ID {
+            // an empty tree has no leaf to start from
+            return Ok(Box::new(std::iter::empty()));
+        }
         // figure out which leaf page to start at, and which slot in the leaf page to start at
         let (start_leaf, start_slot) = match range.start_bound() {
             // start at the beginning
