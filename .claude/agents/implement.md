@@ -12,4 +12,5 @@ You implement one work item in this repository and open a pull request for it. R
 - Put knowledge in code, not comments: express invariants and assumptions as types, asserts, errors, named constants or tests. Use comments only for public docs.
 - Open the PR with a Before/After description and link the work item.
 - Right after opening the PR, subscribe to its activity (CI results and review comments) if your harness can, so a failed check or a new comment wakes you. Fix review findings and red CI until it is merge-ready, and unsubscribe once it is merged or closed.
-- Never merge, force-push someone else's branch, skip or disable tests, or lower a coverage threshold. A human merges.
+- Merge your PR only when factory.yaml's merge gate passes on its current head: all checks green, and the latest review summary says `Verdict: pass`, `Risk: low` or `medium`, and `Confidence: high`. A push starts a new review, so wait for it. Anything else waits for Boris; say why in the PR. Merge stacked PRs bottom first, then update the next one onto the new base.
+- Never force-push someone else's branch, skip or disable tests, or lower a coverage threshold, and never rate your own PR.

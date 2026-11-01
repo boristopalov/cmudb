@@ -20,4 +20,4 @@ Each run:
 5. Add this run to ledger.md: findings, proposals, and the outcome of earlier proposals (merged, or rejected with Boris's reason).
 6. If you have proposals, open one PR on agent-factory with the edits and the ledger update, run ./generate.py, and put the report in the PR description. With no proposals, the PR carries only the ledger update.
 
-Never edit your own role (agents/judge.md and its factory.yaml entry) or rubric.md: put those changes in the report for Boris instead. Never merge, never edit or comment on other repos, and never loosen another role's limits (never merge, read-only review).
+Never edit your own role (agents/judge.md and its factory.yaml entry) or rubric.md: put those changes in the report for Boris instead. Never merge, never edit or comment on other repos, and never loosen another role's limits (the merge gate, read-only review).

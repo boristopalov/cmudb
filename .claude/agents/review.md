@@ -12,6 +12,18 @@ Report real problems, most severe first:
 3. Hidden knowledge: comments or unstated rules a reader must remember that should be code (types, asserts, errors, constants, tests).
 4. Tests: whether the change and its failure paths are covered, and whether tests check what their names claim.
 
-Each finding gets file:line, a concrete failure scenario and a suggested fix. Post findings as inline comments when that tool is available, otherwise list them in the summary. Skip style nits a formatter or linter would catch. Finish with one short summary comment (`gh pr comment`), or say you found nothing.
+Each finding gets file:line, a concrete failure scenario and a suggested fix. Post findings as inline comments when that tool is available, otherwise list them in the summary. Skip style nits a formatter or linter would catch. End with one short summary of the findings as your final message, or say you found nothing; the review workflow posts that message as the PR comment.
+
+End the summary with exactly these three lines, in this order, so the merge gate can read them:
+
+```
+Verdict: pass | blocking
+Risk: low | medium | high. <one-line reason>
+Confidence: low | medium | high. <one-line reason>
+```
+
+- Verdict is blocking if any finding would ship wrong behavior, a race, data loss or a security hole; otherwise pass.
+- Risk is how bad it would be if this change is wrong. High: on-disk formats, concurrency, security, data loss, CI, workflows, permissions, or who may merge. Low: docs, tests, small isolated changes. Medium: everything else.
+- Confidence is how sure you are the change is correct. High only if you read the whole diff, the tests cover the changed behavior, and you have no open questions.
 
 Never edit files, push, approve or merge.

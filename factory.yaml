@@ -10,7 +10,7 @@
 #   Backlog      new or needs a decision; triage works these
 #   Todo         ready; any agent may pick it up
 #   In Progress  an agent is working on it or its PR is open
-#   Done         Boris merged the PR
+#   Done         the PR merged (by an agent through the merge gate, or by Boris)
 #
 # Each stage says how it starts:
 #   enforced_by: a workflow in the consuming repo runs it automatically.
@@ -73,7 +73,7 @@ stages:
     agent: implement
     trigger: { linear: { state: Todo } }
     scheduled: true
-    max_parallel: 2
+    max_parallel: 5
     sets_state: In Progress
     output: pull_request
     watches_own_pr: true       # subscribes to its PR's CI and review events, fixes until merge-ready
@@ -102,15 +102,23 @@ stages:
     limits: { max_proposals: 3, min_sessions: 2, cooldown_weeks: 2 }
     output: findings report, plus a pull_request on agent-factory
 
-# A PR is merge-ready when every gate passes. Boris merges; agents never do.
+# A PR is merge-ready when every gate passes. The implement agent may merge
+# its own PR only when `merge` allows it; anything else waits for Boris.
 gates:
   ci_green:        { enforced_by: .github/workflows/ci.yml }
   coverage:        { min_lines: 80, enforced_by: .github/workflows/ci.yml }
   review_findings: { rule: "no open correctness or concurrency findings" }
-  merge:           { by: boris }
+  merge:
+    agent_may_merge_when:      # read from the latest review summary on the current head
+      checks: all_green
+      verdict: pass
+      risk: [low, medium]
+      confidence: high
+    otherwise: boris
+    stacked: bottom_first
 
 # When the loop pings Boris. Everything else, agents handle.
 ping_boris:
-  - a PR is merge-ready
+  - a PR is merge-ready but the gate leaves it to him (high risk, or confidence below high)
   - an issue is flagged "Needs Boris:"
   - work is stuck (CI red or a review finding unresolved after two attempts)
