@@ -85,11 +85,13 @@ fn run(
 ) -> Result<(), String> {
     let ast = Parser::parse_sql(dialect, sql).map_err(|e| format!("parse: {e}"))?;
     let binder = Binder::new(catalog);
-    let bound = binder.bind(ast).map_err(|e| format!("bind: {}", e.0))?;
     let planner = Planner::new(catalog);
 
-    for stmt in bound {
-        let plan = planner.plan(stmt).map_err(|e| format!("plan: {}", e.0))?;
+    for stmt in &ast {
+        let bound = binder
+            .bind_statement(stmt)
+            .map_err(|e| format!("bind: {}", e.0))?;
+        let plan = planner.plan(bound).map_err(|e| format!("plan: {}", e.0))?;
         let mut exec = create_executor(catalog, bpm, &plan);
         exec.open().map_err(|e| format!("open: {}", e.0))?;
         execute(&plan, &mut *exec)?;
@@ -213,5 +215,33 @@ fn format_value(v: &Value) -> String {
         Value::INT(i) => i.to_string(),
         Value::FLOAT(f) => f.into_inner().to_string(),
         Value::TIMESTAMP(t) => t.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_input_line_can_create_a_table_and_then_use_it() {
+        let dir = tempdir().expect("tempdir");
+        let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).expect("disk");
+        let bpm = Arc::new(create_buffer_pool_manager(
+            16,
+            ArcReplacer::new(16),
+            DiskScheduler::new(dm),
+        ));
+        let catalog = Catalog::new(bpm.clone());
+
+        let result = run(
+            &GenericDialect {},
+            &catalog,
+            &bpm,
+            "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1); SELECT * FROM t;",
+        );
+
+        assert_eq!(result, Ok(()));
+        let oid = catalog.table_oid("t").expect("table t was created");
+        assert_eq!(catalog.get_table(oid).unwrap().heap.iter().count(), 1);
     }
 }
