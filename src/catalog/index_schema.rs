@@ -1,9 +1,11 @@
 use std::ops::Bound;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use crate::buffer_pool::BufferPoolManager;
 use crate::catalog::{DataType, IndexType, Schema, Value};
-use crate::index::{BPlusTree, Index, IndexError, IndexIter, InsertResult, RemoveResult};
+use crate::index::{BPlusTree, Index, IndexError, InsertError, InsertResult, RemoveResult};
 use crate::table_heap::{RecordId, Tuple};
 
 #[derive(Debug, PartialEq, PartialOrd, Ord, Eq, Clone)]
@@ -14,7 +16,37 @@ pub enum IndexValue {
     IndexValue(RecordId),
 }
 
+/// Bytes appended to every index key: the record id, big-endian, so that entries for the
+/// same user key sort by record id.
+const RID_SUFFIX_LEN: usize = 8;
+
+fn rid_suffix(rid: RecordId) -> [u8; RID_SUFFIX_LEN] {
+    let mut out = [0u8; RID_SUFFIX_LEN];
+    out[..4].copy_from_slice(&rid.page_id.to_be_bytes());
+    out[4..].copy_from_slice(&rid.slot_id.to_be_bytes());
+    out
+}
+
+/// Smallest and largest record ids, used to bracket all entries of one user key.
+const RID_MIN: RecordId = RecordId {
+    page_id: 0,
+    slot_id: 0,
+};
+const RID_MAX: RecordId = RecordId::RESERVED;
+
+/// Iterator over `(user key, record id)` index entries.
+pub type TableIndexIter = Box<dyn Iterator<Item = Result<(IndexKey, RecordId), IndexError>>>;
+
 /// An index over some columns of a table. Rows with a NULL in any key column are not stored.
+///
+/// Under MVCC an index entry stays when its tuple changes, so older snapshots can still reach
+/// the old version through it. Several record ids can therefore be filed under the same user
+/// key (a deleted row and its re-inserted replacement, say), so each B+ tree key is the user
+/// key followed by the record id, and every entry is unique. Readers re-check that the
+/// version they can see still has the key they looked up.
+///
+/// Uniqueness of user keys is enforced by the MVCC write path, which checks the newest
+/// version behind each entry while holding [`TableIndex::unique_latch`].
 pub struct TableIndex {
     table_schema: Schema,
     /// Position of each key column in the table schema.
@@ -22,6 +54,8 @@ pub struct TableIndex {
     /// Schema of the index key (the key columns only).
     pub schema: Schema,
     idx: Box<dyn Index + Send + Sync>,
+    /// Serializes "check the key is free, then claim it" across writers of this index.
+    pub unique_latch: Mutex<()>,
 }
 
 impl TableIndex {
@@ -48,7 +82,9 @@ impl TableIndex {
         let schema = Schema::new(key_cols);
 
         let idx = match index_type {
-            IndexType::BPlusTree => BPlusTree::new(index_name, schema.data_len as u32, bpm)?,
+            IndexType::BPlusTree => {
+                BPlusTree::new(index_name, (schema.data_len + RID_SUFFIX_LEN) as u32, bpm)?
+            }
         };
 
         Ok(Self {
@@ -56,6 +92,7 @@ impl TableIndex {
             indexed_col_idxs,
             schema,
             idx: Box::new(idx),
+            unique_latch: Mutex::new(()),
         })
     }
 
@@ -86,58 +123,92 @@ impl TableIndex {
         IndexKey(data)
     }
 
-    /// Adds `rid` under the tuple's key. A tuple with a NULL key column is skipped.
+    fn entry_key(&self, key: &IndexKey, rid: RecordId) -> IndexKey {
+        let mut data = Vec::with_capacity(self.schema.data_len + RID_SUFFIX_LEN);
+        data.extend_from_slice(&key.0);
+        data.extend_from_slice(&rid_suffix(rid));
+        IndexKey(data)
+    }
+
+    /// Files `rid` under the tuple's key. A tuple with a NULL key column is skipped, and adding
+    /// an entry that already exists is a no-op.
     pub fn insert(&self, tuple: &Tuple, rid: RecordId) -> InsertResult {
-        match self.key_of_tuple(tuple) {
-            Some(key) => self.idx.insert(key, IndexValue::IndexValue(rid)),
-            None => Ok(()),
-        }
-    }
-
-    /// Removes the tuple's key. A tuple with a NULL key column is skipped.
-    pub fn remove(&self, tuple: &Tuple) -> RemoveResult {
-        match self.key_of_tuple(tuple) {
-            Some(key) => self.idx.remove(key),
-            None => Ok(()),
-        }
-    }
-
-    /// Whether storing `new` in place of `old` would hit a key another row already holds.
-    /// `old` is `None` for a new row. A NULL key column, or a key equal to `old`'s, is no
-    /// conflict.
-    pub fn conflicts(&self, old: Option<&Tuple>, new: &Tuple) -> Result<bool, IndexError> {
-        let Some(key) = self.key_of_tuple(new) else {
-            return Ok(false);
+        let Some(key) = self.key_of_tuple(tuple) else {
+            return Ok(());
         };
-        if old.and_then(|old| self.key_of_tuple(old)).as_ref() == Some(&key) {
-            return Ok(false);
-        }
-        Ok(self.idx.search(&key)?.is_some())
-    }
-
-    /// Looks up the record stored under the key made of `vals`.
-    pub fn search(&self, vals: &[Value]) -> Result<Option<RecordId>, IndexError> {
-        let key = self.key_of_values(vals);
-        match self.idx.search(&key)? {
-            Some(IndexValue::IndexValue(rid)) => Ok(Some(rid)),
-            None => Ok(None),
+        match self
+            .idx
+            .insert(self.entry_key(&key, rid), IndexValue::IndexValue(rid))
+        {
+            Err(IndexError::Insert(InsertError::DuplicateKey)) => Ok(()),
+            other => other,
         }
     }
 
-    /// Iterates the entries whose keys fall between `start` and `end`, in key order.
+    /// Removes the entry filing `rid` under the tuple's key. A tuple with a NULL key column is
+    /// skipped.
+    pub fn remove(&self, tuple: &Tuple, rid: RecordId) -> RemoveResult {
+        match self.key_of_tuple(tuple) {
+            Some(key) => self.idx.remove(self.entry_key(&key, rid)),
+            None => Ok(()),
+        }
+    }
+
+    /// Returns every record id filed under the key made of `vals`. Stale entries are
+    /// included; see the type-level docs.
+    pub fn search(&self, vals: &[Value]) -> Result<Vec<RecordId>, IndexError> {
+        self.scan(Bound::Included(vals), Bound::Included(vals))?
+            .map(|r| r.map(|(_, rid)| rid))
+            .collect()
+    }
+
+    /// Record ids filed under exactly `key`, a key made by [`TableIndex::key_of_tuple`].
+    pub fn entries_for_key(&self, key: &IndexKey) -> Result<Vec<RecordId>, IndexError> {
+        let iter = self.scan_keys(
+            Bound::Included(self.entry_key(key, RID_MIN)),
+            Bound::Included(self.entry_key(key, RID_MAX)),
+        )?;
+        iter.map(|r| r.map(|(_, rid)| rid)).collect()
+    }
+
+    /// Iterates the `(user key, record id)` entries whose keys fall between `start` and
+    /// `end`, in key order.
+    ///
+    /// Every entry for a user key sorts between that key followed by `RID_MIN` and the key
+    /// followed by `RID_MAX`, so including a key includes that whole range, and excluding it
+    /// excludes it.
     pub fn scan(
         &self,
         start: Bound<&[Value]>,
         end: Bound<&[Value]>,
-    ) -> Result<IndexIter, IndexError> {
-        let to_key = |b: Bound<&[Value]>| -> Bound<IndexKey> {
-            match b {
-                Bound::Included(v) => Bound::Included(self.key_of_values(v)),
-                Bound::Excluded(v) => Bound::Excluded(self.key_of_values(v)),
-                Bound::Unbounded => Bound::Unbounded,
-            }
+    ) -> Result<TableIndexIter, IndexError> {
+        let bracket = |vals: &[Value], rid| self.entry_key(&self.key_of_values(vals), rid);
+        let start = match start {
+            Bound::Included(v) => Bound::Included(bracket(v, RID_MIN)),
+            Bound::Excluded(v) => Bound::Excluded(bracket(v, RID_MAX)),
+            Bound::Unbounded => Bound::Unbounded,
         };
-        self.idx.scan((to_key(start), to_key(end)))
+        let end = match end {
+            Bound::Included(v) => Bound::Included(bracket(v, RID_MAX)),
+            Bound::Excluded(v) => Bound::Excluded(bracket(v, RID_MIN)),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        self.scan_keys(start, end)
+    }
+
+    fn scan_keys(
+        &self,
+        start: Bound<IndexKey>,
+        end: Bound<IndexKey>,
+    ) -> Result<TableIndexIter, IndexError> {
+        let key_size = self.schema.data_len;
+        let iter = self.idx.scan((start, end))?;
+        Ok(Box::new(iter.map(move |r| {
+            r.map(|(mut key, IndexValue::IndexValue(rid))| {
+                key.0.truncate(key_size);
+                (key, rid)
+            })
+        })))
     }
 }
 
@@ -149,7 +220,7 @@ mod tests {
     use ordered_float::OrderedFloat;
     use tempfile::tempdir;
 
-    use super::{IndexValue, TableIndex};
+    use super::TableIndex;
     use crate::buffer_pool::BufferPoolManager;
     use crate::catalog::{DataType, IndexType, Schema, Value};
     use crate::create_buffer_pool_manager;
@@ -222,12 +293,14 @@ mod tests {
         index
             .insert(&null_key, rid(0))
             .expect("NULL keys are skipped");
-        index.remove(&null_key).expect("NULL keys are skipped");
+        index
+            .remove(&null_key, rid(0))
+            .expect("NULL keys are skipped");
         let entries: Vec<_> = index
             .scan(Bound::Unbounded, Bound::Unbounded)
             .unwrap()
             .collect();
-        assert!(entries.is_empty(), "a NULL-keyed row must not be stored");
+        assert!(entries.is_empty(), "a NULL-keyed row is not stored");
     }
 
     #[test]
@@ -254,16 +327,55 @@ mod tests {
 
         assert_eq!(
             index.search(&[Value::FLOAT(OrderedFloat(3.2))]).unwrap(),
-            Some(rid(2))
+            vec![rid(2)]
         );
         let scanned: Vec<u32> = index
             .scan(Bound::Unbounded, Bound::Unbounded)
             .unwrap()
-            .map(|e| {
-                let (_, IndexValue::IndexValue(r)) = e.unwrap();
-                r.slot_id
-            })
+            .map(|e| e.unwrap().1.slot_id)
             .collect();
         assert_eq!(scanned, vec![1, 3, 4, 2, 0], "scan follows float order");
+    }
+
+    #[test]
+    fn same_key_can_be_filed_under_several_rids() {
+        let schema = Schema::new(vec![(DataType::INT, "a".to_string())]);
+        let (bpm, _tmp) = make_bpm(16);
+        let index = TableIndex::new(
+            bpm,
+            "idx".to_string(),
+            schema.clone(),
+            vec![0],
+            IndexType::BPlusTree,
+        )
+        .unwrap();
+        let t = |v| schema.encode_tuple(&[Some(Value::INT(v))]).unwrap();
+        let rid = |p, s| RecordId {
+            page_id: p,
+            slot_id: s,
+        };
+        index.insert(&t(5), rid(3, 1)).unwrap();
+        index.insert(&t(5), rid(0, 0)).unwrap();
+        index
+            .insert(&t(5), rid(0, 0))
+            .expect("adding an existing entry again is a no-op");
+        index.insert(&t(4), rid(9, 9)).unwrap();
+        index.insert(&t(6), rid(1, 1)).unwrap();
+
+        assert_eq!(
+            index.search(&[Value::INT(5)]).unwrap(),
+            vec![rid(0, 0), rid(3, 1)]
+        );
+        let below_six: Vec<_> = index
+            .scan(
+                std::ops::Bound::Excluded(&[Value::INT(4)][..]),
+                std::ops::Bound::Excluded(&[Value::INT(6)][..]),
+            )
+            .unwrap()
+            .map(|r| r.unwrap().1)
+            .collect();
+        assert_eq!(below_six, vec![rid(0, 0), rid(3, 1)]);
+        index.remove(&t(5), rid(0, 0)).unwrap();
+        assert_eq!(index.search(&[Value::INT(5)]).unwrap(), vec![rid(3, 1)]);
     }
 }

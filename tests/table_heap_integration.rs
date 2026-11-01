@@ -3,6 +3,7 @@ use cmudb::create_buffer_pool_manager;
 use cmudb::disk::{DiskManager, DiskScheduler, PAGE_SIZE};
 use cmudb::replacer::ArcReplacer;
 use cmudb::table_heap::{RecordId, TableHeap, TableHeapIterator, Tuple};
+use cmudb::table_page::{TablePageRef, TupleMeta};
 use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use tempfile::{TempDir, tempdir};
@@ -60,22 +61,25 @@ fn growth_preserves_rids_and_order_with_interleaved_pages_and_eviction() {
 
 #[test]
 fn exact_fit_accounts_for_header_and_each_slot_including_empty_tuples() {
-    const MAX_PAYLOAD: usize = PAGE_SIZE - 12 - 9;
-    for spare in [0, 5, 9] {
+    const MAX_PAYLOAD: usize = TablePageRef::MAX_TUPLE_SIZE;
+    for spare in [0, 5, TablePageRef::SLOT_SIZE] {
         let (heap, _bpm, _dir) = make_heap(1);
         let tuple = Tuple {
             data: vec![0x7b; MAX_PAYLOAD - spare],
         };
         let first = heap.insert(&tuple).unwrap();
         let empty = heap.insert(&Tuple { data: vec![] }).unwrap();
-        assert_eq!(first.page_id == empty.page_id, spare == 9);
+        assert_eq!(
+            first.page_id == empty.page_id,
+            spare == TablePageRef::SLOT_SIZE
+        );
         assert_eq!(heap.get(first).unwrap().1.data, tuple.data);
         assert!(heap.get(empty).unwrap().1.data.is_empty());
         assert_eq!(rows(heap.iter()).len(), 2);
     }
 
     let (heap, _bpm, _dir) = make_heap(1);
-    let slots = (PAGE_SIZE - 12) / 9;
+    let slots = (PAGE_SIZE - TablePageRef::HEADER_SIZE) / TablePageRef::SLOT_SIZE;
     for slot in 0..slots {
         let rid = heap.insert(&Tuple { data: vec![] }).unwrap();
         assert_eq!(rid.page_id as usize, heap.first_page_id);
@@ -96,10 +100,13 @@ fn oversized_insert_and_update_leave_page_bytes_and_original_row_unchanged() {
     let rid = heap.insert(&original).unwrap();
     let before = bpm.read_page(heap.first_page_id).unwrap().data().to_vec();
     let oversized = Tuple {
-        data: vec![0xff; PAGE_SIZE - 12 - 9 + 1],
+        data: vec![0xff; TablePageRef::MAX_TUPLE_SIZE + 1],
     };
     assert!(heap.insert(&oversized).is_err());
-    assert!(heap.update(rid, &oversized).is_err());
+    assert!(
+        heap.update_in_place(rid, TupleMeta::default(), &oversized)
+            .is_err()
+    );
     assert_eq!(heap.last_page_id(), heap.first_page_id);
     assert_eq!(bpm.read_page(heap.first_page_id).unwrap().data(), before);
     assert_eq!(heap.get(rid).unwrap().1.data, original.data);
@@ -111,20 +118,25 @@ fn oversized_insert_and_update_leave_page_bytes_and_original_row_unchanged() {
 fn unavailable_frame_during_insert_or_update_preserves_existing_rows() {
     let (heap, bpm, _dir) = make_heap(1);
     let original = Tuple {
-        data: vec![7; PAGE_SIZE - 12 - 9],
+        data: vec![7; TablePageRef::MAX_TUPLE_SIZE],
     };
     let rid = heap.insert(&original).unwrap();
     let pin_only_frame_so_heap_cannot_load_its_page = bpm.new_page().unwrap();
-    let replacement = Tuple { data: vec![8; 100] };
+    let replacement = Tuple {
+        data: vec![8; TablePageRef::MAX_TUPLE_SIZE],
+    };
     assert!(heap.insert(&replacement).is_err());
-    assert!(heap.update(rid, &replacement).is_err());
+    assert!(
+        heap.update_in_place(rid, TupleMeta::default(), &replacement)
+            .is_err()
+    );
     drop(pin_only_frame_so_heap_cannot_load_its_page);
     assert_eq!(heap.last_page_id(), heap.first_page_id);
     assert_eq!(heap.get(rid).unwrap().1.data, original.data);
-    let (new_rid, _) = heap.update(rid, &replacement).unwrap();
-    assert!(heap.get(rid).is_err());
-    assert_eq!(heap.get(new_rid).unwrap().1.data, replacement.data);
-    assert_eq!(rows(heap.iter()), vec![(new_rid, replacement.data)]);
+    heap.update_in_place(rid, TupleMeta::default(), &replacement)
+        .unwrap();
+    assert_eq!(heap.get(rid).unwrap().1.data, replacement.data);
+    assert_eq!(rows(heap.iter()), vec![(rid, replacement.data)]);
 }
 
 #[test]
@@ -218,16 +230,20 @@ fn concurrent_inserts_and_scan_capture_are_serialized_across_page_boundaries() {
 }
 
 #[test]
-fn updating_invalid_or_deleted_rid_does_not_append_a_replacement() {
+fn updating_invalid_rid_does_not_append_a_replacement() {
     let (heap, _bpm, _dir) = make_heap(1);
     let tuple = Tuple { data: vec![1] };
     let rid = heap.insert(&tuple).unwrap();
     assert!(
-        heap.update(RecordId { slot_id: 10, ..rid }, &tuple)
-            .is_err()
+        heap.update_in_place(
+            RecordId { slot_id: 10, ..rid },
+            TupleMeta::default(),
+            &tuple
+        )
+        .is_err()
     );
     assert_eq!(rows(heap.iter()).len(), 1);
     heap.delete(&rid).unwrap();
-    assert!(heap.update(rid, &tuple).is_err());
+    assert!(heap.delete(&rid).is_err());
     assert!(rows(heap.iter()).is_empty());
 }

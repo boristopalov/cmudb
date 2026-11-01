@@ -1,10 +1,12 @@
 use crate::buffer_pool::BufferPoolManager;
-use crate::catalog::index_schema::{IndexValue, TableIndex};
+use crate::catalog::index_schema::{TableIndex, TableIndexIter};
 use crate::catalog::{
     Catalog, CatalogError, DataType, IndexInfo, IndexType, Schema, TableInfo, Value,
 };
+use crate::concurrency::mvcc::{self, MvccError};
+use crate::concurrency::{Transaction, TransactionManager};
 use crate::disk::PAGE_SIZE;
-use crate::index::{IndexError, IndexIter, InsertError};
+use crate::index::IndexError;
 use crate::processor::plan::{
     AggType, AggregationPlanNode, Arithmetic, CreateIndexPlanNode, CreateTablePlanNode,
     DeletePlanNode, DropIndexPlanNode, DropTablePlanNode, Expression, ExternalMergeSortPlanNode,
@@ -38,6 +40,40 @@ impl From<TableHeapError> for ExecutorError {
 impl From<IndexError> for ExecutorError {
     fn from(e: IndexError) -> Self {
         ExecutorError(format!("index error: {:?}", e))
+    }
+}
+
+impl From<MvccError> for ExecutorError {
+    fn from(e: MvccError) -> Self {
+        ExecutorError(e.to_string())
+    }
+}
+
+/// Everything an executor tree needs beyond its plan: the catalog, the buffer pool (for
+/// spill files) and the transaction it runs in.
+///
+/// Executors only read and write; finishing the transaction is up to whoever created the
+/// context. If any write fails the transaction is tainted and can only be aborted.
+pub struct ExecutorContext<'a> {
+    pub catalog: &'a Catalog,
+    pub bpm: Arc<BufferPoolManager>,
+    pub txn: Arc<Transaction>,
+    pub txn_mgr: Arc<TransactionManager>,
+}
+
+impl<'a> ExecutorContext<'a> {
+    pub fn new(
+        catalog: &'a Catalog,
+        bpm: Arc<BufferPoolManager>,
+        txn: Arc<Transaction>,
+        txn_mgr: Arc<TransactionManager>,
+    ) -> Self {
+        Self {
+            catalog,
+            bpm,
+            txn,
+            txn_mgr,
+        }
     }
 }
 
@@ -219,16 +255,16 @@ fn eval_key(
 }
 
 pub struct SeqScanExecutor<'a> {
-    catalog: &'a Catalog,
+    ctx: &'a ExecutorContext<'a>,
     plan: &'a SeqScanPlanNode,
     batch_size: usize,
     iter: Option<TableHeapIterator>,
 }
 
 impl<'a> SeqScanExecutor<'a> {
-    pub fn new(catalog: &'a Catalog, plan: &'a SeqScanPlanNode, batch_size: usize) -> Self {
+    pub fn new(ctx: &'a ExecutorContext<'a>, plan: &'a SeqScanPlanNode, batch_size: usize) -> Self {
         Self {
-            catalog,
+            ctx,
             plan,
             batch_size,
             iter: None,
@@ -238,17 +274,32 @@ impl<'a> SeqScanExecutor<'a> {
 
 impl<'a> Executor for SeqScanExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
-        let table = self.catalog.get_table(self.plan.table_oid)?;
+        let table = self.ctx.catalog.get_table(self.plan.table_oid)?;
         self.iter = Some(table.heap.iter());
         Ok(())
     }
 
+    /// Emits the version of each tuple that this transaction's snapshot sees. The scan's end
+    /// is fixed when it opens, so rows the transaction inserts while scanning (e.g.
+    /// `INSERT INTO t SELECT * FROM t`) are not fed back into it.
     fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
         let iter = self
             .iter
             .as_mut()
             .ok_or_else(|| not_opened("SeqScanExecutor"))?;
-        fill_batch(iter, self.batch_size)
+        let (txn, txn_mgr) = (&*self.ctx.txn, &*self.ctx.txn_mgr);
+        let mut rows = Vec::with_capacity(self.batch_size);
+        while rows.len() < self.batch_size {
+            let next = iter.next_with(|rid, meta, bytes| {
+                mvcc::visible_version(txn, txn_mgr, rid, meta, bytes)
+                    .map(|data| (Tuple { data }, rid))
+            });
+            match next {
+                Some(row) => rows.push(row?),
+                None => break,
+            }
+        }
+        Ok(Batch::from_rows(rows))
     }
 
     fn schema(&self) -> &Schema {
@@ -261,7 +312,7 @@ impl<'a> Executor for SeqScanExecutor<'a> {
 }
 
 pub struct InsertExecutor<'a> {
-    catalog: &'a Catalog,
+    ctx: &'a ExecutorContext<'a>,
     plan: &'a InsertPlanNode,
     child: Box<dyn Executor + 'a>,
     table: Option<Arc<TableInfo>>,
@@ -270,12 +321,12 @@ pub struct InsertExecutor<'a> {
 
 impl<'a> InsertExecutor<'a> {
     pub fn new(
-        catalog: &'a Catalog,
+        ctx: &'a ExecutorContext<'a>,
         plan: &'a InsertPlanNode,
         child: Box<dyn Executor + 'a>,
     ) -> Self {
         Self {
-            catalog,
+            ctx,
             plan,
             child,
             table: None,
@@ -287,7 +338,7 @@ impl<'a> InsertExecutor<'a> {
 impl<'a> Executor for InsertExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
         self.child.open()?;
-        let table = self.catalog.get_table(self.plan.table_oid)?;
+        let table = self.ctx.catalog.get_table(self.plan.table_oid)?;
         self.table = Some(table);
         Ok(())
     }
@@ -302,15 +353,11 @@ impl<'a> Executor for InsertExecutor<'a> {
             .as_ref()
             .ok_or_else(|| not_opened("InsertExecutor"))?;
 
-        let indexes = self.catalog.get_table_indexes(self.plan.table_oid)?;
+        let indexes = self.ctx.catalog.get_table_indexes(self.plan.table_oid)?;
         let mut count: i32 = 0;
         while let Some(batch) = self.child.next_batch()? {
             for (tuple, _) in batch {
-                reject_duplicate_keys(&indexes, None, &tuple)?;
-                let rid = table.heap.insert(&tuple)?;
-                for idx in &indexes {
-                    idx.index.insert(&tuple, rid)?;
-                }
+                mvcc::insert_tuple(&self.ctx.txn, &table.heap, &indexes, &tuple)?;
                 count += 1;
             }
         }
@@ -326,21 +373,6 @@ impl<'a> Executor for InsertExecutor<'a> {
     fn close(&mut self) -> Result<(), ExecutorError> {
         Ok(())
     }
-}
-
-/// Fails with `DuplicateKey` before anything is written when `new` would collide with another
-/// row in any of `indexes`, so a rejected row leaves the table and every index as they were.
-fn reject_duplicate_keys(
-    indexes: &[Arc<IndexInfo>],
-    old: Option<&Tuple>,
-    new: &Tuple,
-) -> Result<(), ExecutorError> {
-    for idx in indexes {
-        if idx.index.conflicts(old, new)? {
-            return Err(IndexError::Insert(InsertError::DuplicateKey).into());
-        }
-    }
-    Ok(())
 }
 
 /// The single row `InsertExecutor` yields: the inserted-row count as raw native-endian
@@ -401,7 +433,7 @@ impl<'a> Executor for ValuesExecutor<'a> {
 }
 
 pub struct UpdateExecutor<'a> {
-    catalog: &'a Catalog,
+    ctx: &'a ExecutorContext<'a>,
     plan: &'a UpdatePlanNode,
     child: Box<dyn Executor + 'a>,
     table: Option<Arc<TableInfo>>,
@@ -409,12 +441,12 @@ pub struct UpdateExecutor<'a> {
 
 impl<'a> UpdateExecutor<'a> {
     pub fn new(
-        catalog: &'a Catalog,
+        ctx: &'a ExecutorContext<'a>,
         plan: &'a UpdatePlanNode,
         child: Box<dyn Executor + 'a>,
     ) -> Self {
         Self {
-            catalog,
+            ctx,
             plan,
             child,
             table: None,
@@ -425,14 +457,13 @@ impl<'a> UpdateExecutor<'a> {
 impl<'a> Executor for UpdateExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
         self.child.open()?;
-        let table = self.catalog.get_table(self.plan.table_oid)?;
+        let table = self.ctx.catalog.get_table(self.plan.table_oid)?;
         self.table = Some(table);
         Ok(())
     }
 
-    /// Updates every row of the next child batch and returns the updated rows. The child scan
-    /// stops at the heap's tail as of `open`, so the replacement rows `heap.update` appends
-    /// are not fed back into this executor.
+    /// Updates every row of the next child batch in place and returns the updated rows.
+    /// Each row keeps its record id, and the version it replaces moves to the undo chain.
     fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
         let table = self
             .table
@@ -444,7 +475,7 @@ impl<'a> Executor for UpdateExecutor<'a> {
         };
 
         let schema = &self.plan.schema;
-        let indexes = self.catalog.get_table_indexes(self.plan.table_oid)?;
+        let indexes = self.ctx.catalog.get_table_indexes(self.plan.table_oid)?;
         let mut out = Vec::with_capacity(batch.len());
         for (tuple_to_update, rid) in batch {
             let mut new_values = row_values(schema, &tuple_to_update)?;
@@ -454,14 +485,16 @@ impl<'a> Executor for UpdateExecutor<'a> {
             }
 
             let new_tuple = schema.encode_tuple(new_values.as_ref())?;
-            reject_duplicate_keys(&indexes, Some(&tuple_to_update), &new_tuple)?;
-            let (new_rid, _) = table.heap.update(rid, &new_tuple)?;
-
-            for idx in &indexes {
-                idx.index.remove(&tuple_to_update)?;
-                idx.index.insert(&new_tuple, new_rid)?;
-            }
-            out.push((new_tuple, new_rid));
+            mvcc::update_tuple(
+                &self.ctx.txn,
+                &self.ctx.txn_mgr,
+                &table.heap,
+                &indexes,
+                rid,
+                &tuple_to_update,
+                &new_tuple,
+            )?;
+            out.push((new_tuple, rid));
         }
         Ok(Batch::from_rows(out))
     }
@@ -476,7 +509,7 @@ impl<'a> Executor for UpdateExecutor<'a> {
 }
 
 pub struct DeleteExecutor<'a> {
-    catalog: &'a Catalog,
+    ctx: &'a ExecutorContext<'a>,
     plan: &'a DeletePlanNode,
     child: Box<dyn Executor + 'a>,
     table: Option<Arc<TableInfo>>,
@@ -484,12 +517,12 @@ pub struct DeleteExecutor<'a> {
 
 impl<'a> DeleteExecutor<'a> {
     pub fn new(
-        catalog: &'a Catalog,
+        ctx: &'a ExecutorContext<'a>,
         plan: &'a DeletePlanNode,
         child: Box<dyn Executor + 'a>,
     ) -> Self {
         Self {
-            catalog,
+            ctx,
             plan,
             child,
             table: None,
@@ -500,7 +533,7 @@ impl<'a> DeleteExecutor<'a> {
 impl<'a> Executor for DeleteExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
         self.child.open()?;
-        let table = self.catalog.get_table(self.plan.table_oid)?;
+        let table = self.ctx.catalog.get_table(self.plan.table_oid)?;
         self.table = Some(table);
         Ok(())
     }
@@ -516,12 +549,8 @@ impl<'a> Executor for DeleteExecutor<'a> {
             return Ok(None);
         };
 
-        let indexes = self.catalog.get_table_indexes(self.plan.table_oid)?;
-        for (tup, rid) in batch.iter() {
-            table.heap.delete(rid)?;
-            for idx in &indexes {
-                idx.index.remove(tup)?;
-            }
+        for (_, rid) in batch.iter() {
+            mvcc::delete_tuple(&self.ctx.txn, &self.ctx.txn_mgr, &table.heap, *rid)?;
         }
         Ok(Some(batch))
     }
@@ -536,20 +565,26 @@ impl<'a> Executor for DeleteExecutor<'a> {
 }
 
 pub struct IndexScanExecutor<'a> {
-    catalog: &'a Catalog,
+    ctx: &'a ExecutorContext<'a>,
     plan: &'a IndexScanPlanNode,
     batch_size: usize,
     table: Option<Arc<TableInfo>>,
-    iter: Option<IndexIter>,
+    index: Option<Arc<IndexInfo>>,
+    iter: Option<TableIndexIter>,
 }
 
 impl<'a> IndexScanExecutor<'a> {
-    pub fn new(catalog: &'a Catalog, plan: &'a IndexScanPlanNode, batch_size: usize) -> Self {
+    pub fn new(
+        ctx: &'a ExecutorContext<'a>,
+        plan: &'a IndexScanPlanNode,
+        batch_size: usize,
+    ) -> Self {
         Self {
-            catalog,
+            ctx,
             plan,
             batch_size,
             table: None,
+            index: None,
             iter: None,
         }
     }
@@ -557,18 +592,21 @@ impl<'a> IndexScanExecutor<'a> {
 
 impl<'a> Executor for IndexScanExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
-        let info = self.catalog.get_index(self.plan.index_oid)?;
+        let info = self.ctx.catalog.get_index(self.plan.index_oid)?;
         let iter = info.as_ref().index.scan(
             self.plan.start.as_ref().map(Vec::as_slice),
             self.plan.end.as_ref().map(Vec::as_slice),
         )?;
         self.iter = Some(iter);
 
-        let table = self.catalog.get_table(info.as_ref().table_oid)?;
+        let table = self.ctx.catalog.get_table(info.as_ref().table_oid)?;
         self.table = Some(table);
+        self.index = Some(info);
 
         Ok(())
     }
+    /// Index entries can be stale, so a row is emitted only if the version this transaction
+    /// sees still has the key it was found under.
     fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
         let iter = self
             .iter
@@ -579,14 +617,26 @@ impl<'a> Executor for IndexScanExecutor<'a> {
             .as_ref()
             .ok_or_else(|| not_opened("IndexScanExecutor"))?;
 
+        let index = self.index.as_ref().ok_or_else(|| {
+            ExecutorError("IndexScanExecutor::next_batch called before open".to_string())
+        })?;
+
         let mut rows = Vec::with_capacity(self.batch_size);
         while rows.len() < self.batch_size {
             let Some(item) = iter.next() else {
                 break;
             };
-            let (_key, IndexValue::IndexValue(rid)) = item?;
-            let (rid, tuple) = table.heap.get(rid)?;
-            rows.push((tuple, rid));
+            let (key, rid) = item?;
+            if let Some(tuple) = mvcc::read_visible_through_index(
+                &self.ctx.txn,
+                &self.ctx.txn_mgr,
+                &table.heap,
+                &index.index,
+                &key,
+                rid,
+            )? {
+                rows.push((tuple, rid));
+            }
         }
         Ok(Batch::from_rows(rows))
     }
@@ -892,7 +942,7 @@ impl<'a> Executor for NestedLoopJoinExecutor<'a> {
 }
 
 pub struct NestedIndexJoinExecutor<'a> {
-    catalog: &'a Catalog,
+    ctx: &'a ExecutorContext<'a>,
     plan: &'a NestedIndexJoinPlanNode,
     child: Box<dyn Executor + 'a>,
     batch_size: usize,
@@ -900,20 +950,20 @@ pub struct NestedIndexJoinExecutor<'a> {
 
     index: Option<Arc<IndexInfo>>,
     outer: OuterRows,
-    inner_matches: Option<IndexIter>,
+    inner_matches: Option<TableIndexIter>,
     curr_left: Option<Tuple>,
     left_matched: bool,
 }
 
 impl<'a> NestedIndexJoinExecutor<'a> {
     pub fn new(
-        catalog: &'a Catalog,
+        ctx: &'a ExecutorContext<'a>,
         plan: &'a NestedIndexJoinPlanNode,
         child: Box<dyn Executor + 'a>,
         batch_size: usize,
     ) -> Self {
         Self {
-            catalog,
+            ctx,
             plan,
             child,
             batch_size,
@@ -930,10 +980,10 @@ impl<'a> NestedIndexJoinExecutor<'a> {
 impl<'a> Executor for NestedIndexJoinExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
         self.child.open()?;
-        let info = self.catalog.get_index(self.plan.index_oid)?;
+        let info = self.ctx.catalog.get_index(self.plan.index_oid)?;
         self.index = Some(info);
 
-        let table = self.catalog.get_table(self.plan.table_oid)?;
+        let table = self.ctx.catalog.get_table(self.plan.table_oid)?;
         self.inner_table = Some(table);
         Ok(())
     }
@@ -975,8 +1025,18 @@ impl<'a> Executor for NestedIndexJoinExecutor<'a> {
                 let Some(entry) = matches.next() else {
                     break;
                 };
-                let (_, IndexValue::IndexValue(rid)) = entry?;
-                let (_, inner_tuple) = table.heap.get(rid)?;
+                let (key, rid) = entry?;
+                let Some(inner_tuple) = mvcc::read_visible_through_index(
+                    &self.ctx.txn,
+                    &self.ctx.txn_mgr,
+                    &table.heap,
+                    &index.index,
+                    &key,
+                    rid,
+                )?
+                else {
+                    continue;
+                };
                 let row = joined_row(child_schema, outer, &table.schema, Some(&inner_tuple))?;
                 out.push((self.plan.schema.encode_tuple(&row)?, RecordId::RESERVED));
                 self.left_matched = true;
@@ -1002,8 +1062,9 @@ impl<'a> Executor for NestedIndexJoinExecutor<'a> {
     }
 }
 
-/// Every index entry whose key equals `key`.
-fn entries_with_key(index: &TableIndex, key: Value) -> Result<IndexIter, IndexError> {
+/// Every index entry whose key equals `key`. Entries can be stale, so callers re-check each
+/// one against the version they see.
+fn entries_with_key(index: &TableIndex, key: Value) -> Result<TableIndexIter, IndexError> {
     let probe = [key];
     index.scan(Bound::Included(&probe[..]), Bound::Included(&probe[..]))
 }

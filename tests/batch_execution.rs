@@ -8,8 +8,10 @@
 
 use cmudb::buffer_pool::BufferPoolManager;
 use cmudb::catalog::{Catalog, DataType, IndexType, Schema, Value};
+use cmudb::concurrency::{IsolationLevel, TransactionManager};
 use cmudb::create_buffer_pool_manager;
 use cmudb::disk::{DiskManager, DiskScheduler};
+use cmudb::processor::executor::ExecutorContext;
 use cmudb::processor::executor::RowCursor;
 use cmudb::processor::executor_factory::create_executor_with_batch_size;
 use cmudb::processor::plan::{
@@ -41,9 +43,26 @@ const S_ROWS: i32 = 40;
 
 type Rows = Vec<Vec<Option<Value>>>;
 
+impl Env {
+    /// A context running in a fresh transaction; commit it with [`Env::commit`].
+    fn ctx(&self) -> ExecutorContext<'_> {
+        ExecutorContext::new(
+            &self.catalog,
+            self.bpm.clone(),
+            self.txn_mgr.begin(IsolationLevel::SnapshotIsolation),
+            self.txn_mgr.clone(),
+        )
+    }
+
+    fn commit(&self, ctx: &ExecutorContext<'_>) {
+        self.txn_mgr.commit(&ctx.txn).expect("commit");
+    }
+}
+
 struct Env {
     catalog: Catalog,
     bpm: Arc<BufferPoolManager>,
+    txn_mgr: Arc<TransactionManager>,
     l_oid: u32,
     r_oid: u32,
     s_oid: u32,
@@ -171,6 +190,7 @@ fn setup() -> Env {
 
     let env = Env {
         catalog,
+        txn_mgr: Arc::new(TransactionManager::new(bpm.clone())),
         bpm,
         l_oid,
         r_oid,
@@ -188,13 +208,16 @@ fn setup() -> Env {
             child: Box::new(values_plan(schema, &rows)),
             table_oid: oid,
         });
-        let mut exec = create_executor_with_batch_size(&env.catalog, &env.bpm, &plan, 3);
+        let ctx = env.ctx();
+        let mut exec = create_executor_with_batch_size(&ctx, &plan, 3);
         exec.open().expect("open insert");
         let batch = exec.next_batch().expect("insert").expect("count row");
         assert_eq!(batch.len(), 1);
         let count = i32::from_ne_bytes(batch.rows[0].0.data.as_slice().try_into().unwrap());
         assert_eq!(count, rows.len() as i32);
         assert!(exec.next_batch().expect("insert after end").is_none());
+        drop(exec);
+        env.commit(&ctx);
     }
     env
 }
@@ -202,7 +225,8 @@ fn setup() -> Env {
 /// Runs `plan` with the given batch size, checking the batch contract along the way, and
 /// returns the decoded rows in the order they were produced.
 fn run(env: &Env, plan: &Plan, batch_size: usize) -> Rows {
-    let mut exec = create_executor_with_batch_size(&env.catalog, &env.bpm, plan, batch_size);
+    let ctx = env.ctx();
+    let mut exec = create_executor_with_batch_size(&ctx, plan, batch_size);
     exec.open().expect("open");
     let schema = exec.schema().clone();
     let mut rows = Vec::new();
@@ -224,6 +248,8 @@ fn run(env: &Env, plan: &Plan, batch_size: usize) -> Rows {
         );
     }
     exec.close().expect("close");
+    drop(exec);
+    env.commit(&ctx);
     rows
 }
 
@@ -532,7 +558,8 @@ fn row_cursor_reads_rows_one_at_a_time() {
     let env = setup();
     let plan = scan(env.l_oid, l_schema());
     for bs in BATCH_SIZES {
-        let mut exec = create_executor_with_batch_size(&env.catalog, &env.bpm, &plan, bs);
+        let ctx = env.ctx();
+        let mut exec = create_executor_with_batch_size(&ctx, &plan, bs);
         exec.open().unwrap();
         let schema = exec.schema().clone();
         let mut cursor = RowCursor::new(&mut *exec);

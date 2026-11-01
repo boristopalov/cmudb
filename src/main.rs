@@ -3,15 +3,17 @@ use std::path::Path;
 use std::sync::Arc;
 
 use cmudb::catalog::{Catalog, Schema, Value};
+use cmudb::concurrency::{IsolationLevel, Transaction, TransactionManager};
 use cmudb::create_buffer_pool_manager;
 use cmudb::disk::{DiskManager, DiskScheduler};
 use cmudb::parser::Binder;
 use cmudb::planner::Planner;
-use cmudb::processor::executor::{Executor, RowCursor};
+use cmudb::processor::executor::{Executor, ExecutorContext, RowCursor};
 use cmudb::processor::executor_factory::create_executor;
 use cmudb::processor::plan::Plan;
 use cmudb::replacer::ArcReplacer;
 
+use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use tempfile::tempdir;
@@ -30,6 +32,12 @@ fn run_shell(db_dir: &Path) {
     let replacer = ArcReplacer::new(NUM_FRAMES);
     let bpm = Arc::new(create_buffer_pool_manager(NUM_FRAMES, replacer, scheduler));
     let catalog = Catalog::new(bpm.clone());
+    let mut session = Session {
+        catalog: &catalog,
+        bpm: bpm.clone(),
+        txn_mgr: Arc::new(TransactionManager::new(bpm.clone())),
+        txn: None,
+    };
 
     let dialect = GenericDialect {};
     let stdin = io::stdin();
@@ -64,7 +72,7 @@ fn run_shell(db_dir: &Path) {
 
         if buf.trim_end().ends_with(';') {
             let sql = std::mem::take(&mut buf);
-            if let Err(e) = run(&dialect, &catalog, &bpm, &sql) {
+            if let Err(e) = session.run(&dialect, &sql) {
                 eprintln!("error: {e}");
             }
             prompt(&mut stdout, false);
@@ -80,27 +88,120 @@ fn prompt(out: &mut io::Stdout, continuation: bool) {
     let _ = out.flush();
 }
 
-fn run(
-    dialect: &GenericDialect,
-    catalog: &Catalog,
-    bpm: &Arc<cmudb::buffer_pool::BufferPoolManager>,
-    sql: &str,
-) -> Result<(), String> {
-    let ast = Parser::parse_sql(dialect, sql).map_err(|e| format!("parse: {e}"))?;
-    let binder = Binder::new(catalog);
-    let planner = Planner::new(catalog);
+/// A REPL session. Statements run in the explicit transaction opened by `BEGIN` if there is
+/// one, and otherwise each in a transaction of its own (autocommit).
+struct Session<'a> {
+    catalog: &'a Catalog,
+    bpm: Arc<cmudb::buffer_pool::BufferPoolManager>,
+    txn_mgr: Arc<TransactionManager>,
+    txn: Option<ExplicitTxn>,
+}
 
-    for stmt in &ast {
-        let bound = binder
+/// The transaction opened by `BEGIN`.
+enum ExplicitTxn {
+    Open(Arc<Transaction>),
+    /// A statement failed. Its writes are already rolled back. As in Postgres, every later
+    /// statement is refused until the user ends the block with `ROLLBACK` (or `COMMIT`, which
+    /// rolls back too), so a partial transaction cannot pass for a whole one.
+    Failed,
+}
+
+impl Session<'_> {
+    /// Runs every statement in `sql`. A failed statement aborts its whole transaction right
+    /// away, releasing its rows and its snapshot, since there is no statement-level rollback.
+    fn run(&mut self, dialect: &GenericDialect, sql: &str) -> Result<(), String> {
+        let ast = Parser::parse_sql(dialect, sql).map_err(|e| format!("parse: {e}"))?;
+        for stmt in ast {
+            match stmt {
+                Statement::StartTransaction { .. } => {
+                    if self.txn.is_some() {
+                        return Err("a transaction is already in progress".to_string());
+                    }
+                    self.txn = Some(ExplicitTxn::Open(
+                        self.txn_mgr.begin(IsolationLevel::SnapshotIsolation),
+                    ));
+                    println!("BEGIN");
+                }
+                Statement::Commit { .. } => match self.txn.take() {
+                    Some(ExplicitTxn::Open(txn)) => {
+                        self.finish(&txn, true)?;
+                        println!("COMMIT");
+                    }
+                    Some(ExplicitTxn::Failed) => println!("ROLLBACK"),
+                    None => return Err("no transaction in progress".to_string()),
+                },
+                Statement::Rollback { .. } => match self.txn.take() {
+                    Some(ExplicitTxn::Open(txn)) => {
+                        self.finish(&txn, false)?;
+                        println!("ROLLBACK");
+                    }
+                    Some(ExplicitTxn::Failed) => println!("ROLLBACK"),
+                    None => return Err("no transaction in progress".to_string()),
+                },
+                stmt => {
+                    let (txn, autocommit) = match &self.txn {
+                        Some(ExplicitTxn::Open(txn)) => (txn.clone(), false),
+                        Some(ExplicitTxn::Failed) => {
+                            return Err("current transaction is aborted, statements are \
+                                        ignored until ROLLBACK"
+                                .to_string());
+                        }
+                        None => (self.txn_mgr.begin(IsolationLevel::SnapshotIsolation), true),
+                    };
+                    match self.run_statement(&txn, &stmt) {
+                        Ok(()) if autocommit => self.finish(&txn, true)?,
+                        Ok(()) => {}
+                        Err(e) => {
+                            self.finish(&txn, false)?;
+                            if autocommit {
+                                return Err(format!("{e} (rolled back)"));
+                            }
+                            self.txn = Some(ExplicitTxn::Failed);
+                            return Err(format!("{e} (transaction aborted; ROLLBACK to end it)"));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn run_statement(&self, txn: &Arc<Transaction>, stmt: &Statement) -> Result<(), String> {
+        let bound = Binder::new(self.catalog)
             .bind_statement(stmt)
             .map_err(|e| format!("bind: {}", e.0))?;
-        let plan = planner.plan(bound).map_err(|e| format!("plan: {}", e.0))?;
-        let mut exec = create_executor(catalog, bpm, &plan);
+        let plan = Planner::new(self.catalog)
+            .plan(bound)
+            .map_err(|e| format!("plan: {}", e.0))?;
+        let ctx = ExecutorContext::new(
+            self.catalog,
+            self.bpm.clone(),
+            txn.clone(),
+            self.txn_mgr.clone(),
+        );
+        let mut exec = create_executor(&ctx, &plan);
         exec.open().map_err(|e| format!("open: {}", e.0))?;
         execute(&plan, &mut *exec)?;
         exec.close().map_err(|e| format!("close: {}", e.0))?;
+        Ok(())
     }
-    Ok(())
+
+    /// Commits or aborts `txn`, then collects garbage. The outcome is settled before
+    /// collection runs, so a collection failure is only a warning.
+    fn finish(&self, txn: &Transaction, commit: bool) -> Result<(), String> {
+        if commit {
+            if let Err(e) = self.txn_mgr.commit(txn) {
+                self.txn_mgr.abort(txn).map_err(|e| format!("abort: {e}"))?;
+                return Err(format!("commit: {e} (transaction rolled back)"));
+            }
+        } else {
+            self.txn_mgr.abort(txn).map_err(|e| format!("abort: {e}"))?;
+        }
+        if let Err(e) = self.txn_mgr.garbage_collect() {
+            eprintln!("warning: garbage collection failed: {e}");
+        }
+        Ok(())
+    }
 }
 
 fn execute(plan: &Plan, exec: &mut dyn Executor) -> Result<(), String> {
@@ -239,11 +340,15 @@ mod tests {
             DiskScheduler::new(dm),
         ));
         let catalog = Catalog::new(bpm.clone());
+        let mut session = Session {
+            catalog: &catalog,
+            bpm: bpm.clone(),
+            txn_mgr: Arc::new(TransactionManager::new(bpm.clone())),
+            txn: None,
+        };
 
-        let result = run(
+        let result = session.run(
             &GenericDialect {},
-            &catalog,
-            &bpm,
             "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1); SELECT * FROM t;",
         );
 

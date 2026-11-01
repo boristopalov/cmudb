@@ -1,50 +1,44 @@
-use crate::buffer_pool::BufferPoolManager;
-use crate::catalog::Catalog;
 use crate::processor::executor::{
     AggregationExecutor, CreateIndexExecutor, CreateTableExecutor, DEFAULT_BATCH_SIZE,
-    DeleteExecutor, DropIndexExecutor, DropTableExecutor, Executor, ExternalMergeSortExecutor,
-    FilterExecutor, HashJoinExecutor, IndexScanExecutor, InsertExecutor, LimitExecutor,
-    NestedIndexJoinExecutor, NestedLoopJoinExecutor, ProjectionExecutor, SeqScanExecutor,
-    SortExecutor, UpdateExecutor, ValuesExecutor, WindowFunctionExecutor,
+    DeleteExecutor, DropIndexExecutor, DropTableExecutor, Executor, ExecutorContext,
+    ExternalMergeSortExecutor, FilterExecutor, HashJoinExecutor, IndexScanExecutor, InsertExecutor,
+    LimitExecutor, NestedIndexJoinExecutor, NestedLoopJoinExecutor, ProjectionExecutor,
+    SeqScanExecutor, SortExecutor, UpdateExecutor, ValuesExecutor, WindowFunctionExecutor,
 };
 use crate::processor::plan::Plan;
-use std::sync::Arc;
 
 /// Builds the executor tree for `plan`, exchanging batches of up to [`DEFAULT_BATCH_SIZE`] rows.
-pub fn create_executor<'a>(
-    catalog: &'a Catalog,
-    bpm: &Arc<BufferPoolManager>,
-    plan: &'a Plan,
-) -> Box<dyn Executor + 'a> {
-    create_executor_with_batch_size(catalog, bpm, plan, DEFAULT_BATCH_SIZE)
+pub fn create_executor<'a>(ctx: &'a ExecutorContext<'a>, plan: &'a Plan) -> Box<dyn Executor + 'a> {
+    create_executor_with_batch_size(ctx, plan, DEFAULT_BATCH_SIZE)
 }
 
 /// Builds the executor tree for `plan`, with every row-producing executor in the tree
 /// targeting `batch_size` rows per batch.
 pub fn create_executor_with_batch_size<'a>(
-    catalog: &'a Catalog,
-    bpm: &Arc<BufferPoolManager>,
+    ctx: &'a ExecutorContext<'a>,
     plan: &'a Plan,
     batch_size: usize,
 ) -> Box<dyn Executor + 'a> {
     assert!(batch_size > 0, "batch size must be at least 1");
-    let build = |child: &'a Plan| create_executor_with_batch_size(catalog, bpm, child, batch_size);
+    let catalog = ctx.catalog;
+    let bpm = &ctx.bpm;
+    let build = |child: &'a Plan| create_executor_with_batch_size(ctx, child, batch_size);
     match plan {
-        Plan::SeqScan(p) => Box::new(SeqScanExecutor::new(catalog, p, batch_size)),
+        Plan::SeqScan(p) => Box::new(SeqScanExecutor::new(ctx, p, batch_size)),
         Plan::Insert(p) => {
             let child = build(&p.child);
-            Box::new(InsertExecutor::new(catalog, p, child))
+            Box::new(InsertExecutor::new(ctx, p, child))
         }
         Plan::Values(p) => Box::new(ValuesExecutor::new(p, batch_size)),
         Plan::Update(p) => {
             let child = build(&p.child);
-            Box::new(UpdateExecutor::new(catalog, p, child))
+            Box::new(UpdateExecutor::new(ctx, p, child))
         }
         Plan::Delete(p) => {
             let child = build(&p.child);
-            Box::new(DeleteExecutor::new(catalog, p, child))
+            Box::new(DeleteExecutor::new(ctx, p, child))
         }
-        Plan::IndexScan(p) => Box::new(IndexScanExecutor::new(catalog, p, batch_size)),
+        Plan::IndexScan(p) => Box::new(IndexScanExecutor::new(ctx, p, batch_size)),
         Plan::Aggregation(p) => {
             let child = build(&p.child);
             Box::new(AggregationExecutor::new(p, child, batch_size))
@@ -56,7 +50,7 @@ pub fn create_executor_with_batch_size<'a>(
         }
         Plan::NestedIndexJoin(p) => {
             let child = build(&p.child);
-            Box::new(NestedIndexJoinExecutor::new(catalog, p, child, batch_size))
+            Box::new(NestedIndexJoinExecutor::new(ctx, p, child, batch_size))
         }
         Plan::HashJoin(p) => {
             let left = build(&p.left);
@@ -108,9 +102,12 @@ pub fn create_executor_with_batch_size<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer_pool::BufferPoolManager;
     use crate::catalog::{Catalog, DataType, Schema, Value};
+    use crate::concurrency::{IsolationLevel, TransactionManager};
     use crate::create_buffer_pool_manager;
     use crate::disk::{DiskManager, DiskScheduler};
+    use crate::processor::executor::ExecutorContext;
     use crate::processor::executor::collect_rows;
     use crate::processor::plan::{Expression, InsertPlanNode, SeqScanPlanNode, ValuesPlanNode};
     use crate::replacer::ArcReplacer;
@@ -162,7 +159,14 @@ mod tests {
             table_oid,
         });
 
-        let mut insert_exec = create_executor(&catalog, &bpm, &insert_plan);
+        let txn_mgr = Arc::new(TransactionManager::new(bpm.clone()));
+        let ctx = ExecutorContext::new(
+            &catalog,
+            bpm.clone(),
+            txn_mgr.begin(IsolationLevel::SnapshotIsolation),
+            txn_mgr.clone(),
+        );
+        let mut insert_exec = create_executor(&ctx, &insert_plan);
         insert_exec.open().expect("open insert");
         let batch = insert_exec
             .next_batch()
@@ -173,12 +177,19 @@ mod tests {
         let count = i32::from_ne_bytes(count_tuple.data.as_slice().try_into().unwrap());
         assert_eq!(count, 3, "insert should report 3 rows");
         drop(insert_exec);
+        txn_mgr.commit(&ctx.txn).expect("commit insert");
 
         let scan_plan = Plan::SeqScan(SeqScanPlanNode {
             table_oid,
             schema: make_schema(),
         });
-        let mut scan_exec = create_executor(&catalog, &bpm, &scan_plan);
+        let ctx = ExecutorContext::new(
+            &catalog,
+            bpm.clone(),
+            txn_mgr.begin(IsolationLevel::SnapshotIsolation),
+            txn_mgr.clone(),
+        );
+        let mut scan_exec = create_executor(&ctx, &scan_plan);
         scan_exec.open().expect("open scan");
 
         let mut got = Vec::new();
