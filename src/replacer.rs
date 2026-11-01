@@ -1,5 +1,3 @@
-use std::process::exit;
-
 use log::{error, info, warn};
 use std::collections::HashMap;
 
@@ -206,12 +204,13 @@ impl ArcReplacer {
                 return;
             }
         } else {
-            if self.mru_list.length + self.mru_ghost_list.length > self.capacity {
-                error!(
-                    "mru_list.length + mru_ghost_list.length should not be > capacity. exiting..."
-                );
-                exit(1);
-            }
+            assert!(
+                self.mru_list.length + self.mru_ghost_list.length < self.capacity,
+                "MRU list plus MRU ghost list exceeds capacity: {} + {} > {}",
+                self.mru_list.length,
+                self.mru_ghost_list.length,
+                self.capacity
+            );
             if self.mru_list.length
                 + self.mru_ghost_list.length
                 + self.mfu_list.length
@@ -439,6 +438,14 @@ mod tests {
                 .is_test(true)
                 .try_init();
         });
+    }
+
+    #[test]
+    #[should_panic(expected = "MRU list plus MRU ghost list exceeds capacity")]
+    fn oversized_mru_history_panics_instead_of_exiting_the_process() {
+        let mut arc_replacer = ArcReplacer::new(1);
+        arc_replacer.mru_ghost_list.length = 2;
+        arc_replacer.record_access(1, 1);
     }
 
     #[test]
