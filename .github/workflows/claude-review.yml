@@ -2,10 +2,16 @@ name: Claude PR review
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Number of the pull request to review
+        required: true
+        type: number
 
 concurrency:
-  group: claude-review-${{ github.event.pull_request.number }}
+  group: claude-review-${{ github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: true
 
 jobs:
@@ -16,6 +22,8 @@ jobs:
       pull-requests: write
       issues: read
       id-token: write
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
     steps:
       - name: Check for the review token
         id: token
@@ -33,6 +41,7 @@ jobs:
         if: steps.token.outputs.present == 'true'
         with:
           fetch-depth: 0
+          ref: refs/pull/${{ env.PR_NUMBER }}/head
 
       - uses: anthropics/claude-code-action@v1
         if: steps.token.outputs.present == 'true'
@@ -40,7 +49,7 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
             REPO: ${{ github.repository }}
-            PR NUMBER: ${{ github.event.pull_request.number }}
+            PR NUMBER: ${{ env.PR_NUMBER }}
 
             You are reviewing a pull request to cmudb, a Rust DBMS modeled on CMU's BusTub
             (buffer pool, disk scheduler, table heap, B+ tree index with latch crabbing,
@@ -60,9 +69,11 @@ jobs:
                tests check what their names claim.
 
             Post each finding as an inline comment on the line it concerns, with a concrete
-            failure scenario and a suggested fix. Skip style nits that fmt or clippy would catch.
-            Finish with one short top-level PR comment summarizing the findings, or saying that
-            you found none.
+            failure scenario and a suggested fix. If the inline comment tool is not available
+            (manual runs), put every finding in the summary comment instead, each with its
+            file:line. Skip style nits that fmt or clippy would catch. Finish with one short
+            top-level PR comment (`gh pr comment`) summarizing the findings, or saying that you
+            found none.
           claude_args: >-
             --max-turns 30
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob"
