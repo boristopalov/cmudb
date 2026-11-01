@@ -10,11 +10,15 @@ pub const KIND_HEADER: u8 = 0;
 pub const KIND_INTERNAL: u8 = 1;
 pub const KIND_LEAF: u8 = 2;
 
-pub const KIND_OFFSET: usize = 6;
-
 pub const U32_BYTES: usize = 4;
 pub const U64_BYTES: usize = 8;
-pub const COMMON_HEADER_BYTES: usize = 8; // MAGIC(4) + VERSION(2) + KIND(1) + RESERVED(1)
+
+const VERSION_BYTES: usize = size_of::<u16>();
+const KIND_BYTES: usize = size_of::<u8>();
+const RESERVED_BYTES: usize = size_of::<u8>();
+
+pub const KIND_OFFSET: usize = MAGIC.len() + VERSION_BYTES;
+pub const COMMON_HEADER_BYTES: usize = KIND_OFFSET + KIND_BYTES + RESERVED_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageCodecError {
@@ -78,12 +82,7 @@ pub fn decode_page_id(raw: u64) -> Result<PageId, PageCodecError> {
 }
 
 pub fn encode_record_id(rid: &RecordId) -> Result<(u64, u64), PageCodecError> {
-    Ok((
-        u64::try_from(rid.page_id)
-            .map_err(|_| PageCodecError::BufferError(BufferError::Overflow))?,
-        u64::try_from(rid.slot_id)
-            .map_err(|_| PageCodecError::BufferError(BufferError::Overflow))?,
-    ))
+    Ok((u64::from(rid.page_id), u64::from(rid.slot_id)))
 }
 
 pub fn decode_record_id(page_id: u64, slot_id: u64) -> Result<RecordId, PageCodecError> {
@@ -96,32 +95,23 @@ pub fn decode_record_id(page_id: u64, slot_id: u64) -> Result<RecordId, PageCode
 }
 
 pub fn write_common_header(w: &mut BufWriter<'_>, kind: u8) -> Result<(), PageCodecError> {
-    w.write_bytes(&MAGIC)
-        .map_err(|b| PageCodecError::BufferError(b))?;
-    w.write_u16_le(VERSION)
-        .map_err(|b| PageCodecError::BufferError(b))?;
-    w.write_u8(kind)
-        .map_err(|b| PageCodecError::BufferError(b))?;
-    w.write_u8(0).map_err(|b| PageCodecError::BufferError(b))?;
+    w.write_bytes(&MAGIC)?;
+    w.write_u16_le(VERSION)?;
+    w.write_u8(kind)?;
+    w.write_u8(0)?;
     Ok(())
 }
 
 pub fn read_common_header(r: &mut BufReader<'_>) -> Result<u8, PageCodecError> {
-    let magic = r
-        .read_bytes(4)
-        .map_err(|b| PageCodecError::BufferError(b))?;
-    if magic != MAGIC {
+    if r.read_bytes(MAGIC.len())? != MAGIC {
         return Err(PageCodecError::BadMagic);
     }
-    let version = r
-        .read_u16_le()
-        .map_err(|b| PageCodecError::BufferError(b))?;
-    // dont need this...
+    let version = r.read_u16_le()?;
     if version != VERSION {
         return Err(PageCodecError::UnsupportedVersion(version));
     }
-    let kind = r.read_u8().map_err(|b| PageCodecError::BufferError(b))?;
-    let _reserved = r.read_u8().map_err(|b| PageCodecError::BufferError(b))?;
+    let kind = r.read_u8()?;
+    let _reserved = r.read_u8()?;
     Ok(kind)
 }
 
@@ -129,6 +119,19 @@ pub fn read_common_header(r: &mut BufReader<'_>) -> Result<u8, PageCodecError> {
 mod tests {
     use super::*;
     use crate::disk::PAGE_SIZE;
+
+    #[test]
+    fn common_header_occupies_common_header_bytes() {
+        let mut buf = vec![0u8; PAGE_SIZE];
+        let mut w = BufWriter::new(&mut buf).unwrap();
+        write_common_header(&mut w, KIND_INTERNAL).unwrap();
+        assert_eq!(w.pos(), COMMON_HEADER_BYTES);
+        assert_eq!(COMMON_HEADER_BYTES, 8);
+        assert_eq!(buf[KIND_OFFSET], KIND_INTERNAL);
+        let mut r = BufReader::new(&buf).unwrap();
+        read_common_header(&mut r).unwrap();
+        assert_eq!(r.remaining(), PAGE_SIZE - COMMON_HEADER_BYTES);
+    }
 
     #[test]
     fn common_header_round_trips() {

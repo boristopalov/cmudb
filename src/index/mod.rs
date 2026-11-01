@@ -20,7 +20,6 @@ pub trait Index {
     fn scan(&self, range: (Bound<IndexKey>, Bound<IndexKey>)) -> Result<IndexIter, IndexError>;
 }
 
-// TODO: clean these up
 #[derive(Debug)]
 pub enum IndexError {
     Insert(InsertError),
