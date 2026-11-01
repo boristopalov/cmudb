@@ -764,9 +764,9 @@ impl BPlusTree {
     /// find_leaf looks for the leaf page that would contain `key`, if `key` exists in our tree.
     /// This is useful for index scans, where we use a key as a lower bound. The key does not need
     /// to exist to be used as a bound.
-    fn find_leaf(&self, key: &IndexKey) -> Result<LeafPage, IndexError> {
+    fn find_leaf(&self, key: &IndexKey) -> Result<Option<LeafPage>, IndexError> {
         let Some(root_page) = self.get_root_page_from_header()? else {
-            return Err(IndexError::Lookup);
+            return Ok(None);
         };
 
         let mut current = root_page;
@@ -786,7 +786,7 @@ impl BPlusTree {
                 }
                 Page::Leaf(leaf) => {
                     // we've arrived at a leaf!
-                    return Ok(leaf);
+                    return Ok(Some(leaf));
                 }
             }
         }
@@ -979,11 +979,10 @@ impl Index for BPlusTree {
             return Err(IndexError::Insert(InsertError::InvalidKey));
         }
 
-        let leaf = self.find_leaf(key)?;
-
-        // we've arrived at a leaf, look for the key
-        let record_id = leaf.get(key).map(IndexValue::IndexValue);
-        return Ok(record_id);
+        let Some(leaf) = self.find_leaf(key)? else {
+            return Ok(None);
+        };
+        Ok(leaf.get(key).map(IndexValue::IndexValue))
     }
 
     fn scan(&self, range: (Bound<IndexKey>, Bound<IndexKey>)) -> Result<IndexIter, IndexError> {
@@ -1002,12 +1001,16 @@ impl Index for BPlusTree {
                 (start_leaf, 0)
             }
             Bound::Excluded(key) => {
-                let leaf = self.find_leaf(key)?;
+                let Some(leaf) = self.find_leaf(key)? else {
+                    return Ok(Box::new(std::iter::empty()));
+                };
                 let start_slot = leaf.upper_bound(key);
                 (leaf, start_slot)
             }
             Bound::Included(key) => {
-                let leaf = self.find_leaf(key)?;
+                let Some(leaf) = self.find_leaf(key)? else {
+                    return Ok(Box::new(std::iter::empty()));
+                };
                 let start_slot = leaf.lower_bound(key);
                 (leaf, start_slot)
             }
@@ -1391,6 +1394,17 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn search_on_empty_tree_returns_none() {
+        let (bpm, _tmp) = make_bpm(10);
+        let key_len = 32u32;
+        let tree = BPlusTree::new("idx".to_string(), key_len, bpm).unwrap();
+        let key = make_key(1, key_len as usize);
+        assert!(tree.search(&key).unwrap().is_none());
+        let from_key = (Bound::Included(key.clone()), Bound::Unbounded);
+        assert_eq!(tree.scan(from_key).unwrap().count(), 0);
     }
 
     #[test]
