@@ -18,7 +18,7 @@ use crate::index::b_plus_page::{
     RECORD_ID_ENCODED_BYTES, TOMBSTONE_SLOT_ENCODED_BYTES,
 };
 use crate::index::page_codec::{
-    COMMON_HEADER_BYTES, KIND_HEADER, KIND_INTERNAL, KIND_LEAF, PageCodecError,
+    COMMON_HEADER_BYTES, KIND_HEADER, KIND_INTERNAL, KIND_LEAF, PageCodecError, decode_record_id,
     expect_common_header, peek_common_header, put_common_header,
 };
 use crate::table_heap::RecordId;
@@ -308,7 +308,34 @@ impl<B: AsRef<[u8]>> LeafPageView<B> {
                 ));
             }
         }
+        view.validate_entries()?;
         Ok(view)
+    }
+
+    /// Rejects the corruptions that `LeafPage::decode` rejects, so a bad page read through a
+    /// view fails with an error instead of a panic: too many entries, keys out of order,
+    /// record ids that do not fit in `u32`, and tombstones naming a slot past the end.
+    fn validate_entries(&self) -> Result<(), PageCodecError> {
+        let size = self.size() as usize;
+        if self.size() > self.max_size().saturating_add(1) {
+            return Err(PageCodecError::Malformed("leaf size exceeds max size"));
+        }
+        for idx in 0..size {
+            let off = self.entry_off(idx) + self.key_len;
+            decode_record_id(
+                get_u64_le(self.bytes(), off),
+                get_u64_le(self.bytes(), off + 8),
+            )?;
+            if idx > 0 && self.key(idx - 1) > self.key(idx) {
+                return Err(PageCodecError::Malformed("leaf keys out of order"));
+            }
+        }
+        if (0..self.tombstone_count()).any(|i| self.tombstone(i) as usize >= size) {
+            return Err(PageCodecError::Malformed(
+                "leaf tombstones index out of bounds",
+            ));
+        }
+        Ok(())
     }
 
     #[inline]
@@ -379,14 +406,14 @@ impl<B: AsRef<[u8]>> LeafPageView<B> {
         &self.bytes()[off..off + self.key_len]
     }
 
-    /// Record id of entry `idx`. Panics if `idx >= size()`.
+    /// Record id of entry `idx`. Panics if `idx >= size()`. `new` has already checked that
+    /// every stored id fits in `u32`, so the conversion below cannot truncate.
     pub fn record_id(&self, idx: usize) -> RecordId {
         assert!(idx < self.size() as usize, "leaf entry index out of bounds");
         let off = self.entry_off(idx) + self.key_len;
-        RecordId {
-            page_id: get_u64_le(self.bytes(), off) as u32,
-            slot_id: get_u64_le(self.bytes(), off + 8) as u32,
-        }
+        let page_id = get_u64_le(self.bytes(), off);
+        let slot_id = get_u64_le(self.bytes(), off + 8);
+        decode_record_id(page_id, slot_id).expect("record ids were validated in LeafPageView::new")
     }
 
     pub fn tombstone_capacity(&self) -> usize {
@@ -726,6 +753,61 @@ mod tests {
             assert_eq!(view.lower_bound(&[probe]), leaf.lower_bound(&key));
             assert_eq!(view.upper_bound(&[probe]), leaf.upper_bound(&key));
             assert_eq!(view.search(&[probe]), leaf.keys.binary_search(&key));
+        }
+    }
+
+    /// Each corruption is rejected by both the view and the owned decoder, with an error
+    /// rather than a panic.
+    #[test]
+    fn corrupt_leaf_pages_are_errors_not_panics() {
+        let key_len = 1u32;
+        let mut leaf = LeafPage::new(16, NUM_TOMBSTONES);
+        for k in [10u8, 20, 30] {
+            leaf.insert(IndexKey(vec![k]), rid(u32::from(k))).unwrap();
+        }
+        leaf.remove_key(&IndexKey(vec![20])).unwrap();
+        let good = encode_leaf(&leaf, key_len);
+        let entry_bytes = key_len as usize + RECORD_ID_ENCODED_BYTES;
+        let tomb_count_off = LEAF_FIXED_HEADER_BYTES + 3 * entry_bytes;
+        let first_rid_off = LEAF_FIXED_HEADER_BYTES + key_len as usize;
+
+        type Corruption = Box<dyn Fn(&mut [u8])>;
+        let corruptions: [(&str, Corruption); 5] = [
+            (
+                "tombstone past the last slot",
+                Box::new(move |b| put_u32_le(b, tomb_count_off + TOMBSTONE_SLOT_ENCODED_BYTES, 3)),
+            ),
+            (
+                "page id wider than u32",
+                Box::new(move |b| put_u64_le(b, first_rid_off, u64::from(u32::MAX) + 1)),
+            ),
+            (
+                "slot id wider than u32",
+                Box::new(move |b| put_u64_le(b, first_rid_off + 8, u64::from(u32::MAX) + 1)),
+            ),
+            (
+                "keys out of order",
+                Box::new(|b| b[LEAF_FIXED_HEADER_BYTES] = 99),
+            ),
+            (
+                "size above max size",
+                Box::new(|b| put_u32_le(b, NODE_MAX_SIZE_OFF, 1)),
+            ),
+        ];
+        for (what, corrupt) in corruptions {
+            let mut buf = good.clone();
+            corrupt(&mut buf[..]);
+            assert!(
+                matches!(
+                    LeafPageView::new(&buf[..], key_len),
+                    Err(PageCodecError::Malformed(_) | PageCodecError::BufferError(_))
+                ),
+                "view rejects {what}"
+            );
+            assert!(
+                LeafPage::decode(&buf[..], key_len).is_err(),
+                "decode rejects {what}"
+            );
         }
     }
 
