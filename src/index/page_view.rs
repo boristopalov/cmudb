@@ -312,6 +312,15 @@ impl<B: AsRef<[u8]>> LeafPageView<B> {
         Ok(view)
     }
 
+    /// A view over bytes that already passed `new` and have not changed since, such as a
+    /// scan's private copy of a leaf. It skips the O(entries) checks `new` repeats.
+    pub(crate) fn trusted(buf: B, key_len: u32) -> Self {
+        Self {
+            buf,
+            key_len: key_len as usize,
+        }
+    }
+
     /// Rejects the corruptions that `LeafPage::decode` rejects, so a bad page read through a
     /// view fails with an error instead of a panic: too many entries, keys out of order,
     /// record ids that do not fit in `u32`, and tombstones naming a slot past the end.
