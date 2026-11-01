@@ -7,7 +7,7 @@ mod common;
 use cmudb::parser::Binder;
 use cmudb::planner::Planner;
 use cmudb::processor::plan::Plan;
-use common::{Db, Row, int};
+use common::{Db, Row, int, ints};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -41,6 +41,10 @@ fn row_u(i: usize) -> String {
     format!("({}, {i})", i * (ROWS / JOIN_ROWS))
 }
 
+fn sum_of_v() -> i32 {
+    (0..ROWS).map(|i| ((i * 7919) % ROWS) as i32).sum()
+}
+
 fn loaded_db() -> Db {
     let db = Db::new(POOL_FRAMES);
     db.exec("CREATE TABLE t (id INTEGER, v INTEGER)");
@@ -55,6 +59,8 @@ fn loaded_db() -> Db {
 enum Expect {
     Rows(usize),
     Count(i32),
+    Exact(Vec<Vec<i32>>),
+    SortedBy { rows: usize, col: usize },
 }
 
 /// One timed read query, with the result and plan it has to produce.
@@ -100,9 +106,19 @@ fn check_case(db: &Db, case: &Case) {
         );
     }
     let rows: Vec<Row> = db.exec(case.sql);
-    match case.expect {
-        Expect::Rows(n) => assert_eq!(rows.len(), n, "{}: row count", case.name),
-        Expect::Count(n) => assert_eq!(rows, vec![vec![int(n)]], "{}: COUNT(*)", case.name),
+    match &case.expect {
+        Expect::Rows(n) => assert_eq!(rows.len(), *n, "{}: row count", case.name),
+        Expect::Count(n) => assert_eq!(rows, vec![vec![int(*n)]], "{}: COUNT(*)", case.name),
+        Expect::Exact(want) => assert_eq!(&ints(&rows), want, "{}: result", case.name),
+        Expect::SortedBy { rows: n, col } => {
+            let got = ints(&rows);
+            assert_eq!(got.len(), *n, "{}: row count", case.name);
+            assert!(
+                got.windows(2).all(|w| w[0][*col] <= w[1][*col]),
+                "{}: rows are sorted by column {col}",
+                case.name
+            );
+        }
     }
 }
 
@@ -126,14 +142,14 @@ fn cases() -> Vec<Case> {
             name: "aggregate_10k",
             sql: "SELECT COUNT(*), SUM(v) FROM t",
             elements: ROWS,
-            expect: Expect::Rows(1),
+            expect: Expect::Exact(vec![vec![ROWS as i32, sum_of_v()]]),
             plan: None,
         },
         Case {
             name: "sort_10k",
             sql: "SELECT * FROM t ORDER BY v",
             elements: ROWS,
-            expect: Expect::Rows(ROWS),
+            expect: Expect::SortedBy { rows: ROWS, col: 1 },
             plan: None,
         },
         Case {

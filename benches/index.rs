@@ -50,6 +50,27 @@ fn insert_all(tree: &BPlusTree, keys: &[u64]) {
     }
 }
 
+fn count_entries(tree: &BPlusTree, range: (Bound<IndexKey>, Bound<IndexKey>)) -> usize {
+    tree.scan(range)
+        .expect("scan")
+        .try_fold(0usize, |n, r| r.map(|_| n + 1))
+        .expect("entry")
+}
+
+fn assert_tree_holds(tree: &BPlusTree, n: u64) {
+    assert_eq!(
+        count_entries(tree, (Bound::Unbounded, Bound::Unbounded)),
+        n as usize,
+        "a full scan sees every inserted key"
+    );
+    for k in (0..n).step_by(97) {
+        assert!(
+            tree.search(&key(k)).expect("search").is_some(),
+            "key {k} is found"
+        );
+    }
+}
+
 fn shuffled(n: u64) -> Vec<u64> {
     let mut keys: Vec<u64> = (0..n).collect();
     keys.shuffle(&mut rand::rng());
@@ -61,6 +82,11 @@ fn insert(c: &mut Criterion) {
     group.throughput(Throughput::Elements(INSERT_KEYS));
     let sequential: Vec<u64> = (0..INSERT_KEYS).collect();
     let random = shuffled(INSERT_KEYS);
+    for keys in [&sequential, &random] {
+        let (tree, _bpm, _dir) = make_tree();
+        insert_all(&tree, keys);
+        assert_tree_holds(&tree, INSERT_KEYS);
+    }
     for (name, keys) in [
         ("insert_seq_10k", &sequential),
         ("insert_random_10k", &random),
@@ -84,6 +110,15 @@ fn lookup_and_scan(c: &mut Criterion) {
     let (tree, _bpm, _dir) = make_tree();
     insert_all(&tree, &shuffled(LOOKUP_KEYS));
     let probes = shuffled(LOOKUP_KEYS);
+    assert_tree_holds(&tree, LOOKUP_KEYS);
+    assert_eq!(
+        count_entries(
+            &tree,
+            (Bound::Included(key(0)), Bound::Excluded(key(RANGE_LEN)))
+        ),
+        RANGE_LEN as usize,
+        "a range scan returns exactly the keys in range"
+    );
 
     group.throughput(Throughput::Elements(1));
     let mut i = 0;
@@ -103,11 +138,7 @@ fn lookup_and_scan(c: &mut Criterion) {
                 Bound::Included(key(start)),
                 Bound::Excluded(key(start + RANGE_LEN)),
             );
-            let hits = tree
-                .scan(range)
-                .expect("scan")
-                .try_fold(0usize, |n, r| r.map(|_| n + 1))
-                .expect("entry");
+            let hits = count_entries(&tree, range);
             black_box(hits);
         })
     });
@@ -115,11 +146,7 @@ fn lookup_and_scan(c: &mut Criterion) {
     group.throughput(Throughput::Elements(LOOKUP_KEYS));
     group.bench_function("scan_full_100k", |b| {
         b.iter(|| {
-            let hits = tree
-                .scan((Bound::Unbounded, Bound::Unbounded))
-                .expect("scan")
-                .try_fold(0usize, |n, r| r.map(|_| n + 1))
-                .expect("entry");
+            let hits = count_entries(&tree, (Bound::Unbounded, Bound::Unbounded));
             black_box(hits);
         })
     });

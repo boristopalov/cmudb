@@ -39,8 +39,10 @@ cargo bench --features bench --bench index -- search   # filter by name
 Criterion keeps the previous run in `target/criterion` and prints the change against it, so
 to compare a branch, run the same bench on the base branch first and then on the branch.
 Only treat a change as real when it is larger than the run-to-run spread (the bracketed range).
-Before timing, each query bench checks its row count and, for the join and index benches, that
-the planner still picks the plan the bench is named after, so a plan change fails loudly.
+Before timing, every bench checks what it reads: the heap and B+ tree return every inserted
+row and key, and each query returns the expected rows. The join and index query benches also
+check that the planner still picks the plan they are named after, so a change fails loudly
+instead of showing up as a speedup.
 The query benches run SQL through the same harness as `tests/common`, so they measure whichever
 executor model the branch has.
 

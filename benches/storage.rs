@@ -55,6 +55,28 @@ fn filled_heap(rows: usize) -> (TableHeap, Vec<RecordId>, Arc<BufferPoolManager>
     (heap, rids, bpm, dir)
 }
 
+fn count_rows(heap: &TableHeap) -> usize {
+    heap.iter()
+        .try_fold(0usize, |n, r| r.map(|_| n + 1))
+        .expect("scan")
+}
+
+fn assert_heap_holds(heap: &TableHeap, rids: &[RecordId]) {
+    assert_eq!(
+        count_rows(heap),
+        rids.len(),
+        "a scan sees every inserted row"
+    );
+    for (i, rid) in rids.iter().enumerate() {
+        let (_, got) = heap.get(*rid).expect("get");
+        assert_eq!(
+            got.data,
+            tuple(i).data,
+            "row {i} reads back what was inserted"
+        );
+    }
+}
+
 fn buffer_pool(c: &mut Criterion) {
     let mut group = c.benchmark_group("buffer_pool");
     group.throughput(Throughput::Elements(1));
@@ -111,15 +133,8 @@ fn table_heap(c: &mut Criterion) {
     });
 
     let (heap, rids, _bpm, _dir) = filled_heap(HEAP_ROWS);
-    group.bench_function("scan_10k", |b| {
-        b.iter(|| {
-            black_box(
-                heap.iter()
-                    .try_fold(0usize, |n, r| r.map(|_| n + 1))
-                    .expect("scan"),
-            )
-        })
-    });
+    assert_heap_holds(&heap, &rids);
+    group.bench_function("scan_10k", |b| b.iter(|| black_box(count_rows(&heap))));
 
     let mut shuffled = rids.clone();
     shuffled.shuffle(&mut rand::rng());
