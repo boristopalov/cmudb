@@ -10,9 +10,26 @@ parking_lot = "0.12.5"
 rand = "0.9.2"
 sqlparser = "0.62.0"
 tempfile = "3.23.0"
+criterion = { version = "0.7", optional = true, default-features = false, features = ["cargo_bench_support"] }
 
 [features]
+bench = ["dep:criterion"]
 deadlock_detection = ["parking_lot/deadlock_detection"]
 
 [dev-dependencies]
 env_logger = "0.11.5"
+
+[[bench]]
+name = "storage"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "index"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "query"
+harness = false
+required-features = ["bench"]
