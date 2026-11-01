@@ -401,10 +401,11 @@ impl BPlusTree {
         Ok(())
     }
 
-    /// Removes `key` from the latched leaf's bytes when nothing after the removal can fail: the
-    /// leaf is the root, or it stays above min size. Returns `Ok(false)` without touching the
-    /// leaf otherwise, so the caller removes from a decoded copy and only writes it back once
-    /// rebalancing has latched every page it needs.
+    /// Removes `key` from the latched leaf's bytes when the leaf is the root or stays above min
+    /// size. For a root leaf, the header page that an emptied root updates is latched and
+    /// validated before the leaf changes. Returns `Ok(false)` without touching the leaf otherwise,
+    /// so the caller removes from a decoded copy and writes it back once rebalancing has latched
+    /// every page it needs.
     fn remove_in_place_if_final(
         &self,
         ctx: &mut TreeContext<'_>,
@@ -414,15 +415,21 @@ impl BPlusTree {
     ) -> Result<bool, IndexError> {
         let leaf_is_root = page_id_of(leaf_page)? == ctx.root_page_id;
         let mut leaf = LeafPageView::new(leaf_page.data_mut(), self.key_len)?;
-        if !leaf_is_root && leaf.size() <= leaf.min_size() {
-            return Ok(false);
+        if !leaf_is_root {
+            if leaf.size() <= leaf.min_size() {
+                return Ok(false);
+            }
+            leaf.remove_key(&key.0)?;
+            return Ok(true);
         }
+        let header_page = ctx.header.as_mut().ok_or(HEADER_LATCH_RELEASED)?;
+        let mut header_view = HeaderPageView::new(header_page.data_mut())?;
         leaf.remove_key(&key.0)?;
-        if leaf_is_root && leaf.size() == 0 {
+        if leaf.size() == 0 {
             header.root_page_id = INVALID_PAGE_ID;
             header.first_leaf_id = INVALID_PAGE_ID;
-            let header_page = ctx.header.as_mut().ok_or(HEADER_LATCH_RELEASED)?;
-            Self::store_header(header_page, header)?;
+            header_view.set_root_page_id(INVALID_PAGE_ID);
+            header_view.set_first_leaf_id(INVALID_PAGE_ID);
         }
         Ok(true)
     }
@@ -960,6 +967,97 @@ mod tests {
     use tempfile::tempdir;
 
     const FOUR_ENTRY_LEAF_KEY_LEN: u32 = 2000;
+
+    const NO_TOMBSTONE_KEY_LEN: u32 = 567;
+
+    #[test]
+    fn no_tombstone_key_len_gives_fourteen_entry_leaves_without_tombstones() {
+        let (bpm, _tmp) = make_bpm(10);
+        let tree = BPlusTree::new("idx".to_string(), NO_TOMBSTONE_KEY_LEN, bpm).unwrap();
+        assert_eq!(tree.leaf_max_size, 14);
+        assert_eq!(
+            LeafPage::tombstone_capacity_for_layout(
+                tree.leaf_max_size,
+                NO_TOMBSTONE_KEY_LEN,
+                NUM_TOMBSTONES
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn failed_rebalance_leaves_the_underfull_leaf_unchanged() {
+        let key_len = NO_TOMBSTONE_KEY_LEN as usize;
+        let (bpm, _tmp) = make_bpm(32);
+        let tree = BPlusTree::new("idx".to_string(), NO_TOMBSTONE_KEY_LEN, bpm.clone()).unwrap();
+        for k in 0..15u8 {
+            let rid = RecordId {
+                page_id: u32::from(k),
+                slot_id: 0,
+            };
+            tree.insert(make_key(k, key_len), IndexValue::IndexValue(rid))
+                .unwrap();
+        }
+        let header = tree.read_header().unwrap();
+        let root = InternalPage::decode(
+            bpm.read_page(header.root_page_id).unwrap().data(),
+            NO_TOMBSTONE_KEY_LEN,
+        )
+        .unwrap();
+        assert_eq!(
+            root.children.len(),
+            2,
+            "15 inserts split the root leaf once"
+        );
+        let (left_id, right_id) = (root.children[0], root.children[1]);
+        let left = tree.decode_leaf(left_id).unwrap();
+        assert_eq!(
+            left.keys.len() as u32,
+            left.min_size(),
+            "left leaf sits at min size"
+        );
+        let left_before = bpm.read_page(left_id).unwrap().data().to_vec();
+
+        bpm.write_page(right_id).unwrap().data_mut()[0] ^= 0xff;
+        let removed = tree.remove(make_key(0, key_len));
+        assert!(
+            matches!(
+                removed,
+                Err(IndexError::PageError(PageCodecError::BadMagic))
+            ),
+            "remove fails while decoding the corrupt sibling, got {removed:?}"
+        );
+        assert_eq!(
+            bpm.read_page(left_id).unwrap().data(),
+            &left_before[..],
+            "the failed remove leaves the leaf's bytes untouched"
+        );
+        assert!(
+            tree.search(&make_key(0, key_len)).unwrap().is_some(),
+            "the key survives the failed remove"
+        );
+
+        bpm.write_page(right_id).unwrap().data_mut()[0] ^= 0xff;
+        tree.remove(make_key(0, key_len)).unwrap();
+        assert!(tree.search(&make_key(0, key_len)).unwrap().is_none());
+    }
+
+    #[test]
+    fn removing_the_last_key_of_a_root_leaf_empties_the_tree() {
+        let key_len = NO_TOMBSTONE_KEY_LEN as usize;
+        let (bpm, _tmp) = make_bpm(8);
+        let tree = BPlusTree::new("idx".to_string(), NO_TOMBSTONE_KEY_LEN, bpm).unwrap();
+        let rid = RecordId {
+            page_id: 1,
+            slot_id: 1,
+        };
+        tree.insert(make_key(3, key_len), IndexValue::IndexValue(rid))
+            .unwrap();
+        tree.remove(make_key(3, key_len)).unwrap();
+        let header = tree.read_header().unwrap();
+        assert_eq!(header.root_page_id, INVALID_PAGE_ID);
+        assert_eq!(header.first_leaf_id, INVALID_PAGE_ID);
+    }
 
     #[test]
     fn four_entry_leaf_key_len_gives_four_entry_leaves() {

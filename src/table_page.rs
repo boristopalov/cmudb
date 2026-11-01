@@ -210,7 +210,10 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> TablePage<B> {
         if meta.is_deleted {
             return Err(TablePageError(format!("slot {slot} already deleted")));
         }
-        let deleted = self.num_deleted_tuples().saturating_add(1);
+        let deleted = self
+            .num_deleted_tuples()
+            .checked_add(1)
+            .ok_or_else(|| TablePageError("deleted-tuple counter overflow".to_string()))?;
         let b = self.bytes_mut();
         b[Self::slot_base(slot) + SLOT_DELETED_OFF] = 1;
         put_u16_le(b, NUM_DELETED_OFF, deleted);
@@ -269,6 +272,23 @@ mod tests {
         assert_eq!(page.num_deleted_tuples(), 1);
         assert!(!page.slot(0).unwrap().is_deleted);
         assert!(page.slot(1).unwrap().is_deleted);
+    }
+
+    #[test]
+    fn mark_deleted_rejects_an_overflowing_deleted_counter() {
+        let mut buf = [0u8; PAGE_SIZE];
+        let mut page = TablePage::init(&mut buf[..]);
+        page.insert(b"x").unwrap();
+        put_u16_le(&mut buf, NUM_DELETED_OFF, u16::MAX);
+        let mut page = TablePageMut::new(&mut buf[..]).unwrap();
+        assert!(
+            page.mark_deleted(0).is_err(),
+            "counter overflow is reported"
+        );
+        assert!(
+            !page.slot(0).unwrap().is_deleted,
+            "a rejected delete leaves the slot live"
+        );
     }
 
     #[test]
