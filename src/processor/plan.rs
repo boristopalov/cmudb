@@ -3,6 +3,8 @@ use crate::{
     processor::executor::ExecutorError,
     table_heap::Tuple,
 };
+use ordered_float::OrderedFloat;
+use std::cmp::Ordering;
 use std::ops::Bound;
 
 pub enum Plan {
@@ -216,7 +218,12 @@ impl Expression {
             Expression::Constant(Some(v)) => Some(v.data_type()),
             Expression::Constant(None) => None,
             Expression::Binary { left, right, op } => match op {
-                Op::Add | Op::Sub | Op::Mul | Op::Div => left.dtype().or_else(|| right.dtype()),
+                Op::Add | Op::Sub | Op::Mul | Op::Div => match (left.dtype(), right.dtype()) {
+                    (Some(DataType::FLOAT), _) | (_, Some(DataType::FLOAT)) => {
+                        Some(DataType::FLOAT)
+                    }
+                    (l, r) => l.or(r),
+                },
                 _ => Some(DataType::BOOLEAN),
             },
         }
@@ -229,7 +236,7 @@ impl Expression {
             Expression::Binary { left, right, op } => {
                 let l = left.evaluate(tuple, schema)?;
                 let r = right.evaluate(tuple, schema)?;
-                Ok(eval_binary(op, l, r))
+                eval_binary(op, l, r)
             }
             Expression::Column {
                 tuple_idx, col_idx, ..
@@ -267,7 +274,7 @@ impl Expression {
             Expression::Binary { left, right, op } => {
                 let l = left.evaluate_join(left_tuple, left_schema, right_tuple, right_schema)?;
                 let r = right.evaluate_join(left_tuple, left_schema, right_tuple, right_schema)?;
-                Ok(eval_binary(op, l, r))
+                eval_binary(op, l, r)
             }
             Expression::Column {
                 tuple_idx, col_idx, ..
@@ -291,35 +298,118 @@ fn invalid_tuple_idx(tuple_idx: u8) -> ExecutorError {
     ))
 }
 
-fn eval_binary(op: &Op, l: Option<Value>, r: Option<Value>) -> Option<Value> {
-    use Value::*;
-
+fn eval_binary(
+    op: &Op,
+    l: Option<Value>,
+    r: Option<Value>,
+) -> Result<Option<Value>, ExecutorError> {
+    let cmp = |holds: fn(Ordering) -> bool| -> Result<Option<Value>, ExecutorError> {
+        Ok(compare(l, r)?.map(|ord| Value::BOOLEAN(holds(ord))))
+    };
+    let arith = |op: Arithmetic| -> Result<Option<Value>, ExecutorError> {
+        match (l, r) {
+            (Some(l), Some(r)) => op.apply(l, r).map(Some),
+            _ => Ok(None),
+        }
+    };
     match op {
-        Op::Add => Some(l? + r?),
-        Op::Sub => Some(l? - r?),
-        Op::Mul => Some(l? * r?),
-        Op::Div => Some(l? / r?),
-
-        Op::Eq => Some(BOOLEAN(l? == r?)),
-        Op::NEq => Some(BOOLEAN(l? != r?)),
-        Op::Lt => Some(BOOLEAN(l? < r?)),
-        Op::Gt => Some(BOOLEAN(l? > r?)),
-        Op::Lte => Some(BOOLEAN(l? <= r?)),
-        Op::Gte => Some(BOOLEAN(l? >= r?)),
-
-        Op::And => match (l, r) {
-            (Some(BOOLEAN(false)), _) | (_, Some(BOOLEAN(false))) => Some(BOOLEAN(false)),
-            (Some(BOOLEAN(a)), Some(BOOLEAN(b))) => Some(BOOLEAN(a && b)),
-            (None, _) | (_, None) => None,
-            _ => unreachable!("type-checked at plan time"),
+        Op::Add => arith(Arithmetic::Add),
+        Op::Sub => arith(Arithmetic::Sub),
+        Op::Mul => arith(Arithmetic::Mul),
+        Op::Div => arith(Arithmetic::Div),
+        Op::Eq => cmp(Ordering::is_eq),
+        Op::NEq => cmp(Ordering::is_ne),
+        Op::Lt => cmp(Ordering::is_lt),
+        Op::Gt => cmp(Ordering::is_gt),
+        Op::Lte => cmp(Ordering::is_le),
+        Op::Gte => cmp(Ordering::is_ge),
+        Op::And => match (as_bool(l)?, as_bool(r)?) {
+            (Some(false), _) | (_, Some(false)) => Ok(Some(Value::BOOLEAN(false))),
+            (Some(true), Some(true)) => Ok(Some(Value::BOOLEAN(true))),
+            _ => Ok(None),
         },
-
-        Op::Or => match (l, r) {
-            (Some(BOOLEAN(true)), _) | (_, Some(BOOLEAN(true))) => Some(BOOLEAN(true)),
-            (Some(BOOLEAN(a)), Some(BOOLEAN(b))) => Some(BOOLEAN(a || b)),
-            (None, _) | (_, None) => None,
-            _ => unreachable!("type-checked at plan time"),
+        Op::Or => match (as_bool(l)?, as_bool(r)?) {
+            (Some(true), _) | (_, Some(true)) => Ok(Some(Value::BOOLEAN(true))),
+            (Some(false), Some(false)) => Ok(Some(Value::BOOLEAN(false))),
+            _ => Ok(None),
         },
+    }
+}
+
+fn as_bool(v: Option<Value>) -> Result<Option<bool>, ExecutorError> {
+    match v {
+        None => Ok(None),
+        Some(Value::BOOLEAN(b)) => Ok(Some(b)),
+        Some(other) => Err(ExecutorError(format!(
+            "expected a BOOLEAN operand, got {other:?}"
+        ))),
+    }
+}
+
+/// Orders two values of the same type, comparing INT with FLOAT numerically.
+/// `None` when either side is NULL.
+fn compare(l: Option<Value>, r: Option<Value>) -> Result<Option<Ordering>, ExecutorError> {
+    let (Some(l), Some(r)) = (l, r) else {
+        return Ok(None);
+    };
+    let ord = match (l, r) {
+        (Value::INT(a), Value::FLOAT(b)) => OrderedFloat(a as f32).cmp(&b),
+        (Value::FLOAT(a), Value::INT(b)) => a.cmp(&OrderedFloat(b as f32)),
+        (a, b) if a.data_type() == b.data_type() => a.cmp(&b),
+        (a, b) => {
+            return Err(ExecutorError(format!("cannot compare {a:?} with {b:?}")));
+        }
+    };
+    Ok(Some(ord))
+}
+
+/// Arithmetic on INT and FLOAT values. INT with INT stays INT and errors on overflow or
+/// division by zero; any FLOAT operand makes the result FLOAT.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Arithmetic {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+impl Arithmetic {
+    pub(crate) fn apply(self, l: Value, r: Value) -> Result<Value, ExecutorError> {
+        match (l, r) {
+            (Value::INT(a), Value::INT(b)) => self.apply_int(a, b).map(Value::INT),
+            (Value::INT(a), Value::FLOAT(b)) => {
+                Ok(Value::FLOAT(self.apply_float(a as f32, *b).into()))
+            }
+            (Value::FLOAT(a), Value::INT(b)) => {
+                Ok(Value::FLOAT(self.apply_float(*a, b as f32).into()))
+            }
+            (Value::FLOAT(a), Value::FLOAT(b)) => Ok(Value::FLOAT(self.apply_float(*a, *b).into())),
+            (a, b) => Err(ExecutorError(format!(
+                "cannot apply {self:?} to {a:?} and {b:?}"
+            ))),
+        }
+    }
+
+    fn apply_int(self, a: i32, b: i32) -> Result<i32, ExecutorError> {
+        let result = match self {
+            Arithmetic::Add => a.checked_add(b),
+            Arithmetic::Sub => a.checked_sub(b),
+            Arithmetic::Mul => a.checked_mul(b),
+            Arithmetic::Div if b == 0 => {
+                return Err(ExecutorError(format!("division by zero: {a} / 0")));
+            }
+            Arithmetic::Div => a.checked_div(b),
+        };
+        result.ok_or_else(|| ExecutorError(format!("integer overflow: {self:?} of {a} and {b}")))
+    }
+
+    fn apply_float(self, a: f32, b: f32) -> f32 {
+        match self {
+            Arithmetic::Add => a + b,
+            Arithmetic::Sub => a - b,
+            Arithmetic::Mul => a * b,
+            Arithmetic::Div => a / b,
+        }
     }
 }
 
@@ -422,6 +512,78 @@ mod tests {
             assert_eq!(eval_ok(one(), op.clone(), null()), None);
             assert_eq!(eval_ok(null(), op, one()), None);
         }
+    }
+
+    fn int(v: i32) -> Expression {
+        constant(Some(Value::INT(v)))
+    }
+
+    fn float(v: f32) -> Expression {
+        constant(Some(Value::FLOAT(v.into())))
+    }
+
+    #[test]
+    fn comparing_int_with_float_compares_numerically() {
+        let f = Some(Value::BOOLEAN(false));
+        let t = Some(Value::BOOLEAN(true));
+        assert_eq!(eval_ok(float(1.5), Op::Gt, int(2)), f);
+        assert_eq!(eval_ok(int(2), Op::Lt, float(1.5)), f);
+        assert_eq!(eval_ok(int(2), Op::Eq, float(2.0)), t);
+        assert_eq!(eval_ok(float(2.5), Op::Gte, int(2)), t);
+    }
+
+    #[test]
+    fn arithmetic_mixing_int_and_float_yields_float() {
+        assert_eq!(
+            eval_ok(int(1), Op::Add, float(0.5)),
+            Some(Value::FLOAT(1.5.into()))
+        );
+        assert_eq!(
+            eval_ok(float(3.0), Op::Div, int(2)),
+            Some(Value::FLOAT(1.5.into()))
+        );
+        assert_eq!(eval_ok(int(7), Op::Div, int(2)), Some(Value::INT(3)));
+    }
+
+    #[test]
+    fn dtype_of_mixed_int_and_float_arithmetic_is_float() {
+        let add = |l: Expression, r: Expression| Expression::Binary {
+            left: Box::new(l),
+            right: Box::new(r),
+            op: Op::Add,
+        };
+        assert_eq!(add(int(1), float(0.5)).dtype(), Some(DataType::FLOAT));
+        assert_eq!(add(float(0.5), int(1)).dtype(), Some(DataType::FLOAT));
+        assert_eq!(add(int(1), int(1)).dtype(), Some(DataType::INT));
+        assert_eq!(add(null(), int(1)).dtype(), Some(DataType::INT));
+    }
+
+    #[test]
+    fn operands_of_incompatible_types_are_an_error() {
+        assert!(eval(int(1), Op::Add, boolean(true)).is_err());
+        assert!(eval(int(1), Op::Lt, boolean(true)).is_err());
+        assert!(eval(boolean(true), Op::And, int(1)).is_err());
+        assert!(eval(boolean(false), Op::And, int(1)).is_err());
+        assert!(eval(int(1), Op::Or, null()).is_err());
+        assert!(eval(boolean(true), Op::Mul, boolean(true)).is_err());
+        let ts = || constant(Some(Value::TIMESTAMP(5)));
+        assert!(eval(ts(), Op::Add, ts()).is_err());
+        assert!(eval(ts(), Op::Eq, int(5)).is_err());
+        assert_eq!(eval_ok(ts(), Op::Lte, ts()), Some(Value::BOOLEAN(true)));
+    }
+
+    #[test]
+    fn integer_division_by_zero_is_an_error() {
+        let err = eval(int(1), Op::Div, int(0)).unwrap_err();
+        assert!(err.0.contains("division by zero"), "{}", err.0);
+    }
+
+    #[test]
+    fn integer_overflow_is_an_error() {
+        assert!(eval(int(i32::MAX), Op::Add, int(1)).is_err());
+        assert!(eval(int(i32::MIN), Op::Sub, int(1)).is_err());
+        assert!(eval(int(i32::MAX), Op::Mul, int(2)).is_err());
+        assert!(eval(int(i32::MIN), Op::Div, int(-1)).is_err());
     }
 
     #[test]
