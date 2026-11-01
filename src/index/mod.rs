@@ -20,31 +20,25 @@ pub trait Index {
     fn scan(&self, range: (Bound<IndexKey>, Bound<IndexKey>)) -> Result<IndexIter, IndexError>;
 }
 
-// TODO: clean these up
 #[derive(Debug)]
 pub enum IndexError {
     Insert(InsertError),
     Remove(RemoveError),
-    Lookup,
+    KeyLength { expected: usize, actual: usize },
+    UnsupportedKeyLength(u32),
     BpmError(BpmError),
     PageError(PageCodecError),
-    LatchError,
+    Structure(&'static str),
 }
 
 #[derive(Debug)]
 pub enum InsertError {
     DuplicateKey,
-    InvalidKey,
-    InvalidValue,
-    BpmError,
-    BadRoot,
-    GenericError(String),
 }
 
 #[derive(Debug)]
 pub enum RemoveError {
     KeyNotFound,
-    GenericError(String),
 }
 
 impl From<BpmError> for IndexError {
@@ -70,10 +64,15 @@ impl fmt::Display for IndexError {
         match self {
             IndexError::Insert(e) => write!(f, "insert failed: {e}"),
             IndexError::Remove(e) => write!(f, "remove failed: {e}"),
+            IndexError::KeyLength { expected, actual } => {
+                write!(f, "key is {actual} bytes but the index expects {expected}")
+            }
+            IndexError::UnsupportedKeyLength(len) => {
+                write!(f, "an index key of {len} bytes cannot fit in a page")
+            }
             IndexError::BpmError(e) => write!(f, "BPM error: {e}"),
             IndexError::PageError(e) => write!(f, "page decode/encode error: {e}"),
-            IndexError::LatchError => write!(f, "error reading or acquiring latch"),
-            IndexError::Lookup => write!(f, "lookup error"),
+            IndexError::Structure(msg) => write!(f, "b+ tree structure violated: {msg}"),
         }
     }
 }
@@ -82,11 +81,6 @@ impl fmt::Display for InsertError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             InsertError::DuplicateKey => write!(f, "key already exists"),
-            InsertError::InvalidKey => write!(f, "invalid key"),
-            InsertError::InvalidValue => write!(f, "invalid value"),
-            InsertError::BpmError => write!(f, "bpm error"),
-            InsertError::BadRoot => write!(f, "error getting root while inserting"),
-            InsertError::GenericError(msg) => write!(f, "error while inserting: {msg}"),
         }
     }
 }
@@ -95,7 +89,42 @@ impl fmt::Display for RemoveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RemoveError::KeyNotFound => write!(f, "key not found"),
-            RemoveError::GenericError(msg) => write!(f, "error while removing: {msg}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn errors_convert_and_display() {
+        let e: IndexError = RemoveError::KeyNotFound.into();
+        assert_eq!(e.to_string(), "remove failed: key not found");
+        let e: IndexError = PageCodecError::BadMagic.into();
+        assert_eq!(e.to_string(), "page decode/encode error: bad page magic");
+        let e: IndexError = BpmError::NoFreeFrame.into();
+        assert!(e.to_string().starts_with("BPM error"));
+        let cases = [
+            (
+                IndexError::Insert(InsertError::DuplicateKey),
+                "insert failed: key already exists",
+            ),
+            (
+                IndexError::KeyLength {
+                    expected: 8,
+                    actual: 3,
+                },
+                "key is 3 bytes but the index expects 8",
+            ),
+            (
+                IndexError::UnsupportedKeyLength(0),
+                "an index key of 0 bytes cannot fit in a page",
+            ),
+            (IndexError::Structure("x"), "b+ tree structure violated: x"),
+        ];
+        for (err, msg) in cases {
+            assert_eq!(err.to_string(), msg);
         }
     }
 }

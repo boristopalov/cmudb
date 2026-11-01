@@ -4,24 +4,20 @@ use std::collections::HashMap;
 use ordered_float::OrderedFloat;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, CreateIndex as SqlCreateIndex,
-    CreateTable as SqlCreateTable, DataType as SqlDataType, Delete, Expr, Function,
-    FunctionArg, FunctionArgExpr, FunctionArguments, FromTable, GroupByExpr, Insert,
-    JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderByKind, Query,
-    SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins, Update,
-    Value as SqlValue,
+    CreateTable as SqlCreateTable, DataType as SqlDataType, Delete, Expr, FromTable, Function,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Insert, JoinConstraint,
+    JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderByKind, Query, SelectItem, SetExpr,
+    Statement, TableFactor, TableObject, TableWithJoins, Update, Value as SqlValue,
 };
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
 
 use crate::catalog::{Catalog, DataType, Schema, Value};
-use crate::processor::plan::{
-    AggType, CreateIndexPlanNode, CreateTablePlanNode, DeletePlanNode, Expression, FilterPlanNode,
-    InsertPlanNode, JoinType, LimitPlanNode, NestedLoopJoinPlanNode, Op, Plan, ProjectionPlanNode,
-    SeqScanPlanNode, SortPlanNode, UpdatePlanNode, ValuesPlanNode,
-};
+use crate::processor::plan::{AggType, Expression, JoinType, Op};
 
-/// a good read: https://craftinginterpreters.com/resolving-and-binding.html
-/// most of this was written by AI since this is not the part of dbms i was interested in
+/// Argument bound for `COUNT(*)`. COUNT skips NULL arguments, so a non-NULL constant makes it count
+/// every row.
+const COUNT_STAR_ARGUMENT: Expression = Expression::Constant(Some(Value::INT(1)));
+
+/// Resolves parsed SQL statements against the catalog into bound statements for the planner.
 pub struct Binder<'a> {
     pub catalog: &'a Catalog,
     /// Active aggregation context for the SELECT currently being resolved.
@@ -60,84 +56,15 @@ impl<'a> Binder<'a> {
     }
 
     fn resolve_expr(&self, expr: &Expr, scope: &Scope) -> Result<Expression, BinderError> {
-        // When we're inside an aggregating SELECT (but not currently descending
-        // into an aggregate's argument), rewrite:
-        //   - any sub-expression that structurally matches a GROUP BY expr to
-        //     a Column ref into the aggregation output (col_idx = group-by position).
-        //   - any aggregate function call to a Column ref into the aggregation
-        //     output (col_idx = group_bys.len() + aggregate position).
-        // Bare column refs that don't match a group-by are an error.
-        if !self.inside_agg_arg.get() {
-            // first, group-by rewrite
-            {
-                let ctx = self.agg_ctx.borrow();
-                if let Some(ctx) = ctx.as_ref() {
-                    if let Some(idx) = ctx.group_by_exprs.iter().position(|gb| gb == expr) {
-                        let dtype = ctx.group_bys[idx].dtype().ok_or_else(|| {
-                            BinderError("GROUP BY expression has no inferable type".into())
-                        })?;
-                        return Ok(Expression::Column {
-                            tuple_idx: 0,
-                            col_idx: idx as u32,
-                            dtype,
-                        });
-                    }
-                }
-            }
-
-            // aggregate function rewrite
-            if let Expr::Function(f) = expr {
-                if let Some(agg_type) = parse_agg_type(&f.name) {
-                    if self.agg_ctx.borrow().is_none() {
-                        return Err(BinderError(
-                            "aggregate functions are only allowed in a SELECT projection".into(),
-                        ));
-                    }
-                    return self.register_aggregate(f, scope, agg_type);
-                }
-            }
-
-            // bare column refs without a matching group-by are illegal in
-            // aggregating queries.
-            if self.agg_ctx.borrow().is_some() {
-                match expr {
-                    Expr::Identifier(id) => {
-                        return Err(BinderError(format!(
-                            "column `{}` must appear in GROUP BY or be used inside an aggregate function",
-                            id.value
-                        )));
-                    }
-                    Expr::CompoundIdentifier(parts) => {
-                        let path = parts
-                            .iter()
-                            .map(|p| p.value.clone())
-                            .collect::<Vec<_>>()
-                            .join(".");
-                        return Err(BinderError(format!(
-                            "column `{path}` must appear in GROUP BY or be used inside an aggregate function"
-                        )));
-                    }
-                    _ => {}
-                }
-            }
-        } else {
-            // inside an aggregate's argument: nested aggregates are forbidden.
-            if let Expr::Function(f) = expr {
-                if parse_agg_type(&f.name).is_some() {
-                    return Err(BinderError(
-                        "nested aggregate functions are not allowed".into(),
-                    ));
-                }
-            }
+        if self.inside_agg_arg.get() {
+            reject_aggregate_call(expr, "nested aggregate functions are not allowed")?;
+        } else if let Some(rewritten) = self.rewrite_for_aggregation(expr, scope)? {
+            return Ok(rewritten);
         }
 
         match expr {
             Expr::Nested(inner) => self.resolve_expr(inner, scope),
 
-            // even though sqlparser's Expr::Identifier can represent both
-            // table and column names, we don't care about table names because
-            // if we call resolve_expr() we will always have a column to resolve,
-            // never a table
             Expr::Identifier(id) => {
                 let name = &id.value;
                 let mut found: Option<Expression> = None;
@@ -225,15 +152,52 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// Registers an aggregate function call discovered inside a projection /
-    /// ORDER BY expression. Returns a Column reference into the aggregation
-    /// node's output that the executor will eventually fill in.
+    /// Inside an aggregating SELECT, maps an expression equal to a GROUP BY expression, or an
+    /// aggregate call, to a column of the aggregation output (`[group_bys..., aggregates...]`), and
+    /// rejects a column reference that is neither. Returns `None` when `expr` resolves normally.
+    fn rewrite_for_aggregation(
+        &self,
+        expr: &Expr,
+        scope: &Scope,
+    ) -> Result<Option<Expression>, BinderError> {
+        if let Expr::Function(f) = expr
+            && let Some(agg_type) = parse_agg_type(&f.name)
+        {
+            return self.register_aggregate(f, scope, agg_type).map(Some);
+        }
+        let ctx = self.agg_ctx.borrow();
+        let Some(ctx) = ctx.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(idx) = ctx.group_by_exprs.iter().position(|gb| gb == expr) {
+            let dtype = ctx.group_bys[idx]
+                .dtype()
+                .ok_or_else(|| BinderError("GROUP BY expression has no inferable type".into()))?;
+            return Ok(Some(Expression::Column {
+                tuple_idx: 0,
+                col_idx: idx as u32,
+                dtype,
+            }));
+        }
+        if let Some(path) = column_path(expr) {
+            return Err(BinderError(format!(
+                "column `{path}` must appear in GROUP BY or be used inside an aggregate function"
+            )));
+        }
+        Ok(None)
+    }
+
+    /// Records an aggregate call of the current aggregating SELECT and returns the column of the
+    /// aggregation output that will hold its result.
     fn register_aggregate(
         &self,
         f: &Function,
         scope: &Scope,
         agg_type: AggType,
     ) -> Result<Expression, BinderError> {
+        if self.agg_ctx.borrow().is_none() {
+            return Err(aggregate_outside_projection());
+        }
         let FunctionArguments::List(list) = &f.args else {
             return Err(BinderError(format!(
                 "aggregate `{}` must be called with arguments",
@@ -263,9 +227,6 @@ impl<'a> Binder<'a> {
             ));
         };
 
-        // The argument expression is evaluated against the *child* tuples
-        // (the pre-aggregation rows), so flip off the agg-rewrite mode
-        // while we resolve it.
         let arg_expr = match arg {
             FunctionArgExpr::Wildcard => {
                 if !matches!(agg_type, AggType::COUNT) {
@@ -274,15 +235,12 @@ impl<'a> Binder<'a> {
                         f.name
                     )));
                 }
-                // COUNT(*) just counts rows; the actual value is unused by the
-                // executor, but we still need an expression that evaluates
-                // without errors. A constant works.
-                Expression::Constant(Some(Value::INT(1)))
+                COUNT_STAR_ARGUMENT
             }
             FunctionArgExpr::Expr(e) => {
-                self.inside_agg_arg.set(true);
+                let was_inside = self.inside_agg_arg.replace(true);
                 let result = self.resolve_expr(e, scope);
-                self.inside_agg_arg.set(false);
+                self.inside_agg_arg.set(was_inside);
                 result?
             }
             FunctionArgExpr::QualifiedWildcard(_) | FunctionArgExpr::WildcardWithOptions(_) => {
@@ -292,20 +250,15 @@ impl<'a> Binder<'a> {
             }
         };
 
-        // Result type: COUNT is always INT; everything else inherits the
-        // argument's type (matching how AggState handles them).
-        let result_dtype = match agg_type {
-            AggType::COUNT => DataType::INT,
-            _ => arg_expr.dtype().ok_or_else(|| {
-                BinderError(format!(
-                    "argument to aggregate `{}` has no inferable type",
-                    f.name
-                ))
-            })?,
-        };
+        let result_dtype = aggregate_result_type(&agg_type, &arg_expr).ok_or_else(|| {
+            BinderError(format!(
+                "argument to aggregate `{}` has no inferable type",
+                f.name
+            ))
+        })?;
 
         let mut ctx_mut = self.agg_ctx.borrow_mut();
-        let ctx = ctx_mut.as_mut().expect("agg_ctx active");
+        let ctx = ctx_mut.as_mut().ok_or_else(aggregate_outside_projection)?;
         let col_idx = ctx.group_bys.len() + ctx.aggregates.len();
         ctx.aggregates.push((arg_expr, agg_type));
         Ok(Expression::Column {
@@ -315,7 +268,15 @@ impl<'a> Binder<'a> {
         })
     }
 
-    fn resolve_select(&self, q: &Box<Query>) -> Result<BoundStatement, BinderError> {
+    /// Runs `f` with `ctx` as the active aggregation context, then restores the previous context.
+    /// Returns `f`'s result together with the context as `f` left it.
+    fn with_agg_ctx<R>(&self, ctx: Option<AggCtx>, f: impl FnOnce() -> R) -> (R, Option<AggCtx>) {
+        let prev = self.agg_ctx.replace(ctx);
+        let result = f();
+        (result, self.agg_ctx.replace(prev))
+    }
+
+    fn resolve_select(&self, q: &Query) -> Result<BoundStatement, BinderError> {
         match q.body.as_ref() {
             SetExpr::Query(inner) => self.resolve_select(inner),
 
@@ -335,17 +296,12 @@ impl<'a> Binder<'a> {
 
             SetExpr::Select(s) => {
                 let (scope, join) = self.build_select_scope(&s.from)?;
-
-                // WHERE is resolved *before* the aggregation context is set
-                // up, because aggregates cannot appear in WHERE (only HAVING).
                 let filters = s
                     .selection
                     .as_ref()
                     .map(|e| self.resolve_expr(e, &scope).map(|e| vec![e]))
                     .transpose()?;
 
-                // GROUP BY exprs are resolved against the child scope, *not*
-                // through the agg-ctx (they define the rewrite map).
                 let group_by_exprs_raw = match &s.group_by {
                     GroupByExpr::Expressions(exprs, modifiers) => {
                         if !modifiers.is_empty() {
@@ -364,52 +320,23 @@ impl<'a> Binder<'a> {
                     .map(|e| self.resolve_expr(e, &scope))
                     .collect::<Result<_, _>>()?;
 
-                // Activate the aggregation context if anything would produce
-                // an Aggregation plan node: either there are GROUP BY exprs
-                // or one of the projections contains an aggregate function.
-                let aggregating = !group_by_exprs_raw.is_empty()
-                    || projection_has_aggregate(&s.projection);
-                let prev_ctx = if aggregating {
-                    self.agg_ctx.borrow_mut().replace(AggCtx {
-                        group_by_exprs: group_by_exprs_raw,
-                        group_bys: group_bys.clone(),
-                        aggregates: vec![],
-                    })
-                } else {
-                    self.agg_ctx.borrow_mut().take()
-                };
-
-                let projections = self.resolve_projections(&s.projection, &scope)?;
-                let sort = match q.order_by.as_ref() {
-                    None => None,
-                    Some(ob) => match &ob.kind {
-                        OrderByKind::Expressions(exprs) => Some(
-                            exprs
-                                .iter()
-                                .map(|oe| self.resolve_expr(&oe.expr, &scope))
-                                .collect::<Result<_, _>>()?,
-                        ),
-                        OrderByKind::All(_) => {
-                            return Err(BinderError("ORDER BY ALL not supported".into()));
-                        }
-                    },
-                };
+                let aggregating =
+                    !group_by_exprs_raw.is_empty() || projection_has_aggregate(&s.projection);
+                let agg_ctx = aggregating.then(|| AggCtx {
+                    group_by_exprs: group_by_exprs_raw,
+                    group_bys,
+                    aggregates: vec![],
+                });
+                let (resolved, agg_ctx) = self.with_agg_ctx(agg_ctx, || {
+                    let projections = self.resolve_projections(&s.projection, &scope)?;
+                    let sort = self.resolve_order_by(q, &scope)?;
+                    Ok::<_, BinderError>((projections, sort))
+                });
+                let (projections, sort) = resolved?;
                 let limit = resolve_limit(q.limit_clause.as_ref())?;
-
-                // Pull out the aggregates registered while resolving the
-                // projection / ORDER BY, then restore any outer agg-ctx.
-                let (group_bys, aggregates) = if aggregating {
-                    let ctx = self
-                        .agg_ctx
-                        .borrow_mut()
-                        .take()
-                        .expect("agg_ctx was just installed");
-                    *self.agg_ctx.borrow_mut() = prev_ctx;
-                    (ctx.group_bys, ctx.aggregates)
-                } else {
-                    *self.agg_ctx.borrow_mut() = prev_ctx;
-                    (vec![], vec![])
-                };
+                let (group_bys, aggregates) = agg_ctx
+                    .map(|ctx| (ctx.group_bys, ctx.aggregates))
+                    .unwrap_or_default();
 
                 Ok(BoundStatement::Select(BoundSelect {
                     scope,
@@ -424,6 +351,24 @@ impl<'a> Binder<'a> {
             }
 
             _ => Err(BinderError("unsupported query body".into())),
+        }
+    }
+
+    fn resolve_order_by(
+        &self,
+        q: &Query,
+        scope: &Scope,
+    ) -> Result<Option<Vec<Expression>>, BinderError> {
+        let Some(ob) = q.order_by.as_ref() else {
+            return Ok(None);
+        };
+        match &ob.kind {
+            OrderByKind::Expressions(exprs) => exprs
+                .iter()
+                .map(|oe| self.resolve_expr(&oe.expr, scope))
+                .collect::<Result<_, _>>()
+                .map(Some),
+            OrderByKind::All(_) => Err(BinderError("ORDER BY ALL not supported".into())),
         }
     }
 
@@ -516,9 +461,6 @@ impl<'a> Binder<'a> {
             match item {
                 SelectItem::UnnamedExpr(e) => {
                     let resolved = self.resolve_expr(e, scope)?;
-                    // a bare `NULL` literal in a projection has no inferable
-                    // type — reject it. NULLs nested inside arithmetic or
-                    // comparisons are fine because the sibling supplies a type.
                     if resolved.dtype().is_none() {
                         return Err(BinderError(
                             "bare NULL not allowed in SELECT projection".into(),
@@ -527,7 +469,9 @@ impl<'a> Binder<'a> {
                     out.push(resolved);
                 }
                 SelectItem::Wildcard(_) => {
-                    for ts in scope.values() {
+                    let mut tables: Vec<&TableScope> = scope.values().collect();
+                    tables.sort_by_key(|ts| ts.idx);
+                    for ts in tables {
                         for (i, col) in ts.schema.cols.iter().enumerate() {
                             out.push(Expression::Column {
                                 tuple_idx: ts.idx,
@@ -677,11 +621,15 @@ impl<'a> Binder<'a> {
         }))
     }
 
+    /// Binds every statement against the catalog as it is now. A statement that depends on an
+    /// earlier one in the same batch (such as an INSERT into a table created just before it) fails
+    /// to bind; run statements one at a time with [`Binder::bind_statement`] instead.
     pub fn bind(&self, stmts: Vec<Statement>) -> Result<Vec<BoundStatement>, BinderError> {
-        stmts.iter().map(|s| self.resolve(s)).collect()
+        stmts.iter().map(|s| self.bind_statement(s)).collect()
     }
 
-    fn resolve(&self, stmt: &Statement) -> Result<BoundStatement, BinderError> {
+    /// Binds one statement against the catalog as it is now.
+    pub fn bind_statement(&self, stmt: &Statement) -> Result<BoundStatement, BinderError> {
         match stmt {
             Statement::Query(q) => self.resolve_select(q),
             Statement::Insert(i) => self.resolve_insert(i),
@@ -746,9 +694,8 @@ fn resolve_limit(clause: Option<&LimitClause>) -> Result<Option<u32>, BinderErro
     }
 }
 
-/// Maps a function name to an aggregate kind, case-insensitively.
-/// Returns `None` for any non-aggregate function call (which the binder then
-/// rejects as unsupported — we have no scalar functions yet).
+/// Maps a function name to an aggregate kind, case-insensitively. Returns `None` for any other
+/// function name.
 fn parse_agg_type(name: &ObjectName) -> Option<AggType> {
     let part = name.0.first()?;
     let ObjectNamePart::Identifier(id) = part else {
@@ -776,13 +723,45 @@ fn projection_has_aggregate(items: &[SelectItem]) -> bool {
     })
 }
 
+fn aggregate_outside_projection() -> BinderError {
+    BinderError("aggregate functions are only allowed in a SELECT projection".into())
+}
+
+fn reject_aggregate_call(expr: &Expr, message: &str) -> Result<(), BinderError> {
+    match expr {
+        Expr::Function(f) if parse_agg_type(&f.name).is_some() => Err(BinderError(message.into())),
+        _ => Ok(()),
+    }
+}
+
+/// The dotted name of a column reference, or `None` if `expr` is not one.
+fn column_path(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(id) => Some(id.value.clone()),
+        Expr::CompoundIdentifier(parts) => Some(
+            parts
+                .iter()
+                .map(|p| p.value.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
+        ),
+        _ => None,
+    }
+}
+
+/// COUNT yields INT; every other aggregate yields its argument's type.
+fn aggregate_result_type(agg_type: &AggType, arg: &Expression) -> Option<DataType> {
+    match agg_type {
+        AggType::COUNT => Some(DataType::INT),
+        _ => arg.dtype(),
+    }
+}
+
 fn expr_has_aggregate(e: &Expr) -> bool {
     match e {
         Expr::Function(f) => parse_agg_type(&f.name).is_some(),
         Expr::Nested(inner) => expr_has_aggregate(inner),
-        Expr::BinaryOp { left, right, .. } => {
-            expr_has_aggregate(left) || expr_has_aggregate(right)
-        }
+        Expr::BinaryOp { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
         _ => false,
     }
 }
@@ -807,13 +786,8 @@ pub enum BoundStatement {
     CreateIndex(BoundCreateIndex),
 }
 
-// select statements includes:
-// the tables included (scope),
-// an optional join (we support at most one — 2-way joins only),
-// whatever we want to retrieve (projections)
-// any filters
-// anything we want to sort by
-// a limit if there is one
+/// A bound SELECT: the tables in scope, an optional two-way join, projections, filters, grouping,
+/// ordering and an optional row limit.
 pub struct BoundSelect {
     pub scope: Scope,
     pub join: Option<BoundJoin>,
@@ -828,7 +802,7 @@ pub struct BoundSelect {
     /// against the child schema by the AggregationExecutor.
     pub aggregates: Vec<(Expression, AggType)>,
     pub sort: Option<Vec<Expression>>,
-    pub limit: Option<u32>, // no offset
+    pub limit: Option<u32>,
 }
 
 pub struct BoundJoin {
@@ -868,7 +842,7 @@ pub struct BoundCreateIndex {
     pub index_schema: Schema,
 }
 
-// keeps track of the tables in scope and the aliases that the AST uses
+/// The tables a statement can reference, keyed by the alias (or table name) used in the SQL.
 pub type Scope = HashMap<TableAlias, TableScope>;
 pub struct TableScope {
     pub oid: TableOid,
@@ -879,23 +853,187 @@ pub type TableAlias = String;
 pub type TableOid = u32;
 pub type TupleIndex = u8;
 
-fn test() {
-    let sql = "SELECT a, b, 123, myfunc(b) \
-           FROM table_1 t1 \
-           LEFT JOIN table_2 t2
-           ON t1.a = t2.a
-           WHERE a > b AND b < 100 \
-           ORDER BY a DESC, b";
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
 
-    let dialect = GenericDialect {}; // or AnsiDialect, or your own dialect ...
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
 
-    let ast = Parser::parse_sql(&dialect, sql).unwrap();
+    use super::{Binder, BoundStatement};
+    use crate::catalog::{Catalog, DataType, Schema};
+    use crate::create_buffer_pool_manager;
+    use crate::disk::{DiskManager, DiskScheduler};
+    use crate::processor::plan::Expression;
+    use crate::replacer::ArcReplacer;
 
-    println!("AST: {:?}", ast);
-    println!("AST len: {:?}", ast.len());
-}
+    fn catalog_with_tables(tables: &[(&str, &[&str])]) -> (Catalog, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).expect("disk");
+        let bpm = Arc::new(create_buffer_pool_manager(
+            16,
+            ArcReplacer::new(16),
+            DiskScheduler::new(dm),
+        ));
+        let catalog = Catalog::new(bpm);
+        for (name, cols) in tables {
+            let schema = Schema::new(
+                cols.iter()
+                    .map(|c| (DataType::INT, c.to_string()))
+                    .collect(),
+            );
+            catalog.create_table(name.to_string(), schema).unwrap();
+        }
+        (catalog, dir)
+    }
 
-#[test]
-fn test_ast() {
-    let a = test();
+    fn bind_one(catalog: &Catalog, sql: &str) -> Result<BoundStatement, String> {
+        let mut ast = Parser::parse_sql(&GenericDialect {}, sql).expect("valid SQL");
+        assert_eq!(ast.len(), 1, "expected exactly one statement");
+        Binder::new(catalog)
+            .bind_statement(&ast.remove(0))
+            .map_err(|e| e.0)
+    }
+
+    fn column_refs(exprs: &[Expression]) -> Vec<(u8, u32)> {
+        exprs
+            .iter()
+            .map(|e| match e {
+                Expression::Column {
+                    tuple_idx, col_idx, ..
+                } => (*tuple_idx, *col_idx),
+                _ => panic!("expected only column references"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn select_star_over_a_join_lists_left_columns_before_right_columns() {
+        let (catalog, _dir) = catalog_with_tables(&[("l", &["a", "b"]), ("r", &["c"])]);
+        for _ in 0..32 {
+            let Ok(BoundStatement::Select(sel)) =
+                bind_one(&catalog, "SELECT * FROM l JOIN r ON l.a = r.c")
+            else {
+                panic!("expected a bound SELECT");
+            };
+            assert_eq!(column_refs(&sel.projections), vec![(0, 0), (0, 1), (1, 0)]);
+        }
+    }
+
+    fn bind_error(catalog: &Catalog, sql: &str) -> String {
+        match bind_one(catalog, sql) {
+            Ok(_) => panic!("expected `{sql}` to fail to bind"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn aggregate_in_where_is_rejected() {
+        let (catalog, _dir) = catalog_with_tables(&[("t", &["a"])]);
+        let err = bind_error(&catalog, "SELECT a FROM t WHERE COUNT(a) > 1");
+        assert!(err.contains("only allowed in a SELECT projection"), "{err}");
+    }
+
+    #[test]
+    fn nested_aggregate_is_rejected() {
+        let (catalog, _dir) = catalog_with_tables(&[("t", &["a"])]);
+        let err = bind_error(&catalog, "SELECT SUM(COUNT(a)) FROM t");
+        assert!(err.contains("nested aggregate"), "{err}");
+    }
+
+    #[test]
+    fn ungrouped_column_in_aggregating_select_is_rejected() {
+        let (catalog, _dir) = catalog_with_tables(&[("t", &["a", "b"])]);
+        let err = bind_error(&catalog, "SELECT a, b FROM t GROUP BY a");
+        assert!(err.contains("column `b` must appear in GROUP BY"), "{err}");
+        let err = bind_error(&catalog, "SELECT t.b, COUNT(a) FROM t");
+        assert!(
+            err.contains("column `t.b` must appear in GROUP BY"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn group_by_and_aggregates_map_to_aggregation_output_columns() {
+        let (catalog, _dir) = catalog_with_tables(&[("t", &["a", "b"])]);
+        let Ok(BoundStatement::Select(sel)) =
+            bind_one(&catalog, "SELECT a, SUM(b), COUNT(*) FROM t GROUP BY a")
+        else {
+            panic!("expected a bound SELECT");
+        };
+        assert_eq!(column_refs(&sel.projections), vec![(0, 0), (0, 1), (0, 2)]);
+        assert_eq!(sel.group_bys.len(), 1);
+        assert_eq!(sel.aggregates.len(), 2);
+    }
+
+    #[test]
+    fn count_star_counts_every_row_through_a_non_null_argument_and_yields_int() {
+        let (catalog, _dir) = catalog_with_tables(&[("t", &["a"])]);
+        let Ok(BoundStatement::Select(sel)) = bind_one(&catalog, "SELECT COUNT(*) FROM t") else {
+            panic!("expected a bound SELECT");
+        };
+        let [(arg, _)] = sel.aggregates.as_slice() else {
+            panic!("expected one aggregate");
+        };
+        assert!(matches!(arg, Expression::Constant(Some(_))));
+        assert_eq!(sel.projections[0].dtype(), Some(DataType::INT));
+        let err = bind_error(&catalog, "SELECT SUM(*) FROM t");
+        assert!(err.contains("only valid as an argument to COUNT"), "{err}");
+    }
+
+    #[test]
+    fn bare_null_projection_is_rejected_but_null_in_arithmetic_is_typed_by_its_sibling() {
+        let (catalog, _dir) = catalog_with_tables(&[("t", &["a"])]);
+        let err = bind_error(&catalog, "SELECT NULL FROM t");
+        assert!(err.contains("bare NULL"), "{err}");
+        let Ok(BoundStatement::Select(sel)) = bind_one(&catalog, "SELECT a + NULL FROM t") else {
+            panic!("expected a bound SELECT");
+        };
+        assert_eq!(sel.projections[0].dtype(), Some(DataType::INT));
+    }
+
+    #[test]
+    fn joins_of_more_than_two_tables_are_rejected() {
+        let (catalog, _dir) = catalog_with_tables(&[("a", &["x"]), ("b", &["y"]), ("c", &["z"])]);
+        let err = bind_error(
+            &catalog,
+            "SELECT * FROM a JOIN b ON a.x = b.y JOIN c ON b.y = c.z",
+        );
+        assert!(err.contains("only 2-way joins"), "{err}");
+    }
+
+    #[test]
+    fn failed_aggregating_select_does_not_leak_into_the_next_statement() {
+        let (catalog, _dir) = catalog_with_tables(&[("t", &["a", "b"])]);
+        let binder = Binder::new(&catalog);
+        let parse = |sql: &str| {
+            Parser::parse_sql(&GenericDialect {}, sql)
+                .unwrap()
+                .remove(0)
+        };
+        assert!(
+            binder
+                .bind_statement(&parse("SELECT a, b FROM t GROUP BY a"))
+                .is_err()
+        );
+        assert!(
+            binder.bind_statement(&parse("UPDATE t SET a = b")).is_ok(),
+            "a later statement must not see the failed SELECT's GROUP BY"
+        );
+    }
+
+    #[test]
+    fn bind_resolves_every_statement_against_the_current_catalog() {
+        let (catalog, _dir) = catalog_with_tables(&[]);
+        let ast = Parser::parse_sql(
+            &GenericDialect {},
+            "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1)",
+        )
+        .unwrap();
+        let err = Binder::new(&catalog)
+            .bind(ast)
+            .err()
+            .expect("INSERT cannot see t yet");
+        assert!(err.0.contains("table not found: t"), "{}", err.0);
+    }
 }

@@ -1,41 +1,38 @@
 use std::collections::VecDeque;
 
-use crate::{
-    buffer_pool::{PageMut, PageRef},
-    index::b_plus_page::INVALID_PAGE_ID,
-};
+use crate::buffer_pool::PageMut;
+use crate::index::b_plus_page::PageId;
 
+/// Write latches held by a pessimistic insert or remove: the header, and the pages from the
+/// highest latched ancestor down to the current page.
 pub struct TreeContext<'a> {
     pub header: Option<PageMut<'a>>,
-
-    pub root_page_id: usize,
-
-    pub read_set: VecDeque<PageRef<'a>>,
-
+    pub root_page_id: PageId,
     pub write_set: VecDeque<PageMut<'a>>,
 }
 
 impl<'a> TreeContext<'a> {
-    pub fn new() -> Self {
+    pub fn new(header: PageMut<'a>, root_page_id: PageId) -> Self {
         TreeContext {
-            header: None,
-            root_page_id: INVALID_PAGE_ID,
-            read_set: VecDeque::new(),
+            header: Some(header),
+            root_page_id,
             write_set: VecDeque::new(),
         }
     }
-    /// drops all ancestors, and current node
-    pub fn drop_read_ancestors(&mut self) {
-        while self.read_set.pop_front().is_some() {}
+
+    /// Makes `child` the current page. When `child_is_safe`, the operation cannot propagate
+    /// above it, so every ancestor latch and the header latch are released.
+    pub fn descend_into(&mut self, child: PageMut<'a>, child_is_safe: bool) {
+        self.write_set.push_back(child);
+        if child_is_safe {
+            self.release_ancestors();
+        }
     }
 
-    /// drops all ancestors, but keeps current node
-    pub fn drop_write_ancestors(&mut self) {
-        if self.write_set.len() > 1 {
-            let leaf = self.write_set.pop_back().unwrap();
-            while self.write_set.pop_front().is_some() {}
-            self.write_set.push_back(leaf);
-        }
+    fn release_ancestors(&mut self) {
+        let current = self.write_set.pop_back();
+        self.write_set.clear();
+        self.write_set.extend(current);
         self.header = None;
     }
 }

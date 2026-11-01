@@ -1,5 +1,4 @@
-use log::info;
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::{Arc, Barrier};
 use std::thread;
 
 use cmudb::buffer_pool::{BpmError, BufferPoolManager};
@@ -47,27 +46,19 @@ fn write_flush_read_roundtrip() {
 fn cached_then_io_read_paths() {
     let (bpm, _tmp) = make_bpm(1);
 
-    // Create and cache page 0
     {
         let mut page0 = bpm.new_page().unwrap();
         page0.data_mut()[0..4].copy_from_slice(&[9, 9, 9, 9]);
     }
 
-    // Cached path
     {
-        {
-            let cached = bpm.read_page(0).unwrap();
-            assert_eq!(&cached.data()[0..4], &[9, 9, 9, 9]);
-        }
+        let cached = bpm.read_page(0).unwrap();
+        assert_eq!(&cached.data()[0..4], &[9, 9, 9, 9]);
     }
 
-    // Force eviction of page 0 so the next read goes through IO
-    {
-        let mut page1 = bpm.new_page().unwrap();
-        page1.data_mut()[0] = 7;
-    }
+    let evicts_page_0 = bpm.new_page().unwrap();
+    drop(evicts_page_0);
 
-    // Read page 0 again; this should trigger IO (page 0 was evicted)
     {
         let reread = bpm.read_page(0).unwrap();
         assert_eq!(&reread.data()[0..4], &[9, 9, 9, 9]);
@@ -80,7 +71,6 @@ fn no_free_frame_when_all_pinned() {
     let mut pinned = bpm.new_page().expect("pin the only frame");
     pinned.data_mut()[0] = 42;
 
-    // A miss must fail to reserve a frame before attempting disk IO.
     let err = bpm.read_page(1).unwrap_err();
     assert!(
         matches!(err, BpmError::NoFreeFrame),
@@ -127,14 +117,13 @@ fn frame_stays_pinned_until_last_read_guard_drops() {
 fn page_not_found_when_not_inserted() {
     let (bpm, _tmp) = make_bpm(1);
 
-    // An empty pool has a free frame, so a missing page reaches disk IO.
     let err = bpm.read_page(1).unwrap_err();
     assert!(
         matches!(err, BpmError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound),
         "unexpected error: {err}"
     );
 
-    bpm.new_page().unwrap(); // this immediately unpins since we don't assign this to anything
+    drop(bpm.new_page().unwrap());
     let err = bpm.read_page(1).unwrap_err();
     assert!(
         matches!(err, BpmError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound),
@@ -146,19 +135,16 @@ fn page_not_found_when_not_inserted() {
 fn eviction_flushes_and_clears_mapping() {
     let (bpm, _tmp) = make_bpm(1);
 
-    // Page 0 with data
     {
         let mut page0 = bpm.new_page().unwrap();
         page0.data_mut()[0..3].copy_from_slice(&[5, 6, 7]);
     }
 
-    // Allocate page 1 to force eviction of page 0
     {
         let mut page1 = bpm.new_page().unwrap();
         page1.data_mut()[0] = 42;
     }
 
-    // Page 0 should have been flushed and unmapped; re-read should still see the data
     {
         let reread = bpm.read_page(0).expect("page 0 re-read after eviction");
         assert_eq!(&reread.data()[0..3], &[5, 6, 7]);
@@ -169,66 +155,76 @@ fn eviction_flushes_and_clears_mapping() {
 fn io_error_restores_free_frame() {
     let (bpm, _tmp) = make_bpm(1);
 
-    // Page 99 is missing; first read should error
     assert!(matches!(
         bpm.read_page(99).unwrap_err(),
         BpmError::Io(_) | BpmError::ChannelClosed
     ));
 
-    // A subsequent new_page should succeed, proving the reserved frame was returned
-    {
+    drop(
         bpm.new_page()
-            .expect("frame should be available after IO error");
-    }
+            .expect("frame should be available after IO error"),
+    );
 }
 
 #[test]
 fn concurrent_writer_and_blocked_reader_respect_pins() {
     let (bpm, _tmp) = make_bpm(1);
-
     {
         let mut page0 = bpm.new_page().unwrap();
         page0.data_mut()[0] = 11;
-    } // frame_id=0 should be now set to evictable
+    }
 
-    let barrier = Arc::new(Barrier::new(2));
-    let bpm_writer = bpm.clone();
-    let bpm_reader = bpm.clone();
-    let writer_barrier = barrier.clone();
-    let reader_barrier = barrier.clone();
+    let writer_pinned = Arc::new(Barrier::new(2));
+    let reader_tried_while_pinned = Arc::new(Barrier::new(2));
+    let writer_unpinned = Arc::new(Barrier::new(2));
 
-    let writer = thread::spawn(move || {
-        {
-            let mut page = bpm_writer.write_page(0).unwrap();
+    let writer = {
+        let bpm = bpm.clone();
+        let (pinned, tried, unpinned) = (
+            writer_pinned.clone(),
+            reader_tried_while_pinned.clone(),
+            writer_unpinned.clone(),
+        );
+        thread::spawn(move || {
+            let mut page = bpm.write_page(0).unwrap();
             page.data_mut()[0] = 22;
-        }
-        writer_barrier.wait(); // allow reader's first attempt while pinned
-        writer_barrier.wait(); // reader finished first attempt
-        writer_barrier.wait(); // let reader proceed to second attempt
-    });
+            pinned.wait();
+            tried.wait();
+            drop(page);
+            unpinned.wait();
+        })
+    };
 
     let reader = thread::spawn(move || {
-        reader_barrier.wait(); // wait for writer to pin
-        // this sometimes panics on NoFreeFrame for some reason?
-        let err = bpm_reader.read_page(1).unwrap_err();
+        writer_pinned.wait();
+        let err = bpm_read_missing_page(&bpm);
+        assert!(
+            matches!(err, BpmError::NoFreeFrame),
+            "only frame is pinned by the writer, got {err}"
+        );
+        reader_tried_while_pinned.wait();
+        writer_unpinned.wait();
+        let err = bpm_read_missing_page(&bpm);
         assert!(
             matches!(err, BpmError::Io(_)),
-            "unexpected error while all frames pinned: {err}"
+            "frame is free again, so the miss reaches disk, got {err}"
         );
-        reader_barrier.wait(); // signal writer first attempt done
-        reader_barrier.wait(); // wait for writer to unpin
+        bpm
     });
     writer.join().unwrap();
-    reader.join().unwrap();
+    let bpm = reader.join().unwrap();
 
-    info!("expecting to evict frame 0");
-    bpm.new_page().unwrap(); // should now evict page 0
+    drop(
+        bpm.new_page()
+            .expect("page 0 is unpinned and can be evicted"),
+    );
+    let reread = bpm.read_page(0).unwrap();
+    assert_eq!(reread.data()[0], 22, "write survives eviction");
+}
 
-    // Verify page 0 changes persisted through eviction
-    {
-        let reread = bpm.read_page(0).unwrap();
-        assert_eq!(reread.data()[0], 22);
-    }
+fn bpm_read_missing_page(bpm: &Arc<BufferPoolManager>) -> BpmError {
+    const NEVER_ALLOCATED: usize = 1;
+    bpm.read_page(NEVER_ALLOCATED).unwrap_err()
 }
 
 #[test]
@@ -240,39 +236,31 @@ fn duplicate_miss_does_not_leak_frames() {
         p.data_mut()[0] = 99;
     }
 
-    // Evict page 0 so it's only on disk
-    {
-        let mut p1 = bpm.new_page().unwrap();
-        p1.data_mut()[0] = 1;
-    }
+    let evicts_page_0 = bpm.new_page().unwrap();
+    drop(evicts_page_0);
 
-    // Two concurrent reads for page 0 (miss path)
-    let (tx, rx) = mpsc::channel();
-    for _ in 0..2 {
-        let bpm_clone = bpm.clone();
-        let tx = tx.clone();
-        let handle = thread::spawn(move || {
-            let (_, result) = match bpm_clone.read_page(0) {
-                Ok(p) => {
-                    let b = p.data()[0];
-                    (Some(()), Ok(b))
+    let both_started = Arc::new(Barrier::new(2));
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let bpm = bpm.clone();
+            let both_started = both_started.clone();
+            thread::spawn(move || {
+                both_started.wait();
+                loop {
+                    match bpm.read_page(0) {
+                        Ok(p) => return p.data()[0],
+                        Err(BpmError::NoFreeFrame) => thread::yield_now(),
+                        Err(e) => panic!("unexpected error on concurrent miss: {e}"),
+                    }
                 }
-                Err(e) => (None, Err(e)),
-            };
-            tx.send(result).unwrap();
-        });
-        handle.join().unwrap();
+            })
+        })
+        .collect();
+    for r in readers {
+        assert_eq!(r.join().unwrap(), 99);
     }
 
-    let vals: Vec<_> = rx.iter().take(2).collect();
-    for v in vals {
-        assert_eq!(v.unwrap(), 99);
-    }
-
-    // After concurrent misses, we should still be able to allocate a new page (no leaked frames)
-    {
-        bpm.new_page().unwrap();
-    }
+    drop(bpm.new_page().expect("concurrent misses leak no frames"));
 }
 
 #[test]
@@ -307,16 +295,13 @@ fn test_eviction() {
         });
         handles.push(handle);
     }
-    // Make the test fail if any thread panicked
     for h in handles {
-        h.join().unwrap(); // unwrap() will panic if the thread panicked
+        h.join().expect("writer thread panicked");
     }
 }
 
 #[test]
-fn soak_randomized_workload() {
-    // Runs a longer, mixed read/write workload across more pages than frames to force evictions.
-    // warning: this puts a lot of stress on the machine
+fn soak_randomized_workload_with_more_pages_than_frames() {
     const NUM_FRAMES: usize = 66;
     const NUM_PAGES: usize = 100;
     const THREADS: usize = 20;
@@ -324,7 +309,6 @@ fn soak_randomized_workload() {
 
     let (bpm, _tmp) = make_bpm(NUM_FRAMES);
 
-    // Seed pages on disk so reads/writes have targets to churn on.
     let mut expected = Vec::with_capacity(NUM_PAGES);
     for _ in 0..NUM_PAGES {
         let val = rand::random::<u8>();
@@ -346,20 +330,18 @@ fn soak_randomized_workload() {
         let handle = thread::spawn(move || {
             barrier.wait();
             for _ in 0..OPS_PER_THREAD {
-                let page_id = rand::random_range(0.0..(NUM_PAGES as f64 - 1 as f64)) as usize;
+                let page_id = rand::random_range(0..NUM_PAGES);
                 let should_read = rand::random_bool(0.5);
                 if should_read {
-                    // Read path
                     match bpm.read_page(page_id) {
                         Ok(page) => {
                             let expected_val = *expected[page_id].read();
                             assert_eq!(page.data()[0], expected_val);
                         }
-                        Err(BpmError::NoFreeFrame) => continue, // sometimes all frames will be full
+                        Err(BpmError::NoFreeFrame) => continue,
                         Err(e) => panic!("unexpected read error: {e}"),
                     }
                 } else {
-                    // Write path
                     match bpm.write_page(page_id) {
                         Ok(mut page) => {
                             let mut expected_val = expected[page_id].write();
@@ -380,7 +362,6 @@ fn soak_randomized_workload() {
         h.join().unwrap();
     }
 
-    // After the churn, each page should still match the expected value.
     for pid in 0..NUM_PAGES {
         let expected_val = *expected[pid].read();
         let page_val = {
@@ -390,6 +371,74 @@ fn soak_randomized_workload() {
         assert_eq!(page_val, expected_val, "page {} mismatch", pid);
     }
 
-    // And we should still be able to allocate a new page, proving no leaked pins/frames.
-    bpm.new_page().unwrap();
+    drop(
+        bpm.new_page()
+            .expect("no leaked pins or frames after the churn"),
+    );
+}
+
+const HOT_PAGES: usize = 6;
+const HOT_FRAMES: usize = 4;
+const HOT_READERS: usize = 8;
+const HOT_READS_PER_THREAD: usize = 20_000;
+const HOT_DEADLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn read_hot_page(
+    bpm: &Arc<BufferPoolManager>,
+    page_id: usize,
+) -> Option<cmudb::buffer_pool::PageRef<'_>> {
+    match bpm.read_page(page_id) {
+        Ok(page) => {
+            assert_eq!(
+                page.data()[..8],
+                (page_id as u64).to_le_bytes(),
+                "a pinned frame holds the page it was pinned for"
+            );
+            Some(page)
+        }
+        Err(BpmError::NoFreeFrame) => {
+            thread::yield_now();
+            None
+        }
+        Err(e) => panic!("unexpected error reading page {page_id}: {e:?}"),
+    }
+}
+
+#[test]
+fn readers_racing_on_hot_pages_never_deadlock_or_evict_a_pinned_frame() {
+    let (bpm, _tmp) = make_bpm(HOT_FRAMES);
+    for page_id in 0..HOT_PAGES {
+        let mut page = bpm.new_page().expect("new page");
+        page.data_mut()[..8].copy_from_slice(&(page_id as u64).to_le_bytes());
+    }
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    for reader in 0..HOT_READERS {
+        let bpm = Arc::clone(&bpm);
+        let done_tx = done_tx.clone();
+        thread::spawn(move || {
+            for i in 0..HOT_READS_PER_THREAD {
+                let outer_id = (reader + i) % HOT_PAGES;
+                let Some(outer) = read_hot_page(&bpm, outer_id) else {
+                    continue;
+                };
+                let inner = read_hot_page(&bpm, (outer_id + 1) % HOT_PAGES);
+                drop(inner);
+                drop(outer);
+            }
+            done_tx.send(()).expect("test still waiting");
+        });
+    }
+    drop(done_tx);
+    for _ in 0..HOT_READERS {
+        done_rx
+            .recv_timeout(HOT_DEADLOCK_TIMEOUT)
+            .expect("every reader finishes; a timeout means the buffer pool deadlocked");
+    }
+
+    let all_frames_released: Vec<_> = (0..HOT_FRAMES).map(|_| bpm.new_page().map(drop)).collect();
+    assert!(
+        all_frames_released.iter().all(Result::is_ok),
+        "no pin outlives its guard"
+    );
 }

@@ -10,11 +10,15 @@ pub const KIND_HEADER: u8 = 0;
 pub const KIND_INTERNAL: u8 = 1;
 pub const KIND_LEAF: u8 = 2;
 
-pub const KIND_OFFSET: usize = 6;
-
 pub const U32_BYTES: usize = 4;
 pub const U64_BYTES: usize = 8;
-pub const COMMON_HEADER_BYTES: usize = 8; // MAGIC(4) + VERSION(2) + KIND(1) + RESERVED(1)
+
+const VERSION_BYTES: usize = size_of::<u16>();
+const KIND_BYTES: usize = size_of::<u8>();
+const RESERVED_BYTES: usize = size_of::<u8>();
+
+pub const KIND_OFFSET: usize = MAGIC.len() + VERSION_BYTES;
+pub const COMMON_HEADER_BYTES: usize = KIND_OFFSET + KIND_BYTES + RESERVED_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageCodecError {
@@ -78,12 +82,7 @@ pub fn decode_page_id(raw: u64) -> Result<PageId, PageCodecError> {
 }
 
 pub fn encode_record_id(rid: &RecordId) -> Result<(u64, u64), PageCodecError> {
-    Ok((
-        u64::try_from(rid.page_id)
-            .map_err(|_| PageCodecError::BufferError(BufferError::Overflow))?,
-        u64::try_from(rid.slot_id)
-            .map_err(|_| PageCodecError::BufferError(BufferError::Overflow))?,
-    ))
+    Ok((u64::from(rid.page_id), u64::from(rid.slot_id)))
 }
 
 pub fn decode_record_id(page_id: u64, slot_id: u64) -> Result<RecordId, PageCodecError> {
@@ -96,31 +95,140 @@ pub fn decode_record_id(page_id: u64, slot_id: u64) -> Result<RecordId, PageCode
 }
 
 pub fn write_common_header(w: &mut BufWriter<'_>, kind: u8) -> Result<(), PageCodecError> {
-    w.write_bytes(&MAGIC)
-        .map_err(|b| PageCodecError::BufferError(b))?;
-    w.write_u16_le(VERSION)
-        .map_err(|b| PageCodecError::BufferError(b))?;
-    w.write_u8(kind)
-        .map_err(|b| PageCodecError::BufferError(b))?;
-    w.write_u8(0).map_err(|b| PageCodecError::BufferError(b))?;
+    w.write_bytes(&MAGIC)?;
+    w.write_u16_le(VERSION)?;
+    w.write_u8(kind)?;
+    w.write_u8(0)?;
     Ok(())
 }
 
 pub fn read_common_header(r: &mut BufReader<'_>) -> Result<u8, PageCodecError> {
-    let magic = r
-        .read_bytes(4)
-        .map_err(|b| PageCodecError::BufferError(b))?;
-    if magic != MAGIC {
+    if r.read_bytes(MAGIC.len())? != MAGIC {
         return Err(PageCodecError::BadMagic);
     }
-    let version = r
-        .read_u16_le()
-        .map_err(|b| PageCodecError::BufferError(b))?;
-    // dont need this...
+    let version = r.read_u16_le()?;
     if version != VERSION {
         return Err(PageCodecError::UnsupportedVersion(version));
     }
-    let kind = r.read_u8().map_err(|b| PageCodecError::BufferError(b))?;
-    let _reserved = r.read_u8().map_err(|b| PageCodecError::BufferError(b))?;
+    let kind = r.read_u8()?;
+    let _reserved = r.read_u8()?;
     Ok(kind)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::disk::PAGE_SIZE;
+
+    #[test]
+    fn common_header_occupies_common_header_bytes() {
+        let mut buf = vec![0u8; PAGE_SIZE];
+        let mut w = BufWriter::new(&mut buf).unwrap();
+        write_common_header(&mut w, KIND_INTERNAL).unwrap();
+        assert_eq!(w.pos(), COMMON_HEADER_BYTES);
+        assert_eq!(COMMON_HEADER_BYTES, 8);
+        assert_eq!(buf[KIND_OFFSET], KIND_INTERNAL);
+        let mut r = BufReader::new(&buf).unwrap();
+        read_common_header(&mut r).unwrap();
+        assert_eq!(r.remaining(), PAGE_SIZE - COMMON_HEADER_BYTES);
+    }
+
+    #[test]
+    fn common_header_round_trips() {
+        let mut buf = vec![0u8; PAGE_SIZE];
+        write_common_header(&mut BufWriter::new(&mut buf).unwrap(), KIND_LEAF).unwrap();
+        assert_eq!(&buf[..4], b"CMDB");
+        assert_eq!(buf[KIND_OFFSET], KIND_LEAF);
+        let kind = read_common_header(&mut BufReader::new(&buf).unwrap()).unwrap();
+        assert_eq!(kind, KIND_LEAF);
+    }
+
+    #[test]
+    fn common_header_rejects_bad_magic_version_and_short_buffers() {
+        let mut buf = vec![0u8; PAGE_SIZE];
+        write_common_header(&mut BufWriter::new(&mut buf).unwrap(), KIND_HEADER).unwrap();
+
+        let mut bad_magic = buf.clone();
+        bad_magic[0] = b'X';
+        assert_eq!(
+            read_common_header(&mut BufReader::new(&bad_magic).unwrap()),
+            Err(PageCodecError::BadMagic)
+        );
+
+        let mut bad_version = buf.clone();
+        bad_version[4] = 9;
+        assert_eq!(
+            read_common_header(&mut BufReader::new(&bad_version).unwrap()),
+            Err(PageCodecError::UnsupportedVersion(9))
+        );
+
+        let mut tiny = [0u8; 3];
+        assert_eq!(
+            BufWriter::new(&mut tiny).err(),
+            Some(BufferError::BufferTooSmall {
+                needed: PAGE_SIZE,
+                actual: 3
+            })
+        );
+        assert!(BufReader::new(&tiny).is_err());
+    }
+
+    #[test]
+    fn page_and_record_ids_round_trip() {
+        assert_eq!(encode_page_id(INVALID_PAGE_ID).unwrap(), u64::MAX);
+        assert_eq!(decode_page_id(u64::MAX).unwrap(), INVALID_PAGE_ID);
+        assert_eq!(decode_page_id(encode_page_id(17).unwrap()).unwrap(), 17);
+
+        let rid = RecordId {
+            page_id: 4,
+            slot_id: 9,
+        };
+        let (p, s) = encode_record_id(&rid).unwrap();
+        assert_eq!(decode_record_id(p, s).unwrap(), rid);
+        assert!(decode_record_id(u64::from(u32::MAX) + 1, 0).is_err());
+        assert!(decode_record_id(0, u64::from(u32::MAX) + 1).is_err());
+    }
+
+    #[test]
+    fn errors_display_readably() {
+        let cases = [
+            (PageCodecError::BadMagic, "bad page magic"),
+            (
+                PageCodecError::UnsupportedVersion(3),
+                "unsupported page version 3",
+            ),
+            (
+                PageCodecError::WrongPageKind {
+                    expected: 1,
+                    actual: 2,
+                },
+                "wrong page kind (expected 1, got 2)",
+            ),
+            (PageCodecError::InvalidPageKind(7), "invalid page kind: 7"),
+            (
+                PageCodecError::InvalidKeyLen {
+                    expected: 8,
+                    actual: 4,
+                },
+                "invalid key length (expected 8, got 4)",
+            ),
+            (PageCodecError::InvalidSize, "invalid page size fields"),
+            (PageCodecError::Malformed("x"), "malformed page: x"),
+            (
+                PageCodecError::BufferError(BufferError::Overflow),
+                "numeric overflow decoding page",
+            ),
+            (
+                BufferError::BufferTooSmall {
+                    needed: 8,
+                    actual: 2,
+                }
+                .into(),
+                "buffer too small (needed 8 bytes, got 2 bytes)",
+            ),
+        ];
+        for (err, msg) in cases {
+            assert_eq!(err.to_string(), msg);
+        }
+    }
 }

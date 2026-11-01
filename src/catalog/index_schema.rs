@@ -2,10 +2,8 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use crate::buffer_pool::BufferPoolManager;
-use crate::catalog::{Column, DataType, IndexType, Schema, Value, is_null};
-use crate::index::{
-    BPlusTree, Index, IndexError, IndexIter, InsertError, InsertResult, RemoveError, RemoveResult,
-};
+use crate::catalog::{DataType, IndexType, Schema, Value};
+use crate::index::{BPlusTree, Index, IndexError, IndexIter, InsertResult, RemoveResult};
 use crate::table_heap::{RecordId, Tuple};
 
 #[derive(Debug, PartialEq, PartialOrd, Ord, Eq, Clone)]
@@ -16,110 +14,117 @@ pub enum IndexValue {
     IndexValue(RecordId),
 }
 
-/// We do not allow nulls in indexes!!!
+/// An index over some columns of a table. Rows with a NULL in any key column are not stored.
 pub struct TableIndex {
-    indexed_cols: Vec<Column>, // offsets are into the table tuple's payload region
-    pub indexed_col_idxs: Vec<usize>, // each indexed column's position in the table schema (for null-bit lookup)
-    table_bitmap_len: usize,          // bytes of bitmap prefix on tuples from the indexed table
-    pub schema: Schema,               // schema of the index key, not the tuple
-    key_size: usize,
-    idx: Box<dyn Index>,
+    table_schema: Schema,
+    /// Position of each key column in the table schema.
+    pub indexed_col_idxs: Vec<usize>,
+    /// Schema of the index key (the key columns only).
+    pub schema: Schema,
+    idx: Box<dyn Index + Send + Sync>,
 }
 
-/// represents an index of a table
-/// does NOT support nulls, i.e. our indexes contain only non-nulled
 impl TableIndex {
+    /// Creates an empty index over `indexed_col_idxs` of `table_schema`.
+    ///
+    /// Panics if a column index is out of range for `table_schema`.
     pub fn new(
         bpm: Arc<BufferPoolManager>,
         index_name: String,
-        indexed_cols: Vec<Column>,
+        table_schema: Schema,
         indexed_col_idxs: Vec<usize>,
-        table_bitmap_len: usize,
         index_type: IndexType,
     ) -> Result<Self, IndexError> {
-        let cols_for_schema: Vec<(DataType, String)> = indexed_cols
+        let key_cols: Vec<(DataType, String)> = indexed_col_idxs
             .iter()
-            .map(|c| (c.dtype, c.name.clone()))
+            .map(|&i| {
+                let col = table_schema
+                    .cols
+                    .get(i)
+                    .unwrap_or_else(|| panic!("indexed column {i} is not in the table schema"));
+                (col.dtype, col.name.clone())
+            })
             .collect();
-        let schema = Schema::new(cols_for_schema);
-        let key_size = schema.data_len;
+        let schema = Schema::new(key_cols);
 
         let idx = match index_type {
-            IndexType::BPlusTree => BPlusTree::new(index_name, key_size as u32, bpm)?,
+            IndexType::BPlusTree => BPlusTree::new(index_name, schema.data_len as u32, bpm)?,
         };
 
         Ok(Self {
-            indexed_cols,
+            table_schema,
             indexed_col_idxs,
-            table_bitmap_len,
             schema,
-            key_size,
             idx: Box::new(idx),
         })
     }
 
-    pub fn encode_key(&self, tuple: &Tuple) -> IndexKey {
-        let mut data = Vec::with_capacity(self.key_size);
-        for c in self.indexed_cols.iter() {
-            c.dtype
-                .encode_from_tuple(tuple, self.table_bitmap_len, c.offset, &mut data);
-        }
-        IndexKey(data)
-    }
-
-    fn encode_key_from_values(&self, vals: &[Value]) -> IndexKey {
-        assert_eq!(vals.len(), self.indexed_cols.len());
-        let mut data = Vec::with_capacity(self.key_size);
-        for v in vals.iter() {
-            // Sort-friendly encoding: must match encode_from_tuple's per-type format
-            // exactly so search/scan keys line up with insert keys.
-            match v {
-                Value::BOOLEAN(b) => data.push(*b as u8),
-                Value::INT(i) => {
-                    data.extend_from_slice(&((*i as u32) ^ 0x8000_0000).to_be_bytes());
-                }
-                Value::FLOAT(f) => {
-                    data.extend_from_slice(&((f.0 as u32) ^ 0x8000_0000).to_be_bytes());
-                }
-                Value::TIMESTAMP(t) => {
-                    data.extend_from_slice(&((*t as u64) ^ 0x8000_0000_0000_0000).to_be_bytes());
-                }
-            }
-        }
-        IndexKey(data)
-    }
-
-    fn key_has_null(&self, tuple: &Tuple) -> bool {
-        self.indexed_col_idxs
+    /// Encodes the key columns of a table tuple, or returns `None` when any of them is NULL.
+    pub fn key_of_tuple(&self, tuple: &Tuple) -> Option<IndexKey> {
+        let values = self
+            .indexed_col_idxs
             .iter()
-            .any(|&i| is_null(&tuple.data, i))
+            .map(|&i| {
+                self.table_schema
+                    .get_value(tuple, i)
+                    .expect("indexed column index was validated against the table schema")
+            })
+            .collect::<Option<Vec<Value>>>()?;
+        Some(self.key_of_values(&values))
     }
 
+    fn key_of_values(&self, vals: &[Value]) -> IndexKey {
+        assert_eq!(
+            vals.len(),
+            self.indexed_col_idxs.len(),
+            "an index key needs one value per key column"
+        );
+        let mut data = Vec::with_capacity(self.schema.data_len);
+        for v in vals {
+            v.encode_order_preserving(&mut data);
+        }
+        IndexKey(data)
+    }
+
+    /// Adds `rid` under the tuple's key. A tuple with a NULL key column is skipped.
     pub fn insert(&self, tuple: &Tuple, rid: RecordId) -> InsertResult {
-        if self.key_has_null(tuple) {
-            return Ok(()); // skip inserting a null value. we could return an error instead, idk
+        match self.key_of_tuple(tuple) {
+            Some(key) => self.idx.insert(key, IndexValue::IndexValue(rid)),
+            None => Ok(()),
         }
-        let key = self.encode_key(tuple);
-        self.idx.insert(key, IndexValue::IndexValue(rid))
-    }
-    pub fn remove(&self, tuple: &Tuple) -> RemoveResult {
-        if self.key_has_null(tuple) {
-            return Ok(()); // wasn't indexed, nothing to remove
-        }
-        let key = self.encode_key(tuple);
-        self.idx.remove(key)
     }
 
-    /// search looks up a key in the index
+    /// Removes the tuple's key. A tuple with a NULL key column is skipped.
+    pub fn remove(&self, tuple: &Tuple) -> RemoveResult {
+        match self.key_of_tuple(tuple) {
+            Some(key) => self.idx.remove(key),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether storing `new` in place of `old` would hit a key another row already holds.
+    /// `old` is `None` for a new row. A NULL key column, or a key equal to `old`'s, is no
+    /// conflict.
+    pub fn conflicts(&self, old: Option<&Tuple>, new: &Tuple) -> Result<bool, IndexError> {
+        let Some(key) = self.key_of_tuple(new) else {
+            return Ok(false);
+        };
+        if old.and_then(|old| self.key_of_tuple(old)).as_ref() == Some(&key) {
+            return Ok(false);
+        }
+        Ok(self.idx.search(&key)?.is_some())
+    }
+
+    /// Looks up the record stored under the key made of `vals`.
     pub fn search(&self, vals: &[Value]) -> Result<Option<RecordId>, IndexError> {
-        let key = self.encode_key_from_values(vals);
+        let key = self.key_of_values(vals);
         match self.idx.search(&key)? {
             Some(IndexValue::IndexValue(rid)) => Ok(Some(rid)),
-            _ => Ok(None),
+            None => Ok(None),
         }
     }
 
-    /// scans the index with start/end key bounds
+    /// Iterates the entries whose keys fall between `start` and `end`, in key order.
     pub fn scan(
         &self,
         start: Bound<&[Value]>,
@@ -127,8 +132,8 @@ impl TableIndex {
     ) -> Result<IndexIter, IndexError> {
         let to_key = |b: Bound<&[Value]>| -> Bound<IndexKey> {
             match b {
-                Bound::Included(v) => Bound::Included(self.encode_key_from_values(v)),
-                Bound::Excluded(v) => Bound::Excluded(self.encode_key_from_values(v)),
+                Bound::Included(v) => Bound::Included(self.key_of_values(v)),
+                Bound::Excluded(v) => Bound::Excluded(self.key_of_values(v)),
                 Bound::Unbounded => Bound::Unbounded,
             }
         };
@@ -138,22 +143,24 @@ impl TableIndex {
 
 #[cfg(test)]
 mod tests {
-    use crate::catalog::index_schema::IndexType;
-    use crate::catalog::index_schema::TableIndex;
+    use std::ops::Bound;
+    use std::sync::Arc;
+
+    use ordered_float::OrderedFloat;
+    use tempfile::tempdir;
+
+    use super::{IndexValue, TableIndex};
+    use crate::buffer_pool::BufferPoolManager;
+    use crate::catalog::{DataType, IndexType, Schema, Value};
     use crate::create_buffer_pool_manager;
     use crate::disk::{DiskManager, DiskScheduler};
     use crate::replacer::ArcReplacer;
-    use std::sync::Arc;
-    use tempfile::tempdir;
-
-    use crate::buffer_pool::BufferPoolManager;
-    use crate::catalog::{DataType, Schema, Value};
+    use crate::table_heap::RecordId;
 
     fn make_bpm(num_frames: usize) -> (Arc<BufferPoolManager>, tempfile::TempDir) {
         let dir = tempdir().expect("tempdir");
-        let db_path = dir.path().join("db");
-        let log_path = dir.path().join("log");
-        let dm = DiskManager::new(&db_path, &log_path).expect("disk manager");
+        let dm =
+            DiskManager::new(dir.path().join("db"), dir.path().join("log")).expect("disk manager");
         let scheduler = DiskScheduler::new(dm);
         let replacer = ArcReplacer::new(num_frames);
         (
@@ -162,51 +169,101 @@ mod tests {
         )
     }
 
+    fn rid(slot_id: u32) -> RecordId {
+        RecordId {
+            page_id: 0,
+            slot_id,
+        }
+    }
+
     #[test]
-    fn test_index_encoder() {
-        // 1. create a schema
+    fn key_of_tuple_encodes_only_the_indexed_columns() {
         let schema = Schema::new(vec![
             (DataType::INT, "a".to_string()),
             (DataType::BOOLEAN, "b".to_string()),
             (DataType::INT, "c".to_string()),
             (DataType::INT, "d".to_string()),
         ]);
-        // each tuple in this schema should be 4 + 1 + 4 + 4 bytes
-        assert_eq!(13, schema.data_len);
+        let tuple = schema
+            .encode_tuple(&[
+                Some(Value::INT(12)),
+                Some(Value::BOOLEAN(true)),
+                Some(Value::INT(13)),
+                Some(Value::INT(14)),
+            ])
+            .unwrap();
+        let (bpm, _dir) = make_bpm(10);
+        let index =
+            TableIndex::new(bpm, "i".into(), schema, vec![0, 2], IndexType::BPlusTree).unwrap();
 
-        // 2. create a tuple that abides to this schema
-        let values = vec![
-            Some(Value::INT(12)),
-            Some(Value::BOOLEAN(true)),
-            Some(Value::INT(13)),
-            Some(Value::INT(14)),
-        ];
-        let tup = schema.encode_tuple(&values).unwrap();
+        assert_eq!(8, index.schema.data_len);
+        let key = index.key_of_tuple(&tuple).expect("no NULL key columns");
+        assert_eq!(key, index.key_of_values(&[Value::INT(12), Value::INT(13)]));
+    }
 
-        // 3. create an index
-        let index_cols = vec![
-            schema.cols.get(0).unwrap().clone(),
-            schema.cols.get(2).unwrap().clone(),
-        ];
-        let index_col_idxs = vec![0, 2];
-
-        let (bpm, _tmp) = make_bpm(10);
-
+    #[test]
+    fn rows_with_a_null_key_column_are_not_indexed() {
+        let schema = Schema::new(vec![
+            (DataType::INT, "a".to_string()),
+            (DataType::INT, "b".to_string()),
+        ]);
+        let (bpm, _dir) = make_bpm(10);
         let index = TableIndex::new(
             bpm,
-            "mock_index".to_string(),
-            index_cols,
-            index_col_idxs,
-            schema.bitmap_len,
+            "i".into(),
+            schema.clone(),
+            vec![0],
             IndexType::BPlusTree,
         )
         .unwrap();
-        assert_eq!(8, index.schema.data_len);
+        let null_key = schema.encode_tuple(&[None, Some(Value::INT(1))]).unwrap();
 
-        let tuples = vec![tup];
-        for t in tuples.iter() {
-            let index_key = index.encode_key(t).0;
-            assert_eq!(2 * 4, index_key.len());
+        assert!(index.key_of_tuple(&null_key).is_none());
+        index
+            .insert(&null_key, rid(0))
+            .expect("NULL keys are skipped");
+        index.remove(&null_key).expect("NULL keys are skipped");
+        let entries: Vec<_> = index
+            .scan(Bound::Unbounded, Bound::Unbounded)
+            .unwrap()
+            .collect();
+        assert!(entries.is_empty(), "a NULL-keyed row must not be stored");
+    }
+
+    #[test]
+    fn float_keys_with_the_same_integer_part_are_distinct_and_ordered() {
+        let schema = Schema::new(vec![(DataType::FLOAT, "f".to_string())]);
+        let (bpm, _dir) = make_bpm(16);
+        let index = TableIndex::new(
+            bpm,
+            "i".into(),
+            schema.clone(),
+            vec![0],
+            IndexType::BPlusTree,
+        )
+        .unwrap();
+        let floats = [3.7_f32, -1.5, 3.2, -0.25, 0.5];
+        for (slot, f) in floats.iter().enumerate() {
+            let tuple = schema
+                .encode_tuple(&[Some(Value::FLOAT(OrderedFloat(*f)))])
+                .unwrap();
+            index
+                .insert(&tuple, rid(slot as u32))
+                .expect("distinct floats must not collide");
         }
+
+        assert_eq!(
+            index.search(&[Value::FLOAT(OrderedFloat(3.2))]).unwrap(),
+            Some(rid(2))
+        );
+        let scanned: Vec<u32> = index
+            .scan(Bound::Unbounded, Bound::Unbounded)
+            .unwrap()
+            .map(|e| {
+                let (_, IndexValue::IndexValue(r)) = e.unwrap();
+                r.slot_id
+            })
+            .collect();
+        assert_eq!(scanned, vec![1, 3, 4, 2, 0], "scan follows float order");
     }
 }

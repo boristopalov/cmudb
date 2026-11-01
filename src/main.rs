@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, Write};
+use std::path::Path;
 use std::sync::Arc;
 
 use cmudb::catalog::{Catalog, Schema, Value};
@@ -15,17 +16,19 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use tempfile::tempdir;
 
+const NUM_FRAMES: usize = 64;
+
 fn main() {
-    let num_frames: usize = 64;
-    let dir = tempdir().expect("failed to create tempdir for db");
-    let dm = DiskManager::new(
-        dir.path().join("cmudb.data"),
-        dir.path().join("cmudb.log"),
-    )
-    .expect("failed to create disk manager");
+    let db_dir = tempdir().expect("failed to create tempdir for db");
+    run_shell(db_dir.path());
+}
+
+fn run_shell(db_dir: &Path) {
+    let dm = DiskManager::new(db_dir.join("cmudb.data"), db_dir.join("cmudb.log"))
+        .expect("failed to create disk manager");
     let scheduler = DiskScheduler::new(dm);
-    let replacer = ArcReplacer::new(num_frames);
-    let bpm = Arc::new(create_buffer_pool_manager(num_frames, replacer, scheduler));
+    let replacer = ArcReplacer::new(NUM_FRAMES);
+    let bpm = Arc::new(create_buffer_pool_manager(NUM_FRAMES, replacer, scheduler));
     let catalog = Catalog::new(bpm.clone());
 
     let dialect = GenericDialect {};
@@ -69,9 +72,6 @@ fn main() {
             prompt(&mut stdout, true);
         }
     }
-
-    // keep the tempdir alive for the whole session
-    drop(dir);
 }
 
 fn prompt(out: &mut io::Stdout, continuation: bool) {
@@ -88,11 +88,13 @@ fn run(
 ) -> Result<(), String> {
     let ast = Parser::parse_sql(dialect, sql).map_err(|e| format!("parse: {e}"))?;
     let binder = Binder::new(catalog);
-    let bound = binder.bind(ast).map_err(|e| format!("bind: {}", e.0))?;
     let planner = Planner::new(catalog);
 
-    for stmt in bound {
-        let plan = planner.plan(stmt).map_err(|e| format!("plan: {}", e.0))?;
+    for stmt in &ast {
+        let bound = binder
+            .bind_statement(stmt)
+            .map_err(|e| format!("bind: {}", e.0))?;
+        let plan = planner.plan(bound).map_err(|e| format!("plan: {}", e.0))?;
         let mut exec = create_executor(catalog, bpm, &plan);
         exec.open().map_err(|e| format!("open: {}", e.0))?;
         execute(&plan, &mut *exec)?;
@@ -105,9 +107,7 @@ fn execute(plan: &Plan, exec: &mut dyn Executor) -> Result<(), String> {
     match plan {
         Plan::Insert(_) => {
             if let Some((tup, _)) = exec.next().map_err(|e| format!("exec: {}", e.0))? {
-                let n = i32::from_ne_bytes(
-                    tup.data.as_slice().try_into().unwrap_or([0, 0, 0, 0]),
-                );
+                let n = i32::from_ne_bytes(tup.data.as_slice().try_into().unwrap_or([0, 0, 0, 0]));
                 println!("INSERT {n}");
             }
         }
@@ -218,5 +218,33 @@ fn format_value(v: &Value) -> String {
         Value::INT(i) => i.to_string(),
         Value::FLOAT(f) => f.into_inner().to_string(),
         Value::TIMESTAMP(t) => t.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_input_line_can_create_a_table_and_then_use_it() {
+        let dir = tempdir().expect("tempdir");
+        let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).expect("disk");
+        let bpm = Arc::new(create_buffer_pool_manager(
+            16,
+            ArcReplacer::new(16),
+            DiskScheduler::new(dm),
+        ));
+        let catalog = Catalog::new(bpm.clone());
+
+        let result = run(
+            &GenericDialect {},
+            &catalog,
+            &bpm,
+            "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1); SELECT * FROM t;",
+        );
+
+        assert_eq!(result, Ok(()));
+        let oid = catalog.table_oid("t").expect("table t was created");
+        assert_eq!(catalog.get_table(oid).unwrap().heap.iter().count(), 1);
     }
 }

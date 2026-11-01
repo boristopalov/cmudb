@@ -1,12 +1,12 @@
 use crate::buf::{BufReader, BufWriter, BufferError};
 use crate::catalog::index_schema::IndexKey;
 use crate::disk::PAGE_SIZE;
-use crate::index::RemoveError;
 use crate::index::page_codec::{
     COMMON_HEADER_BYTES, KIND_HEADER, KIND_INTERNAL, KIND_LEAF, KIND_OFFSET, PageCodecError,
     U32_BYTES, U64_BYTES, decode_page_id, decode_record_id, encode_page_id, encode_record_id,
     read_common_header, write_common_header,
 };
+use crate::index::{InsertError, RemoveError};
 use crate::table_heap::RecordId;
 use log::{error, info};
 use std::collections::VecDeque;
@@ -17,15 +17,29 @@ pub type PageId = usize;
 pub const INVALID_PAGE_ID: PageId = usize::MAX;
 pub const NUM_TOMBSTONES: u32 = 256;
 
-// each page id is written to disk as a u64
 const PAGE_ID_ENCODED_BYTES: usize = U64_BYTES;
 const RECORD_ID_ENCODED_BYTES: usize = 2 * U64_BYTES;
+const TOMBSTONE_COUNT_ENCODED_BYTES: usize = U32_BYTES;
 const TOMBSTONE_SLOT_ENCODED_BYTES: usize = U32_BYTES;
 
-// Per-page fixed headers (common header + per-kind fields).
-const INTERNAL_FIXED_HEADER_BYTES: usize = COMMON_HEADER_BYTES + (4 * U32_BYTES); // size, max_size, child_count, reserved
-const LEAF_FIXED_HEADER_BYTES: usize = COMMON_HEADER_BYTES + (2 * U32_BYTES) + U64_BYTES; // size, max_size, next_leaf_id
-const HEADER_FIXED_HEADER_BYTES: usize = COMMON_HEADER_BYTES + (2 * U32_BYTES) + (2 * U64_BYTES); // key_len, reserved, root_page_id, first_leaf_id
+const SIZE_FIELD_BYTES: usize = U32_BYTES;
+const MAX_SIZE_FIELD_BYTES: usize = U32_BYTES;
+const CHILD_COUNT_FIELD_BYTES: usize = U32_BYTES;
+const RESERVED_FIELD_BYTES: usize = U32_BYTES;
+const KEY_LEN_FIELD_BYTES: usize = U32_BYTES;
+
+const INTERNAL_FIXED_HEADER_BYTES: usize = COMMON_HEADER_BYTES
+    + SIZE_FIELD_BYTES
+    + MAX_SIZE_FIELD_BYTES
+    + CHILD_COUNT_FIELD_BYTES
+    + RESERVED_FIELD_BYTES;
+const LEAF_FIXED_HEADER_BYTES: usize =
+    COMMON_HEADER_BYTES + SIZE_FIELD_BYTES + MAX_SIZE_FIELD_BYTES + PAGE_ID_ENCODED_BYTES;
+const HEADER_FIXED_HEADER_BYTES: usize = COMMON_HEADER_BYTES
+    + KEY_LEN_FIELD_BYTES
+    + RESERVED_FIELD_BYTES
+    + PAGE_ID_ENCODED_BYTES
+    + PAGE_ID_ENCODED_BYTES;
 
 #[derive(Debug, PartialEq)]
 pub enum PageType {
@@ -58,13 +72,11 @@ impl Base {
     }
 }
 
-// probably a simpler way of doing this
 pub enum Page {
     Internal(InternalPage),
     Leaf(LeafPage),
 }
 
-// also probably a better way of doing this (see kind())
 pub enum PageKind {
     Internal,
     Leaf,
@@ -91,8 +103,8 @@ impl Page {
 #[derive(Debug)]
 pub struct InternalPage {
     base: Base,
-    pub children: Vec<PageId>, // page_ids that child nodes are in
-    pub keys: Vec<IndexKey>,   // invariant: children.len() == keys.len() + 1
+    pub children: Vec<PageId>,
+    pub keys: Vec<IndexKey>,
 }
 
 impl InternalPage {
@@ -109,23 +121,18 @@ impl InternalPage {
         self.children.get(idx)
     }
 
-    // TODO: simplify this horrid calculation
+    /// Returns the most keys an internal page with `key_len`-byte keys can encode into one page.
     pub fn max_size_for_layout(key_len: usize) -> Option<u32> {
         if key_len == 0 {
             return None;
         }
-        // Internal layout:
-        // - fixed header
-        // - (n+1) child pointers (u64)
-        // - n keys (key_len bytes)
-        //
-        // bytes = INTERNAL_FIXED_HEADER_BYTES + (n+1)*PAGE_ID + n*key_len
-        // => n <= floor((PAGE_SIZE - INTERNAL_FIXED_HEADER_BYTES - PAGE_ID) / (key_len + PAGE_ID))
-        let denom = key_len.checked_add(PAGE_ID_ENCODED_BYTES)?;
-        let fixed = INTERNAL_FIXED_HEADER_BYTES.checked_add(PAGE_ID_ENCODED_BYTES)?;
-        let slack = PAGE_SIZE.checked_sub(fixed)?;
-        let n = slack / denom;
-        u32::try_from(n).ok().filter(|&v| v > 0)
+        let leftmost_child_bytes = PAGE_ID_ENCODED_BYTES;
+        let bytes_per_key_and_right_child = key_len.checked_add(PAGE_ID_ENCODED_BYTES)?;
+        let space_for_keys =
+            PAGE_SIZE.checked_sub(INTERNAL_FIXED_HEADER_BYTES + leftmost_child_bytes)?;
+        u32::try_from(space_for_keys / bytes_per_key_and_right_child)
+            .ok()
+            .filter(|&n| n > 0)
     }
 
     pub fn validate(&self) {
@@ -152,20 +159,13 @@ impl InternalPage {
         );
     }
 
-    /// Given a key, returns the index of the child page that should be searched next
-    /// in order to continue searching for the given key.
-    /// The returned index should be used to look up the child page ID in the page's list of children when searching,
-    /// or to determine where to insert a child.
+    /// Returns the index `i` of the child whose subtree holds `key`: the number of keys `<= key`,
+    /// so `keys[i - 1] <= key < keys[i]` wherever those keys exist.
     pub fn find_child_index(&self, key: &IndexKey) -> usize {
-        // Returns i such that:
-        // - i == 0: key < keys[0]
-        // - 0 < i < keys.len(): keys[i-1] <= key < keys[i]
-        // - i == keys.len(): keys[last] <= key
         self.keys.partition_point(|k| k <= key)
     }
 
-    /// Inserts a child, such that the inserted child is to the right of the separator key.
-    ///
+    /// Inserts `sep_key` and `right_child`, with the child directly to the right of the key.
     pub fn insert_separator(&mut self, sep_key: IndexKey, right_child: PageId) {
         let left_child_index = self.find_child_index(&sep_key);
         assert!(
@@ -193,6 +193,8 @@ impl InternalPage {
         self.base.min_size()
     }
 
+    /// Moves the keys and children above the middle key into the empty `right` page, removes the
+    /// middle key from this page and returns it for the parent.
     pub fn split_into(&mut self, right: &mut InternalPage) -> IndexKey {
         assert!(
             right.children.is_empty() && right.keys.is_empty(),
@@ -202,7 +204,6 @@ impl InternalPage {
 
         let mid = self.keys.len() / 2;
 
-        // Right gets keys[mid+1..] and children[mid+1..]. The middle key is promoted to the parent.
         right.keys = self.keys.split_off(mid + 1);
         let sep_key = self
             .keys
@@ -389,11 +390,8 @@ impl InternalPage {
         self.base.size < self.base.min_size()
     }
 
-    /// Removes the separator key between `children[left_child_index]` and `children[left_child_index+1]`,
-    /// and removes (and returns) the right child pointer (`children[left_child_index+1]`).
-    /// TODO: can we make these internal
-    /// The interface for this class is massive and impossible to reason with
-    /// need to reduce the surface area.
+    /// Removes the separator key between `children[left_child_index]` and
+    /// `children[left_child_index + 1]`, and returns it with that right child.
     pub fn remove_separator(&mut self, left_child_index: usize) -> (IndexKey, PageId) {
         assert!(
             left_child_index < self.keys.len(),
@@ -458,13 +456,6 @@ impl InternalPage {
     pub fn would_be_underfull(&self) -> bool {
         self.base.size == self.base.min_size()
     }
-
-    // pub fn init_as_root(&mut self, left_child: PageId, sep_key: IndexKey, right_child: PageId) {
-    //     self.children = vec![left_child, right_child];
-    //     self.keys = vec![sep_key];
-    //     self.base.size = 1;
-    //     self.validate();
-    // }
 }
 
 #[derive(Debug)]
@@ -472,63 +463,43 @@ pub struct LeafPage {
     base: Base,
     pub keys: Vec<IndexKey>,
     pub record_ids: Vec<RecordId>,
-    pub next_leaf_id: PageId, // for range scans
+    /// Page id of the next leaf to the right, or `INVALID_PAGE_ID` for the last leaf.
+    pub next_leaf_id: PageId,
+    /// Slots of deleted keys still stored in the page, oldest deletion first.
     pub tombstones: VecDeque<u32>,
     pub tombstone_capacity: usize,
 }
 
 impl LeafPage {
+    /// Returns the most entries a leaf with `key_len`-byte keys can encode into one page,
+    /// leaving room for an empty tombstone section.
     pub fn max_size_for_layout(key_len: usize) -> Option<u32> {
         if key_len == 0 {
             return None;
         }
-        // Leaf layout:
-        // - fixed header
-        // - n entries: key_len + RecordId
-        // - trailing tombstone count (u32)
-        //
-        // bytes = LEAF_FIXED_HEADER_BYTES + n*(key_len + RecordId) + u32
         let entry_bytes = key_len.checked_add(RECORD_ID_ENCODED_BYTES)?;
-        let fixed = LEAF_FIXED_HEADER_BYTES.checked_add(TOMBSTONE_SLOT_ENCODED_BYTES)?;
-        let slack = PAGE_SIZE.checked_sub(fixed)?;
-        let n = slack / entry_bytes;
-        u32::try_from(n).ok().filter(|&v| v > 0)
+        let space_for_entries =
+            PAGE_SIZE.checked_sub(LEAF_FIXED_HEADER_BYTES + TOMBSTONE_COUNT_ENCODED_BYTES)?;
+        u32::try_from(space_for_entries / entry_bytes)
+            .ok()
+            .filter(|&n| n > 0)
     }
 
+    /// Returns how many tombstones (at most `requested`) fit beside a full leaf of `max_size` entries.
     pub fn tombstone_capacity_for_layout(max_size: u32, key_len: u32, requested: u32) -> u32 {
-        let key_len = match usize::try_from(key_len) {
-            Ok(v) => v,
-            Err(_) => return 0,
-        };
-        if key_len == 0 {
-            return 0;
-        }
-        let entry_bytes = match key_len.checked_add(RECORD_ID_ENCODED_BYTES) {
-            Some(v) => v,
-            None => return 0,
-        };
-        let max_size = match usize::try_from(max_size) {
-            Ok(v) => v,
-            Err(_) => return 0,
-        };
-        let live_needed =
-            match LEAF_FIXED_HEADER_BYTES.checked_add(match max_size.checked_mul(entry_bytes) {
-                Some(v) => v,
-                None => return 0,
-            }) {
-                Some(v) => v,
-                None => return 0,
-            };
-        if live_needed >= PAGE_SIZE {
-            return 0;
-        }
-        let slack = PAGE_SIZE - live_needed;
-        if slack < TOMBSTONE_SLOT_ENCODED_BYTES {
-            return 0;
-        }
-        let fit = (slack - TOMBSTONE_SLOT_ENCODED_BYTES) / TOMBSTONE_SLOT_ENCODED_BYTES;
-        let requested = requested as usize;
-        u32::try_from(requested.min(fit)).unwrap_or(0)
+        Self::tombstone_slots_beside_full_leaf(max_size, key_len)
+            .map_or(0, |fit| fit.min(requested))
+    }
+
+    fn tombstone_slots_beside_full_leaf(max_size: u32, key_len: u32) -> Option<u32> {
+        let key_len = usize::try_from(key_len).ok().filter(|&k| k > 0)?;
+        let entry_bytes = key_len.checked_add(RECORD_ID_ENCODED_BYTES)?;
+        let entries_bytes = usize::try_from(max_size).ok()?.checked_mul(entry_bytes)?;
+        let live_bytes = LEAF_FIXED_HEADER_BYTES.checked_add(entries_bytes)?;
+        let space_for_slots = PAGE_SIZE
+            .checked_sub(live_bytes)?
+            .checked_sub(TOMBSTONE_COUNT_ENCODED_BYTES)?;
+        u32::try_from(space_for_slots / TOMBSTONE_SLOT_ENCODED_BYTES).ok()
     }
 
     pub fn new(max_size: u32, num_tombstones: u32) -> Self {
@@ -582,9 +553,7 @@ impl LeafPage {
         self.keys.partition_point(|k| k <= key)
     }
 
-    /// Performs a binary search on the leaf page's list of keys for the given key
-    /// Returns an Option<RecordId> which will contain the record ID
-    /// for the given key is found, if the given key is found.
+    /// Returns the record id stored for `key`, or `None` if it is absent or tombstoned.
     pub fn get(&self, key: &IndexKey) -> Option<RecordId> {
         let pos = match self.keys.binary_search(key) {
             Ok(pos) => pos,
@@ -625,19 +594,12 @@ impl LeafPage {
     }
 
     fn adjust_tombstones_after_remove(&mut self, removed_at: u32) {
-        // Remove tombstones pointing at the removed slot; shift all later slots left by 1.
-        let mut out = VecDeque::with_capacity(self.tombstones.len());
-        for s in self.tombstones.drain(..) {
-            if s == removed_at {
-                continue;
-            }
-            if s > removed_at {
-                out.push_back(s - 1);
-            } else {
-                out.push_back(s);
+        self.tombstones.retain(|&slot| slot != removed_at);
+        for slot in self.tombstones.iter_mut() {
+            if *slot > removed_at {
+                *slot -= 1;
             }
         }
-        self.tombstones = out;
     }
 
     fn physical_remove_at(&mut self, slot: u32) {
@@ -686,11 +648,8 @@ impl LeafPage {
             }));
         }
 
-        // Tombstones are stored as a trailing section in the free space after the live entries:
-        // u32 count, followed by `count` u32 slot indexes (oldest-first).
-        // Tombstones are part of the logical page contents; if they don't fit, we error.
         let available = PAGE_SIZE.saturating_sub(live_needed);
-        let tombstone_bytes = TOMBSTONE_SLOT_ENCODED_BYTES
+        let tombstone_bytes = TOMBSTONE_COUNT_ENCODED_BYTES
             .checked_add(
                 self.tombstones
                     .len()
@@ -721,8 +680,6 @@ impl LeafPage {
             w.write_u64_le(sid)?;
         }
 
-        // Make decoding deterministic even when the remainder is all zeros by always writing a
-        // tombstone count (which may be 0).
         w.write_u32_le(
             u32::try_from(self.tombstones.len())
                 .map_err(|_| PageCodecError::BufferError(BufferError::Overflow))?,
@@ -796,8 +753,8 @@ impl LeafPage {
         page.record_ids = record_ids;
         page.next_leaf_id = next_leaf_id;
 
-        // Optional trailing tombstones section.
-        if r.remaining() >= TOMBSTONE_SLOT_ENCODED_BYTES {
+        let has_tombstone_section = r.remaining() >= TOMBSTONE_COUNT_ENCODED_BYTES;
+        if has_tombstone_section {
             let tombstone_count = r.read_u32_le()? as usize;
             if tombstone_count > 0 {
                 let needed = tombstone_count
@@ -832,13 +789,16 @@ impl LeafPage {
 }
 
 impl LeafPage {
-    pub fn insert(&mut self, key: IndexKey, record_id: RecordId) -> Result<(), ()> {
+    /// Inserts `key`, reviving it if it is tombstoned.
+    ///
+    /// Returns `InsertError::DuplicateKey` if `key` is already live in this page.
+    pub fn insert(&mut self, key: IndexKey, record_id: RecordId) -> Result<(), InsertError> {
         match self.keys.binary_search(&key) {
             Ok(pos) => {
-                let slot = u32::try_from(pos).map_err(|_| ())?;
+                let slot = Self::slot(pos);
                 if !self.is_tombstoned(slot) {
                     error!("attempted to insert duplicate key into leaf page");
-                    return Err(());
+                    return Err(InsertError::DuplicateKey);
                 }
                 self.record_ids[pos] = record_id;
                 self.remove_tombstone(slot);
@@ -846,7 +806,7 @@ impl LeafPage {
                 Ok(())
             }
             Err(pos) => {
-                let insert_at = u32::try_from(pos).map_err(|_| ())?;
+                let insert_at = Self::slot(pos);
                 self.keys.insert(pos, key);
                 self.record_ids.insert(pos, record_id);
                 self.adjust_tombstones_after_insert(insert_at);
@@ -868,12 +828,11 @@ impl LeafPage {
         assert!(!self.keys.is_empty(), "cannot split an empty leaf page");
 
         let mid = self.keys.len() / 2;
-        let mid_u32 = u32::try_from(mid).expect("mid fits u32");
+        let mid_u32 = Self::slot(mid);
 
         right.keys = self.keys.split_off(mid);
         right.record_ids = self.record_ids.split_off(mid);
 
-        // Tombstone slot indexes move with the corresponding key entries.
         let mut left_tombstones = VecDeque::with_capacity(self.tombstones.len());
         let mut right_tombstones = VecDeque::with_capacity(self.tombstones.len());
         for slot in self.tombstones.drain(..) {
@@ -898,28 +857,23 @@ impl LeafPage {
         right.keys[0].clone()
     }
 
+    /// Appends `right`'s entries to this leaf. `right`'s tombstones count as newer than this
+    /// page's, so when the merged tombstones overflow, this page's oldest are purged first.
     pub fn absorb_right(&mut self, right: &mut LeafPage) {
         self.validate();
         right.validate();
 
-        let left_len = u32::try_from(self.keys.len()).expect("keys.len fits u32");
+        let left_len = Self::slot(self.keys.len());
         self.keys.append(&mut right.keys);
         self.record_ids.append(&mut right.record_ids);
         self.next_leaf_id = right.next_leaf_id;
         self.base.size = self.keys.len() as u32;
 
-        // Keep tombstones across merges; deletes from the merged-in leaf (`right`) are considered
-        // more recent than deletes already recorded in `self`, so we append them after `self`'s
-        // existing tombstones. Right slots are offset by the old left length.
         for slot in right.tombstones.drain(..) {
             self.tombstones.push_back(slot + left_len);
         }
         while self.tombstones.len() > self.tombstone_capacity {
-            let evicted = self
-                .tombstones
-                .pop_front()
-                .expect("len > capacity implies non-empty");
-            self.physical_remove_at(evicted);
+            self.purge_oldest_tombstone();
         }
 
         self.validate();
@@ -946,13 +900,11 @@ impl LeafPage {
     }
 
     pub fn key_exists(&self, key: &IndexKey) -> bool {
-        match self.keys.binary_search(key) {
-            Ok(_) => return true,
-            Err(_) => {
-                error!("could not find key in page: {:?}", key);
-                return false;
-            }
-        };
+        let found = self.keys.binary_search(key).is_ok();
+        if !found {
+            error!("could not find key in page: {:?}", key);
+        }
+        found
     }
 
     pub fn remove_key(&mut self, key: &IndexKey) -> Result<(), RemoveError> {
@@ -964,26 +916,21 @@ impl LeafPage {
                 return Err(RemoveError::KeyNotFound);
             }
         };
-        let mut slot = u32::try_from(pos).expect("pos fits u32");
+        let mut slot = Self::slot(pos);
         if self.is_tombstoned(slot) {
             return Err(RemoveError::KeyNotFound);
         }
 
-        // If there is no tombstone space, fall back to immediate physical deletion.
-        if self.tombstone_capacity == 0 {
+        let page_keeps_no_tombstones = self.tombstone_capacity == 0;
+        if page_keeps_no_tombstones {
             self.physical_remove_at(slot);
             self.validate();
             return Ok(());
         }
 
-        // If the tombstone FIFO is full, physically delete the oldest tombstoned key to make room.
         if self.tombstones.len() == self.tombstone_capacity {
-            let evicted = self
-                .tombstones
-                .pop_front()
-                .expect("len == capacity implies non-empty");
-            self.physical_remove_at(evicted);
-            if evicted < slot {
+            let purged = self.purge_oldest_tombstone();
+            if purged < slot {
                 slot -= 1;
             }
         }
@@ -992,6 +939,19 @@ impl LeafPage {
 
         self.validate();
         Ok(())
+    }
+
+    fn purge_oldest_tombstone(&mut self) -> u32 {
+        let oldest = self
+            .tombstones
+            .pop_front()
+            .expect("purge_oldest_tombstone called with no tombstones");
+        self.physical_remove_at(oldest);
+        oldest
+    }
+
+    fn slot(index: usize) -> u32 {
+        u32::try_from(index).expect("leaf slot index exceeds u32")
     }
 
     pub fn pop_first(&mut self) -> Option<(IndexKey, RecordId, bool)> {
@@ -1030,7 +990,7 @@ impl LeafPage {
     }
 
     pub fn push_back(&mut self, key: IndexKey, record_id: RecordId, tombstoned: bool) {
-        let slot = u32::try_from(self.keys.len()).expect("len fits u32");
+        let slot = Self::slot(self.keys.len());
         self.keys.push(key);
         self.record_ids.push(record_id);
         if tombstoned {
@@ -1117,8 +1077,11 @@ mod tests {
     use crate::buf::BufferError;
     use crate::catalog::index_schema::IndexKey;
     use crate::disk::PAGE_SIZE;
+    use crate::index::InsertError;
     use crate::index::b_plus_page::{
-        HeaderPage, INVALID_PAGE_ID, InternalPage, LeafPage, NUM_TOMBSTONES,
+        HEADER_FIXED_HEADER_BYTES, HeaderPage, INTERNAL_FIXED_HEADER_BYTES, INVALID_PAGE_ID,
+        InternalPage, LEAF_FIXED_HEADER_BYTES, LeafPage, NUM_TOMBSTONES, PAGE_ID_ENCODED_BYTES,
+        RECORD_ID_ENCODED_BYTES, TOMBSTONE_COUNT_ENCODED_BYTES, TOMBSTONE_SLOT_ENCODED_BYTES,
     };
     use crate::index::page_codec::PageCodecError;
     use crate::table_heap::RecordId;
@@ -1177,7 +1140,7 @@ mod tests {
         ];
         left.base.size = left.keys.len() as u32;
         left.next_leaf_id = 999;
-        left.tombstones = VecDeque::from([1u32, 3u32]); // keys 20 and 40 tombstoned
+        left.tombstones = VecDeque::from([1u32, 3u32]);
         left.validate();
 
         let mut right = LeafPage::new(10, NUM_TOMBSTONES);
@@ -1220,7 +1183,7 @@ mod tests {
             },
         ];
         left.base.size = left.keys.len() as u32;
-        left.tombstones = VecDeque::from([0u32]); // delete key 10
+        left.tombstones = VecDeque::from([0u32]);
         left.validate();
 
         let mut right = LeafPage::new(10, 1);
@@ -1236,20 +1199,24 @@ mod tests {
             },
         ];
         right.base.size = right.keys.len() as u32;
-        right.tombstones = VecDeque::from([0u32]); // delete key 30
+        right.tombstones = VecDeque::from([0u32]);
         right.validate();
 
-        // Capacity is 1, but merging would create 2 tombstones. Since the absorbed leaf's deletes are
-        // considered more recent, the older tombstone from `left` must be evicted and physically
-        // deleted first.
         left.absorb_right(&mut right);
         assert_eq!(
             left.keys,
             vec![IndexKey(vec![20]), IndexKey(vec![30]), IndexKey(vec![40])]
         );
-        assert_eq!(left.tombstones, VecDeque::from([1u32])); // key 30 shifted to slot 1
-        assert!(left.get(&IndexKey(vec![10])).is_none()); // physically removed
-        assert!(left.get(&IndexKey(vec![30])).is_none()); // still tombstoned
+        assert_eq!(
+            left.tombstones,
+            VecDeque::from([1u32]),
+            "only the absorbed tombstone for key 30 survives, at its shifted slot"
+        );
+        assert!(
+            !left.key_exists(&IndexKey(vec![10])),
+            "left's older tombstone is purged from the page"
+        );
+        assert!(left.get(&IndexKey(vec![30])).is_none());
     }
 
     #[test]
@@ -1377,15 +1344,19 @@ mod tests {
         assert_eq!(leaf.tombstones[1], 1);
         assert!(leaf.get(&IndexKey(vec![20])).is_none());
 
-        // Tombstones capacity is 2: the oldest (10) is evicted (physically deleted) when adding 30.
         assert!(leaf.remove_key(&IndexKey(vec![30])).is_ok());
-        assert_eq!(leaf.keys.len(), 2);
-        assert_eq!(leaf.tombstones.len(), 2);
-        assert_eq!(leaf.tombstones[0], 0); // key 20 shifted to slot 0 after deleting key 10
-        assert_eq!(leaf.tombstones[1], 1); // key 30 is now at slot 1
+        assert_eq!(
+            leaf.keys.len(),
+            2,
+            "the oldest tombstone (key 10) is purged"
+        );
+        assert_eq!(
+            Vec::from(leaf.tombstones.clone()),
+            vec![0, 1],
+            "keys 20 and 30 shift down one slot after key 10 is purged"
+        );
         assert!(leaf.get(&IndexKey(vec![30])).is_none());
 
-        // Tombstones are persisted as a trailing section in the leaf encoding.
         let mut buf = [0u8; PAGE_SIZE];
         leaf.encode(&mut buf, 1).unwrap();
         let decoded = LeafPage::decode(&buf, 1).unwrap();
@@ -1398,13 +1369,20 @@ mod tests {
     }
     #[test]
     fn test_leaf_page_encode_errors_if_tombstones_do_not_fit() {
-        // Fill the page so that only 8 bytes remain after the live entries, then try to encode 2
-        // tombstones (4 bytes count + 2 * 4 bytes indexes = 12 bytes) => must error.
         let key_len = 1u32;
-        let max_size = 480u32; // 24 + 480*(1+16)=8184 => 8 bytes slack
-        let mut leaf = LeafPage::new(max_size, 2);
-        leaf.keys = vec![IndexKey(vec![0u8]); 480];
-        leaf.record_ids = (0u32..480u32)
+        let slack_after_entries = 8;
+        let entry_bytes = key_len as usize + RECORD_ID_ENCODED_BYTES;
+        let max_size = (PAGE_SIZE - LEAF_FIXED_HEADER_BYTES - slack_after_entries) / entry_bytes;
+        assert_eq!(
+            LEAF_FIXED_HEADER_BYTES + max_size * entry_bytes + slack_after_entries,
+            PAGE_SIZE
+        );
+        let two_tombstones_bytes = TOMBSTONE_COUNT_ENCODED_BYTES + 2 * TOMBSTONE_SLOT_ENCODED_BYTES;
+        assert!(two_tombstones_bytes > slack_after_entries);
+
+        let mut leaf = LeafPage::new(max_size as u32, 2);
+        leaf.keys = vec![IndexKey(vec![0u8]); max_size];
+        leaf.record_ids = (0..max_size as u32)
             .map(|i| RecordId {
                 page_id: i,
                 slot_id: 0,
@@ -1453,5 +1431,134 @@ mod tests {
             HeaderPage::decode(&buf),
             Err(PageCodecError::BadMagic)
         ));
+    }
+
+    fn rid(n: u32) -> RecordId {
+        RecordId {
+            page_id: n,
+            slot_id: 0,
+        }
+    }
+
+    #[test]
+    fn fixed_header_sizes_match_the_encoded_field_layout() {
+        assert_eq!(INTERNAL_FIXED_HEADER_BYTES, 8 + 4 * 4);
+        assert_eq!(LEAF_FIXED_HEADER_BYTES, 8 + 2 * 4 + 8);
+        assert_eq!(HEADER_FIXED_HEADER_BYTES, 8 + 2 * 4 + 2 * 8);
+        assert_eq!(PAGE_ID_ENCODED_BYTES, 8);
+    }
+
+    #[test]
+    fn internal_max_size_for_layout_is_the_largest_page_that_encodes() {
+        for key_len in [1u32, 4, 8, 37, 255] {
+            let max = InternalPage::max_size_for_layout(key_len as usize).unwrap() as usize;
+            let page_with = |n: usize| {
+                let mut page = InternalPage::new(max as u32);
+                page.keys = vec![IndexKey(vec![0; key_len as usize]); n];
+                page.children = (0..=n).collect();
+                page.base.size = n as u32;
+                page
+            };
+            let mut buf = [0u8; PAGE_SIZE];
+            assert!(
+                page_with(max).encode(&mut buf, key_len).is_ok(),
+                "key_len {key_len}: max keys fit"
+            );
+            assert!(
+                page_with(max + 1).encode(&mut buf, key_len).is_err(),
+                "key_len {key_len}: one more key overflows"
+            );
+        }
+    }
+
+    #[test]
+    fn leaf_max_size_for_layout_leaves_room_for_the_tombstone_count() {
+        for key_len in [1u32, 4, 8, 37, 255] {
+            let max = LeafPage::max_size_for_layout(key_len as usize).unwrap() as usize;
+            let entry_bytes = key_len as usize + RECORD_ID_ENCODED_BYTES;
+            let used = LEAF_FIXED_HEADER_BYTES + max * entry_bytes + TOMBSTONE_COUNT_ENCODED_BYTES;
+            assert!(used <= PAGE_SIZE, "key_len {key_len}: max entries fit");
+            assert!(
+                used + entry_bytes > PAGE_SIZE,
+                "key_len {key_len}: one more entry overflows"
+            );
+        }
+        assert_eq!(LeafPage::max_size_for_layout(0), None);
+        assert_eq!(InternalPage::max_size_for_layout(0), None);
+    }
+
+    #[test]
+    fn tombstone_capacity_fills_the_space_beside_a_full_leaf() {
+        let key_len = 8u32;
+        let max_size = LeafPage::max_size_for_layout(key_len as usize).unwrap();
+        let free = PAGE_SIZE
+            - LEAF_FIXED_HEADER_BYTES
+            - max_size as usize * (key_len as usize + RECORD_ID_ENCODED_BYTES)
+            - TOMBSTONE_COUNT_ENCODED_BYTES;
+        let fit = (free / TOMBSTONE_SLOT_ENCODED_BYTES) as u32;
+        assert_eq!(
+            LeafPage::tombstone_capacity_for_layout(max_size, key_len, u32::MAX),
+            fit
+        );
+        assert_eq!(
+            LeafPage::tombstone_capacity_for_layout(max_size, key_len, 1),
+            1.min(fit)
+        );
+        assert_eq!(LeafPage::tombstone_capacity_for_layout(max_size, 0, 10), 0);
+        assert_eq!(
+            LeafPage::tombstone_capacity_for_layout(u32::MAX, key_len, 10),
+            0
+        );
+    }
+
+    #[test]
+    fn find_child_index_counts_keys_less_than_or_equal_to_the_search_key() {
+        let mut page = InternalPage::new(10);
+        page.children = vec![1, 2, 3];
+        page.keys = vec![IndexKey(vec![10]), IndexKey(vec![20])];
+        page.base.size = 2;
+        assert_eq!(page.find_child_index(&IndexKey(vec![5])), 0);
+        assert_eq!(page.find_child_index(&IndexKey(vec![10])), 1);
+        assert_eq!(page.find_child_index(&IndexKey(vec![15])), 1);
+        assert_eq!(page.find_child_index(&IndexKey(vec![20])), 2);
+        assert_eq!(page.find_child_index(&IndexKey(vec![99])), 2);
+    }
+
+    #[test]
+    fn leaf_insert_rejects_live_duplicates_and_revives_tombstoned_keys() {
+        let mut leaf = LeafPage::new(10, 2);
+        leaf.insert(IndexKey(vec![1]), rid(1)).unwrap();
+        assert!(matches!(
+            leaf.insert(IndexKey(vec![1]), rid(2)),
+            Err(InsertError::DuplicateKey)
+        ));
+        leaf.remove_key(&IndexKey(vec![1])).unwrap();
+        leaf.insert(IndexKey(vec![1]), rid(3)).unwrap();
+        assert_eq!(leaf.get(&IndexKey(vec![1])).unwrap().page_id, 3);
+        assert!(leaf.tombstones.is_empty());
+    }
+
+    #[test]
+    fn leaf_without_tombstone_capacity_deletes_keys_immediately() {
+        let mut leaf = LeafPage::new(10, 0);
+        leaf.insert(IndexKey(vec![1]), rid(1)).unwrap();
+        leaf.insert(IndexKey(vec![2]), rid(2)).unwrap();
+        leaf.remove_key(&IndexKey(vec![1])).unwrap();
+        assert_eq!(leaf.keys, vec![IndexKey(vec![2])]);
+        assert!(leaf.tombstones.is_empty());
+    }
+
+    #[test]
+    fn leaf_encoding_always_writes_a_tombstone_count() {
+        let mut leaf = LeafPage::new(10, NUM_TOMBSTONES);
+        leaf.insert(IndexKey(vec![7]), rid(1)).unwrap();
+        let mut buf = [0xFFu8; PAGE_SIZE];
+        leaf.encode(&mut buf, 1).unwrap();
+        let count_at = LEAF_FIXED_HEADER_BYTES + 1 + RECORD_ID_ENCODED_BYTES;
+        assert_eq!(
+            &buf[count_at..count_at + TOMBSTONE_COUNT_ENCODED_BYTES],
+            &[0, 0, 0, 0]
+        );
+        assert!(LeafPage::decode(&buf, 1).unwrap().tombstones.is_empty());
     }
 }

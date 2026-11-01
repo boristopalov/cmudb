@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::thread;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 #[cfg(feature = "deadlock_detection")]
@@ -31,15 +31,19 @@ struct FrameHeader {
     frame_id: usize,
     page_id: Option<usize>,
     buf: Page,
-    pin_count: AtomicU32,
     dirty: AtomicBool,
+}
+
+#[derive(Debug)]
+struct EvictedPage {
+    page_id: usize,
+    data: Page,
 }
 
 #[derive(Debug)]
 struct FrameReservation {
     frame_id: usize,
-    page_id: Option<usize>,
-    reclaimed_page: Option<Page>,
+    evicted: Option<EvictedPage>,
 }
 
 #[derive(Debug)]
@@ -47,19 +51,17 @@ struct Meta {
     replacer: replacer::ArcReplacer,
     free_list: Vec<usize>,
     page_table: HashMap<usize, usize>,
+    /// Pins per frame. Kept beside the replacer under one lock, so a frame is marked
+    /// evictable only while nothing pins it.
+    pins: Vec<u32>,
 }
 
-// Must be able to handle DBs greater than hardware memory limit
-// Buffer pool can get from memory or from disk
 #[derive(Debug)]
 pub struct BufferPoolManager {
     frames: Vec<RwLock<FrameHeader>>,
-    /// Protects all metadata that participates in eviction/mapping: replacer, page_table, free_list,
-    /// global pin count. Lock order: meta -> frame.
     meta: Mutex<Meta>,
     scheduler: Mutex<disk::DiskScheduler>,
     next_page_id: AtomicUsize,
-    // num_frames: u32,
 }
 
 #[cfg(feature = "deadlock_detection")]
@@ -116,24 +118,10 @@ impl<'a> PageRef<'a> {
 
 impl<'a> Drop for PageRef<'a> {
     fn drop(&mut self) {
-        let current = self.frame_guard.pin_count.load(Ordering::Acquire);
-        if current == 0 {
-            warn!(
-                "tried to unpin a frame with 0 pins frame_id={}",
-                self.frame_guard.frame_id
-            );
-            return;
-        }
-        let prev = self.frame_guard.pin_count.fetch_sub(1, Ordering::AcqRel);
-        let frame_id = self.frame_guard.frame_id.clone();
-        info!("dropping frame guard; page_id={:?}", self.page_id());
-        unsafe {
-            ManuallyDrop::drop(&mut self.frame_guard);
-        }
-        let mut meta = self.bpm.meta.lock();
-        if prev == 1 {
-            meta.replacer.set_evictable(frame_id, true);
-        }
+        let frame_id = self.frame_guard.frame_id;
+        // SAFETY: `frame_guard` is dropped exactly once, here in `Drop::drop`, and is never read afterwards.
+        unsafe { ManuallyDrop::drop(&mut self.frame_guard) };
+        self.bpm.release_pin(frame_id);
     }
 }
 
@@ -153,23 +141,10 @@ impl<'a> PageMut<'a> {
 
 impl<'a> Drop for PageMut<'a> {
     fn drop(&mut self) {
-        let current = self.frame_guard.pin_count.load(Ordering::Acquire);
-        if current == 0 {
-            warn!(
-                "tried to unpin a frame with 0 pins frame_id={}",
-                self.frame_guard.frame_id
-            );
-            return;
-        }
-        let prev = self.frame_guard.pin_count.fetch_sub(1, Ordering::AcqRel);
-        let frame_id = self.frame_guard.frame_id.clone();
-        unsafe {
-            ManuallyDrop::drop(&mut self.frame_guard);
-        }
-        let mut meta = self.bpm.meta.lock();
-        if prev == 1 {
-            meta.replacer.set_evictable(frame_id, true);
-        }
+        let frame_id = self.frame_guard.frame_id;
+        // SAFETY: `frame_guard` is dropped exactly once, here in `Drop::drop`, and is never read afterwards.
+        unsafe { ManuallyDrop::drop(&mut self.frame_guard) };
+        self.bpm.release_pin(frame_id);
     }
 }
 
@@ -210,7 +185,6 @@ type PageMutResult<'a> = Result<PageMut<'a>, BpmError>;
 impl FrameHeader {
     pub fn clear(&mut self) {
         self.dirty.store(false, Ordering::Release);
-        self.pin_count.store(0, Ordering::Release);
         self.page_id = None;
     }
 }
@@ -225,6 +199,11 @@ impl BufferPoolManager {
         replacer: replacer::ArcReplacer,
         scheduler: disk::DiskScheduler,
     ) -> Self {
+        assert_eq!(
+            replacer.capacity(),
+            num_frames,
+            "replacer capacity differs from the number of buffer pool frames"
+        );
         #[cfg(feature = "deadlock_detection")]
         start_deadlock_detector();
         let mut frames = Vec::with_capacity(num_frames);
@@ -235,7 +214,6 @@ impl BufferPoolManager {
                 frame_id: i,
                 page_id: None,
                 buf: [0u8; disk::PAGE_SIZE],
-                pin_count: AtomicU32::new(0),
                 dirty: AtomicBool::new(false),
             }));
             free_list.push(i);
@@ -247,416 +225,400 @@ impl BufferPoolManager {
                 replacer,
                 free_list,
                 page_table: HashMap::with_capacity(num_frames),
+                pins: vec![0; num_frames],
             }),
             scheduler: Mutex::new(scheduler),
             next_page_id: AtomicUsize::new(0),
         }
     }
 
-    pub fn new_page(self: &Arc<Self>) -> Result<PageMut, BpmError> {
+    pub fn new_page(self: &Arc<Self>) -> PageMutResult<'_> {
         info!("tid={} new_page requested", Self::tid());
         let mut meta = self.meta.lock();
         let reservation = self.get_free_frame(&mut meta)?;
         let frame_id = reservation.frame_id;
         let page_id = self.get_next_page_id();
-        let mut frame = self
-            .frames
-            .get(frame_id)
-            .ok_or(BpmError::FrameMissing)?
-            .write();
+        let mut frame = self.frame(frame_id)?.write();
         frame.clear();
         frame.page_id = Some(page_id);
         frame.dirty.store(true, Ordering::Release);
-        frame.pin_count.store(1, Ordering::Release);
+        meta.pins[frame_id] = 1;
         meta.page_table.insert(page_id, frame_id);
         meta.replacer.record_access(frame_id, page_id);
         meta.replacer.set_evictable(frame_id, false);
 
-        return Ok(PageMut {
+        Ok(PageMut {
             frame_guard: ManuallyDrop::new(frame),
-            bpm: Arc::clone(&self),
-        });
+            bpm: Arc::clone(self),
+        })
     }
 
-    pub fn write_page(self: &Arc<Self>, page_id: usize) -> PageMutResult {
-        // case 1: frame exists.
-        // Retries if the frame is evicted and reassigned between our reservation and acquiring the write lock:
-        // a concurrent guard drop can take pin_count to 0 and re-mark the frame evictable,
-        // letting another thread claim it before we get the lock.
+    pub fn write_page(self: &Arc<Self>, page_id: usize) -> PageMutResult<'_> {
         let mut meta = loop {
             let mut meta = self.meta.lock();
+            let Some(frame_id) = meta.page_table.get(&page_id).copied() else {
+                break meta;
+            };
+            info!(
+                "tid={} write_page cache hit page_id={page_id} frame_id={frame_id}",
+                Self::tid()
+            );
+            meta.replacer.record_access(frame_id, page_id);
+            meta.pins[frame_id] += 1;
+            meta.replacer.set_evictable(frame_id, false);
+            drop(meta);
 
-            if let Some(frame_id) = meta.page_table.get(&page_id).copied() {
-                info!(
-                    "tid={} write_page cache hit page_id={page_id} frame_id={frame_id}",
-                    Self::tid()
-                );
-                meta.replacer.record_access(frame_id, page_id);
-                meta.replacer.set_evictable(frame_id, false);
-                drop(meta);
-
-                let frame = self
-                    .frames
-                    .get(frame_id)
-                    .ok_or(BpmError::FrameMissing)?
-                    .write();
-                if frame.page_id != Some(page_id) {
-                    drop(frame);
-                    continue;
-                }
-                frame.pin_count.fetch_add(1, Ordering::AcqRel);
-                frame.dirty.store(true, Ordering::Release);
-
-                return Ok(PageMut {
-                    frame_guard: ManuallyDrop::new(frame),
-                    bpm: Arc::clone(&self),
-                });
+            let frame = self.frame(frame_id)?.write();
+            let frame_was_reassigned_after_lookup = frame.page_id != Some(page_id);
+            if frame_was_reassigned_after_lookup {
+                drop(frame);
+                self.release_pin(frame_id);
+                continue;
             }
-
-            break meta;
+            frame.dirty.store(true, Ordering::Release);
+            return Ok(PageMut {
+                frame_guard: ManuallyDrop::new(frame),
+                bpm: Arc::clone(self),
+            });
         };
 
-        // case 2: frame not in memory, check for free frame
-        let reservation = self.get_free_frame(&mut meta)?;
-        let frame_id = reservation.frame_id;
-        let mut frame = self
-            .frames
-            .get(frame_id)
-            .ok_or(BpmError::FrameMissing)?
-            .write();
         info!(
-            "tid={} write_page cache miss page_id={page_id} reserved_frame={frame_id}",
+            "tid={} write_page cache miss page_id={page_id}",
             Self::tid()
         );
-
-        // read the existing page from disk
-        let (tx, rx) = mpsc::channel::<Result<disk::PageData, std::io::Error>>();
-        let disk_request = DiskRequest {
-            page_id,
-            is_write: false,
-            data: Box::new([0u8; disk::PAGE_SIZE]),
-            promise: tx,
-        };
-
-        if self.scheduler.lock().schedule(vec![disk_request]).is_err() {
-            drop(frame);
-            self.restore_frame(&mut meta, reservation);
-            return Err(BpmError::ChannelClosed);
-        }
-
-        // wait for the io request to complete
-        let page_data = match rx.recv() {
-            Ok(Ok(data)) => data,
-            Ok(Err(e)) => {
-                drop(frame);
-                self.restore_frame(&mut meta, reservation);
-                return Err(BpmError::Io(e));
-            }
-            Err(_) => {
-                drop(frame);
-                self.restore_frame(&mut meta, reservation);
-                return Err(BpmError::ChannelClosed);
-            }
-        };
-
-        // bring this page into the free frame
-        frame.buf = *page_data;
-        frame.page_id = Some(page_id);
-        frame.pin_count.store(1, Ordering::Release);
-        frame.dirty.store(true, Ordering::Release);
-        meta.page_table.insert(page_id, frame_id);
-        meta.replacer.record_access(frame_id, page_id);
-        meta.replacer.set_evictable(frame_id, false);
-
-        return Ok(PageMut {
+        let frame = self.load_into_free_frame(&mut meta, page_id, true)?;
+        Ok(PageMut {
             frame_guard: ManuallyDrop::new(frame),
-            bpm: Arc::clone(&self),
-        });
+            bpm: Arc::clone(self),
+        })
     }
 
-    pub fn read_page(self: &Arc<Self>, page_id: usize) -> PageRefResult {
-        // case 1: page is cached
-        let mut meta = self.meta.lock();
+    pub fn read_page(self: &Arc<Self>, page_id: usize) -> PageRefResult<'_> {
         info!("tid={} read_page page_id={page_id}", Self::tid());
-        if let Some(frame_id) = meta.page_table.get(&page_id).copied() {
+        let mut meta = loop {
+            let mut meta = self.meta.lock();
+            let Some(frame_id) = meta.page_table.get(&page_id).copied() else {
+                break meta;
+            };
             info!(
                 "tid={} read_page cache hit page_id={page_id} frame_id={frame_id}",
                 Self::tid()
             );
-
             meta.replacer.record_access(frame_id, page_id);
+            meta.pins[frame_id] += 1;
             meta.replacer.set_evictable(frame_id, false);
             drop(meta);
 
-            let frame_lock = self.frames.get(frame_id).ok_or(BpmError::FrameMissing)?;
-
-            let frame = frame_lock.read();
-            if frame.page_id == Some(page_id) {
-                frame.pin_count.fetch_add(1, Ordering::AcqRel);
-
-                return Ok(PageRef {
-                    frame_guard: ManuallyDrop::new(frame),
-                    frame_id,
-                    bpm: Arc::clone(&self),
-                });
-            } else {
-                return Err(BpmError::FrameMissing);
+            let frame = self.frame(frame_id)?.read();
+            let frame_was_reassigned_after_lookup = frame.page_id != Some(page_id);
+            if frame_was_reassigned_after_lookup {
+                drop(frame);
+                self.release_pin(frame_id);
+                continue;
             }
+            return Ok(PageRef {
+                frame_guard: ManuallyDrop::new(frame),
+                frame_id,
+                bpm: Arc::clone(self),
+            });
         };
 
-        // case 2: page not cached -- issue an io request and load into memory
         info!("tid={} read_page cache miss page_id={page_id}", Self::tid());
-        let (tx, rx) = mpsc::channel::<Result<disk::PageData, std::io::Error>>();
-        let disk_request = DiskRequest {
-            page_id,
-            is_write: false,
-            data: Box::new([0u8; PAGE_SIZE]),
-            promise: tx,
-        };
+        let frame = self.load_into_free_frame(&mut meta, page_id, false)?;
+        let frame_id = frame.frame_id;
+        Ok(PageRef {
+            frame_guard: ManuallyDrop::new(RwLockWriteGuard::downgrade(frame)),
+            frame_id,
+            bpm: Arc::clone(self),
+        })
+    }
 
-        // reserve a frame before issuing IO
-        let reservation = self.get_free_frame(&mut meta)?;
+    fn frame(&self, frame_id: usize) -> Result<&RwLock<FrameHeader>, BpmError> {
+        self.frames.get(frame_id).ok_or(BpmError::FrameMissing)
+    }
+
+    fn load_into_free_frame(
+        &self,
+        meta: &mut Meta,
+        page_id: usize,
+        dirty: bool,
+    ) -> Result<RwLockWriteGuard<'_, FrameHeader>, BpmError> {
+        let reservation = self.get_free_frame(meta)?;
         let frame_id = reservation.frame_id;
-        let mut frame = self
-            .frames
-            .get(frame_id)
-            .ok_or(BpmError::FrameMissing)?
-            .write();
-        info!("read_page reserved frame_id={frame_id} for page_id={page_id}",);
+        let mut frame = self.frame(frame_id)?.write();
+        info!(
+            "tid={} reserved frame_id={frame_id} for page_id={page_id}",
+            Self::tid()
+        );
 
-        if self.scheduler.lock().schedule(vec![disk_request]).is_err() {
-            drop(frame);
-            self.restore_frame(&mut meta, reservation);
-            return Err(BpmError::ChannelClosed);
-        }
-
-        // wait for the io request to complete
-        let page_data = match rx.recv() {
-            Ok(Ok(data)) => data,
-            Ok(Err(e)) => {
+        let page_data = match self.read_from_disk(page_id) {
+            Ok(data) => data,
+            Err(e) => {
                 drop(frame);
-                self.restore_frame(&mut meta, reservation);
-                return Err(BpmError::Io(e));
-            }
-            Err(_) => {
-                drop(frame);
-                self.restore_frame(&mut meta, reservation);
-                return Err(BpmError::ChannelClosed);
+                self.restore_frame(meta, reservation);
+                return Err(e);
             }
         };
 
         frame.buf = *page_data;
         frame.page_id = Some(page_id);
-        frame.pin_count.store(1, Ordering::Release);
-        frame.dirty.store(false, Ordering::Release);
+        meta.pins[frame_id] = 1;
+        frame.dirty.store(dirty, Ordering::Release);
         meta.page_table.insert(page_id, frame_id);
         meta.replacer.record_access(frame_id, page_id);
         meta.replacer.set_evictable(frame_id, false);
+        Ok(frame)
+    }
 
-        let read_guard = parking_lot::RwLockWriteGuard::downgrade(frame);
+    fn read_from_disk(&self, page_id: usize) -> Result<disk::PageData, BpmError> {
+        self.run_disk_request(page_id, false, Box::new([0u8; PAGE_SIZE]))
+    }
 
-        return Ok(PageRef {
-            frame_guard: ManuallyDrop::new(read_guard),
-            frame_id,
-            bpm: Arc::clone(&self),
-        });
+    fn write_to_disk(&self, page_id: usize, page: &Page) -> Result<(), BpmError> {
+        self.run_disk_request(page_id, true, Box::new(*page))
+            .map(drop)
+    }
+
+    fn run_disk_request(
+        &self,
+        page_id: usize,
+        is_write: bool,
+        data: disk::PageData,
+    ) -> Result<disk::PageData, BpmError> {
+        let (tx, rx) = mpsc::channel::<Result<disk::PageData, io::Error>>();
+        let request = DiskRequest {
+            page_id,
+            is_write,
+            data,
+            promise: tx,
+        };
+        self.scheduler
+            .lock()
+            .schedule(vec![request])
+            .map_err(|_| BpmError::ChannelClosed)?;
+        match rx.recv() {
+            Ok(Ok(data)) => Ok(data),
+            Ok(Err(e)) => Err(BpmError::Io(e)),
+            Err(_) => Err(BpmError::ChannelClosed),
+        }
     }
 
     fn get_free_frame(&self, meta: &mut Meta) -> Result<FrameReservation, BpmError> {
-        info!("tid={} get_free_frame: looking for free frame", Self::tid());
-        {
-            if let Some(frame_id) = meta.free_list.pop() {
-                info!(
-                    "tid={} get_free_frame: using free_list frame_id={frame_id}",
-                    Self::tid()
-                );
-                return Ok(FrameReservation {
-                    frame_id,
-                    page_id: None,
-                    reclaimed_page: None,
-                });
-            }
+        if let Some(frame_id) = meta.free_list.pop() {
+            info!(
+                "tid={} get_free_frame: using free_list frame_id={frame_id}",
+                Self::tid()
+            );
+            return Ok(FrameReservation {
+                frame_id,
+                evicted: None,
+            });
         }
 
-        // no free frame, we need to evict an existing frame
         info!(
             "tid={} get_free_frame: no free frames, attempting eviction",
             Self::tid()
         );
-
         let Some(frame_id) = meta.replacer.evict() else {
             return Err(BpmError::NoFreeFrame);
         };
         info!(
-            "tid={} get_free_frame: replacer returned victim frame_id={})",
-            Self::tid(),
-            frame_id,
+            "tid={} get_free_frame: replacer returned victim frame_id={frame_id}",
+            Self::tid()
         );
 
-        // Check the victim frame's state
-        let mut frame = self
-            .frames
-            .get(frame_id)
-            .ok_or(BpmError::FrameMissing)?
-            .write();
-
-        if frame.pin_count.load(Ordering::Acquire) > 0 {
+        if meta.pins[frame_id] > 0 {
             warn!(
-                "tid={} get_free_frame: attempted to evict pinned frame_id={frame_id}; requeuing",
+                "tid={} get_free_frame: attempted to evict pinned frame_id={frame_id}",
                 Self::tid()
             );
             return Err(BpmError::FrameInUse);
         }
+        let mut frame = self.frame(frame_id)?.write();
 
-        // if there is no page_id on the frame, we can just return the frame
-        // no page data to worry about in this case
         let Some(page_id) = frame.page_id else {
             return Ok(FrameReservation {
                 frame_id,
-                page_id: None,
-                reclaimed_page: None,
+                evicted: None,
             });
         };
 
-        // no need to flush if the frame is not dirty
-        if !frame.dirty.load(Ordering::Acquire) {
-            meta.page_table.remove(&page_id);
-            let buf = frame.buf.clone();
-            frame.clear();
-            return Ok(FrameReservation {
-                frame_id,
-                page_id: Some(page_id),
-                reclaimed_page: Some(buf),
-            });
-        };
-
-        info!(
-            "tid={} get_free_frame: flushing dirty page_id={} before eviction",
-            Self::tid(),
-            page_id
-        );
-        let (tx, rx) = mpsc::channel::<Result<disk::PageData, std::io::Error>>();
-        let disk_request = DiskRequest {
-            page_id,
-            is_write: true,
-            data: Box::new(frame.buf),
-            promise: tx,
-        };
-        if let Err(_) = self.scheduler.lock().schedule(vec![disk_request]) {
-            return Err(BpmError::ChannelClosed);
-        }
-        match rx.recv() {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                return Err(BpmError::Io(e));
-            }
-            Err(_) => {
-                return Err(BpmError::ChannelClosed);
-            }
+        if frame.dirty.load(Ordering::Acquire) {
+            info!(
+                "tid={} get_free_frame: flushing dirty page_id={page_id} before eviction",
+                Self::tid()
+            );
+            self.write_to_disk(page_id, &frame.buf)?;
         }
 
         meta.page_table.remove(&page_id);
-        let buf = frame.buf.clone();
+        let data = frame.buf;
         frame.clear();
         Ok(FrameReservation {
             frame_id,
-            page_id: Some(page_id),
-            reclaimed_page: Some(buf),
+            evicted: Some(EvictedPage { page_id, data }),
         })
     }
 
     fn restore_frame(&self, meta: &mut Meta, reservation: FrameReservation) {
         let frame_id = reservation.frame_id;
-
-        let Some(page_id) = reservation.page_id else {
-            meta.free_list.push(frame_id);
-            return;
-        };
-        let Some(reclaimed_page) = reservation.reclaimed_page else {
+        let Some(EvictedPage { page_id, data }) = reservation.evicted else {
             meta.free_list.push(frame_id);
             return;
         };
 
-        // if we evicted and took a page, check if we have that old page already loaded into a frame
-        // if it is then the frame we evicted doesn't need to hold the old page and we can just push it back to the free list
-        // if the old page is not loaded into a frame, get the frame that we marked for eviction, and want to restore, reset it, make sure
-        // the old page ID is in the frame, and add it back to the page table
-        info!("restore_frame: restoring evicted page for frame_id={frame_id}");
-        if meta.page_table.contains_key(&page_id) {
-            info!(
-                "restore_frame: page_id={page_id} already mapped elsewhere, returning frame {frame_id} to free_list"
-            );
+        info!("restore_frame: restoring evicted page_id={page_id} into frame_id={frame_id}");
+        let evicted_page_was_reloaded_elsewhere = meta.page_table.contains_key(&page_id);
+        if evicted_page_was_reloaded_elsewhere {
+            info!("restore_frame: page_id={page_id} already mapped, freeing frame_id={frame_id}");
             meta.free_list.push(frame_id);
             return;
         }
-        // if we have this frame loaded into memory already,
-        // just update it directly
-        if let Some(frame_lock) = self.frames.get(frame_id) {
-            let mut frame = frame_lock.write();
-            frame.page_id = Some(page_id);
-            frame.buf = reclaimed_page;
-            meta.page_table.insert(page_id, frame_id);
-        // if we do not have this frame loaded into memory,
-        // mark it as a free frame
-        } else {
-            info!("restore_frame: returning free frame_id={frame_id} to free_list");
+        let Ok(frame_lock) = self.frame(frame_id) else {
             meta.free_list.push(frame_id);
-        }
+            return;
+        };
+
+        let mut frame = frame_lock.write();
+        frame.page_id = Some(page_id);
+        frame.buf = data;
+        meta.page_table.insert(page_id, frame_id);
         meta.replacer.record_access(frame_id, page_id);
         meta.replacer.set_evictable(frame_id, true);
     }
 
+    fn release_pin(&self, frame_id: usize) {
+        let mut meta = self.meta.lock();
+        match meta.pins[frame_id].checked_sub(1) {
+            Some(remaining) => {
+                meta.pins[frame_id] = remaining;
+                if remaining == 0 {
+                    meta.replacer.set_evictable(frame_id, true);
+                }
+            }
+            None => warn!("tried to unpin a frame with 0 pins frame_id={frame_id}"),
+        }
+    }
+
     fn get_next_page_id(&self) -> usize {
-        self.next_page_id
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+        self.next_page_id.fetch_add(1, Ordering::AcqRel)
     }
 
     pub fn flush_page(&self, page_id: usize) -> Result<(), BpmError> {
         info!("flush_page: flushing page page_id={page_id}");
-
-        let frame_id = {
-            let meta = self.meta.lock();
-            if let Some(fid) = meta.page_table.get(&page_id).copied() {
-                fid
-            } else {
-                warn!("tried to flush page with page_id={page_id} but could not find its frame");
-                return Err(BpmError::FrameMissing);
-            }
+        let Some(frame_id) = self.meta.lock().page_table.get(&page_id).copied() else {
+            warn!("tried to flush page with page_id={page_id} but could not find its frame");
+            return Err(BpmError::FrameMissing);
         };
 
-        let frame_lock = self.frames.get(frame_id).ok_or(BpmError::FrameMissing)?;
-        let frame = frame_lock.read();
-
-        let (tx, rx) = mpsc::channel::<Result<disk::PageData, std::io::Error>>();
-        let disk_request = DiskRequest {
-            page_id,
-            is_write: true,
-            data: Box::new(frame.buf),
-            promise: tx,
-        };
-
-        if self
-            .scheduler
-            .lock()
-            .schedule(vec![disk_request])
-            .map_err(|_| BpmError::ChannelClosed)
-            .is_err()
-        {
-            return Err(BpmError::ChannelClosed);
-        }
-
-        match rx.recv() {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                return Err(BpmError::Io(e));
-            }
-            Err(_) => {
-                return Err(BpmError::ChannelClosed);
-            }
-        };
-
-        // if we get here we should have successfully flushed
+        let frame = self.frame(frame_id)?.read();
+        self.write_to_disk(page_id, &frame.buf)?;
         frame.dirty.store(false, Ordering::Release);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::disk::{DiskManager, DiskScheduler};
+    use crate::replacer::ArcReplacer;
+    use std::time::Duration;
+
+    fn make_bpm(num_frames: usize) -> (Arc<BufferPoolManager>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).unwrap();
+        let bpm = BufferPoolManager::new(
+            num_frames,
+            ArcReplacer::new(num_frames),
+            DiskScheduler::new(dm),
+        );
+        (Arc::new(bpm), dir)
+    }
+
+    fn finishes_within(limit: Duration, work: impl FnOnce() + Send + 'static) -> bool {
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            work();
+            let _ = done_tx.send(());
+        });
+        done_rx.recv_timeout(limit).is_ok()
+    }
+
+    #[test]
+    fn dropping_a_guard_with_zero_pins_still_releases_the_frame_lock() {
+        let (bpm, _dir) = make_bpm(1);
+        let page = bpm.new_page().unwrap();
+        let page_id = page.page_id().unwrap();
+        bpm.meta.lock().pins[page.frame_id()] = 0;
+        drop(page);
+
+        let finished = finishes_within(Duration::from_secs(5), move || {
+            drop(bpm.write_page(page_id).unwrap());
+        });
+        assert!(finished, "frame write lock was leaked by the guard drop");
+    }
+
+    #[test]
+    #[should_panic(expected = "replacer capacity differs")]
+    fn new_rejects_a_replacer_sized_for_a_different_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).unwrap();
+        BufferPoolManager::new(2, ArcReplacer::new(3), DiskScheduler::new(dm));
+    }
+
+    #[test]
+    fn concurrent_access_retries_when_a_cached_frame_is_reassigned() {
+        let (bpm, _dir) = make_bpm(2);
+        let page_count = 6;
+        for _ in 0..page_count {
+            drop(bpm.new_page().unwrap());
+        }
+        let missing_frames = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..6)
+            .map(|worker| {
+                let bpm = Arc::clone(&bpm);
+                let missing_frames = Arc::clone(&missing_frames);
+                thread::spawn(move || {
+                    for round in 0..3_000 {
+                        let page_id = (worker * 7 + round) % page_count;
+                        let reported_missing = if worker % 3 == 0 {
+                            matches!(bpm.write_page(page_id), Err(BpmError::FrameMissing))
+                        } else {
+                            matches!(bpm.read_page(page_id), Err(BpmError::FrameMissing))
+                        };
+                        if reported_missing {
+                            missing_frames.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert_eq!(
+            missing_frames.load(Ordering::Relaxed),
+            0,
+            "a page that exists was reported as FrameMissing"
+        );
+    }
+
+    #[test]
+    fn last_guard_drop_makes_the_frame_evictable_again() {
+        let (bpm, _dir) = make_bpm(1);
+        let page_id = bpm.new_page().unwrap().page_id().unwrap();
+        let first = bpm.read_page(page_id).unwrap();
+        let second = bpm.read_page(page_id).unwrap();
+        drop(first);
+        assert!(matches!(
+            bpm.new_page(),
+            Err(BpmError::FrameInUse | BpmError::NoFreeFrame)
+        ));
+        drop(second);
+        assert!(
+            bpm.new_page().is_ok(),
+            "frame stayed pinned after its last guard dropped"
+        );
     }
 }

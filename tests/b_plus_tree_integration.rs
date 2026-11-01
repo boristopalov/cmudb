@@ -108,9 +108,6 @@ fn b_plus_tree_soak_concurrent() {
                 let k = rng.random_range(0..key_space) as u8;
                 let key = make_key(k, key_len);
 
-                // 30% chance to insert a key
-                // 10% chance to remove a key
-                // 60% chance to search for a key
                 match rng.random_range(0..100u32) {
                     0..=89 => {
                         let _ = tree.insert(
