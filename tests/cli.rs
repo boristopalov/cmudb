@@ -59,11 +59,12 @@ fn shell_runs_ddl_dml_and_prints_a_table() {
 
 #[test]
 fn shell_reports_errors_and_keeps_going() {
-    let (out, err) = run_shell(
-        "SELEC 1;\nSELECT * FROM missing;\nSELECT 1 + 1;\nquit\n",
-    );
+    let (out, err) = run_shell("SELEC 1;\nSELECT * FROM missing;\nSELECT 1 + 1;\nquit\n");
     assert!(err.contains("error: parse:"), "{err}");
-    assert!(err.contains("error: bind: table not found: missing"), "{err}");
+    assert!(
+        err.contains("error: bind: table not found: missing"),
+        "{err}"
+    );
     assert!(out.contains("| 2    |"), "{out}");
 }
 

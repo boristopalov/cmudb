@@ -103,9 +103,8 @@ impl<'a> Planner<'a> {
         //   [ group-by columns... , aggregate-result columns... ]
         // which matches the order the executor encodes tuples in.
         if !group_bys.is_empty() || !aggregates.is_empty() {
-            let mut cols: Vec<(DataType, String)> = Vec::with_capacity(
-                group_bys.len() + aggregates.len(),
-            );
+            let mut cols: Vec<(DataType, String)> =
+                Vec::with_capacity(group_bys.len() + aggregates.len());
             for (i, gb) in group_bys.iter().enumerate() {
                 let dtype = gb.dtype().unwrap_or(DataType::INT);
                 // Borrow the source column name when the group-by is a plain
@@ -115,8 +114,7 @@ impl<'a> Planner<'a> {
                         tuple_idx, col_idx, ..
                     } => {
                         let join_off = source_schema.join_offset.unwrap_or(0);
-                        let idx =
-                            *col_idx as usize + if *tuple_idx == 1 { join_off } else { 0 };
+                        let idx = *col_idx as usize + if *tuple_idx == 1 { join_off } else { 0 };
                         source_schema
                             .cols
                             .get(idx)

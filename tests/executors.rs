@@ -5,7 +5,7 @@ mod common;
 
 use cmudb::catalog::{DataType, Schema, Value};
 use cmudb::processor::plan::{
-    AggType, DropIndexPlanNode, DropTablePlanNode, ExternalMergeSortPlanNode, Expression,
+    AggType, DropIndexPlanNode, DropTablePlanNode, Expression, ExternalMergeSortPlanNode,
     HashJoinPlanNode, JoinType, LimitPlanNode, Plan, SeqScanPlanNode, SortPlanNode,
     WindowFunctionPlanNode,
 };
@@ -20,7 +20,12 @@ fn col(col_idx: u32) -> Expression {
 }
 
 fn int_schema(names: &[&str]) -> Schema {
-    Schema::new(names.iter().map(|n| (DataType::INT, n.to_string())).collect())
+    Schema::new(
+        names
+            .iter()
+            .map(|n| (DataType::INT, n.to_string()))
+            .collect(),
+    )
 }
 
 fn scan(db: &Db, table: &str, names: &[&str]) -> Plan {
@@ -78,8 +83,15 @@ fn hash_join_left_pads_unmatched_rows_with_nulls() {
     let rows = db.run_plan(&hash_join(&db, JoinType::Left)).unwrap();
     assert_eq!(rows.len(), 6);
     let unmatched: Vec<_> = rows.iter().filter(|r| r[2].is_none()).collect();
-    assert_eq!(unmatched.len(), 2, "k=1 and k=NULL have no partner: {rows:?}");
-    assert!(rows.iter().all(|r| r[0].is_some() || r[2].is_none()), "NULL keys never match");
+    assert_eq!(
+        unmatched.len(),
+        2,
+        "k=1 and k=NULL have no partner: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|r| r[0].is_some() || r[2].is_none()),
+        "NULL keys never match"
+    );
     assert!(unmatched.iter().all(|r| r[3].is_none()));
 }
 
@@ -88,10 +100,21 @@ fn hash_join_handles_empty_inputs() {
     let db = Db::new(256);
     db.exec("CREATE TABLE l (k INTEGER, a INTEGER)");
     db.exec("CREATE TABLE r (k INTEGER, b INTEGER)");
-    assert!(db.run_plan(&hash_join(&db, JoinType::Inner)).unwrap().is_empty());
+    assert!(
+        db.run_plan(&hash_join(&db, JoinType::Inner))
+            .unwrap()
+            .is_empty()
+    );
     db.exec("INSERT INTO l VALUES (1, 1)");
-    assert!(db.run_plan(&hash_join(&db, JoinType::Inner)).unwrap().is_empty());
-    assert_eq!(db.run_plan(&hash_join(&db, JoinType::Left)).unwrap().len(), 1);
+    assert!(
+        db.run_plan(&hash_join(&db, JoinType::Inner))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        db.run_plan(&hash_join(&db, JoinType::Left)).unwrap().len(),
+        1
+    );
 }
 
 #[test]
@@ -187,7 +210,13 @@ fn window_partition_without_order_gives_partition_totals() {
         &db,
         Some(vec![col(0)]),
         None,
-        vec![AggType::SUM, AggType::COUNT, AggType::MIN, AggType::MAX, AggType::AVG],
+        vec![
+            AggType::SUM,
+            AggType::COUNT,
+            AggType::MIN,
+            AggType::MAX,
+            AggType::AVG,
+        ],
     );
     // rows within a partition come back in input order; sort to compare
     let mut rows = ints(&db.run_plan(&plan).unwrap());
@@ -273,7 +302,11 @@ fn drop_index_then_drop_table() {
         if_exists: false,
     }))
     .unwrap();
-    assert!(db.try_exec("SELECT * FROM t").unwrap_err().contains("table not found"));
+    assert!(
+        db.try_exec("SELECT * FROM t")
+            .unwrap_err()
+            .contains("table not found")
+    );
     let again = Plan::DropTable(DropTablePlanNode {
         table_oid,
         if_exists: false,
@@ -291,9 +324,18 @@ fn drop_index_then_drop_table() {
 #[test]
 fn values_are_comparable_and_support_arithmetic_across_types() {
     assert_eq!(Value::INT(2) + Value::INT(3), Value::INT(5));
-    assert_eq!(Value::FLOAT(1.5.into()) * Value::FLOAT(2.0.into()), Value::FLOAT(3.0.into()));
-    assert_eq!(Value::FLOAT(4.0.into()) - Value::FLOAT(1.0.into()), Value::FLOAT(3.0.into()));
-    assert_eq!(Value::FLOAT(4.0.into()) / Value::FLOAT(2.0.into()), Value::FLOAT(2.0.into()));
+    assert_eq!(
+        Value::FLOAT(1.5.into()) * Value::FLOAT(2.0.into()),
+        Value::FLOAT(3.0.into())
+    );
+    assert_eq!(
+        Value::FLOAT(4.0.into()) - Value::FLOAT(1.0.into()),
+        Value::FLOAT(3.0.into())
+    );
+    assert_eq!(
+        Value::FLOAT(4.0.into()) / Value::FLOAT(2.0.into()),
+        Value::FLOAT(2.0.into())
+    );
     assert!(Value::INT(1) < Value::INT(2));
     assert_eq!(Value::TIMESTAMP(5).data_type(), DataType::TIMESTAMP);
     assert_eq!(Value::BOOLEAN(true).data_type(), DataType::BOOLEAN);

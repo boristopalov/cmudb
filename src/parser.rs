@@ -4,11 +4,10 @@ use std::collections::HashMap;
 use ordered_float::OrderedFloat;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, CreateIndex as SqlCreateIndex,
-    CreateTable as SqlCreateTable, DataType as SqlDataType, Delete, Expr, Function,
-    FunctionArg, FunctionArgExpr, FunctionArguments, FromTable, GroupByExpr, Insert,
-    JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderByKind, Query,
-    SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins, Update,
-    Value as SqlValue,
+    CreateTable as SqlCreateTable, DataType as SqlDataType, Delete, Expr, FromTable, Function,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Insert, JoinConstraint,
+    JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderByKind, Query, SelectItem, SetExpr,
+    Statement, TableFactor, TableObject, TableWithJoins, Update, Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -367,8 +366,8 @@ impl<'a> Binder<'a> {
                 // Activate the aggregation context if anything would produce
                 // an Aggregation plan node: either there are GROUP BY exprs
                 // or one of the projections contains an aggregate function.
-                let aggregating = !group_by_exprs_raw.is_empty()
-                    || projection_has_aggregate(&s.projection);
+                let aggregating =
+                    !group_by_exprs_raw.is_empty() || projection_has_aggregate(&s.projection);
                 let prev_ctx = if aggregating {
                     self.agg_ctx.borrow_mut().replace(AggCtx {
                         group_by_exprs: group_by_exprs_raw,
@@ -780,9 +779,7 @@ fn expr_has_aggregate(e: &Expr) -> bool {
     match e {
         Expr::Function(f) => parse_agg_type(&f.name).is_some(),
         Expr::Nested(inner) => expr_has_aggregate(inner),
-        Expr::BinaryOp { left, right, .. } => {
-            expr_has_aggregate(left) || expr_has_aggregate(right)
-        }
+        Expr::BinaryOp { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
         _ => false,
     }
 }

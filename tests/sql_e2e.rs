@@ -42,18 +42,33 @@ fn insert_reports_row_count_and_select_star_round_trips_every_type() {
     );
     assert_eq!(rows[2][3], None, "NULL float survives a round trip");
     assert_eq!(rows[3][4], None, "NULL boolean survives a round trip");
-    assert_eq!(db.exec("INSERT INTO emp VALUES (5, 10, 1, 0.0, false)"), vec![vec![int(1)]]);
+    assert_eq!(
+        db.exec("INSERT INTO emp VALUES (5, 10, 1, 0.0, false)"),
+        vec![vec![int(1)]]
+    );
 }
 
 #[test]
 fn where_clause_comparisons_and_boolean_logic() {
     let db = emp_db();
     let q = |sql: &str| ints(&db.exec(sql));
-    assert_eq!(q("SELECT id FROM emp WHERE salary > 150"), vec![[2], [3], [4]]);
-    assert_eq!(q("SELECT id FROM emp WHERE salary >= 200 AND dept <> 30"), vec![[2], [3]]);
-    assert_eq!(q("SELECT id FROM emp WHERE salary < 200 OR dept = 30"), vec![[1], [4]]);
+    assert_eq!(
+        q("SELECT id FROM emp WHERE salary > 150"),
+        vec![[2], [3], [4]]
+    );
+    assert_eq!(
+        q("SELECT id FROM emp WHERE salary >= 200 AND dept <> 30"),
+        vec![[2], [3]]
+    );
+    assert_eq!(
+        q("SELECT id FROM emp WHERE salary < 200 OR dept = 30"),
+        vec![[1], [4]]
+    );
     assert_eq!(q("SELECT id FROM emp WHERE salary <= 200"), vec![[1], [2]]);
-    assert_eq!(q("SELECT id FROM emp WHERE (dept = 10) AND (salary = 200)"), vec![[2]]);
+    assert_eq!(
+        q("SELECT id FROM emp WHERE (dept = 10) AND (salary = 200)"),
+        vec![[2]]
+    );
     assert!(q("SELECT id FROM emp WHERE salary > 1000").is_empty());
 }
 
@@ -76,21 +91,32 @@ fn where_clause_treats_null_as_not_true() {
 fn projection_evaluates_arithmetic() {
     let db = emp_db();
     assert_eq!(
-        ints(&db.exec("SELECT id, salary * 2, salary + 1, salary - 1, salary / 2 FROM emp WHERE id = 3")),
+        ints(&db.exec(
+            "SELECT id, salary * 2, salary + 1, salary - 1, salary / 2 FROM emp WHERE id = 3"
+        )),
         vec![[3, 600, 301, 299, 150]]
     );
     assert_eq!(ints(&db.exec("SELECT 1 + 2")), vec![[3]]);
     let floats = db.exec("SELECT bonus * 2.0 FROM emp WHERE id = 2");
     assert_eq!(floats, vec![vec![Some(Value::FLOAT(5.0.into()))]]);
     // NULL propagates through arithmetic.
-    assert_eq!(db.exec("SELECT bonus + 1.0 FROM emp WHERE id = 3"), vec![vec![None]]);
+    assert_eq!(
+        db.exec("SELECT bonus + 1.0 FROM emp WHERE id = 3"),
+        vec![vec![None]]
+    );
 }
 
 #[test]
 fn table_aliases_and_qualified_columns() {
     let db = emp_db();
-    assert_eq!(ints(&db.exec("SELECT e.id FROM emp e WHERE e.salary = 200")), vec![[2]]);
-    assert_eq!(ints(&db.exec("SELECT emp.id FROM emp WHERE emp.id = 4")), vec![[4]]);
+    assert_eq!(
+        ints(&db.exec("SELECT e.id FROM emp e WHERE e.salary = 200")),
+        vec![[2]]
+    );
+    assert_eq!(
+        ints(&db.exec("SELECT emp.id FROM emp WHERE emp.id = 4")),
+        vec![[4]]
+    );
 }
 
 #[test]
@@ -101,7 +127,10 @@ fn aggregates_with_and_without_group_by() {
         ints(&db.exec("SELECT SUM(salary), MIN(salary), MAX(salary), AVG(salary) FROM emp")),
         vec![[1000, 100, 400, 250]]
     );
-    assert_eq!(ints(&db.exec("SELECT SUM(salary) + 1 FROM emp")), vec![[1001]]);
+    assert_eq!(
+        ints(&db.exec("SELECT SUM(salary) + 1 FROM emp")),
+        vec![[1001]]
+    );
     assert_eq!(
         sorted(ints(&db.exec(
             "SELECT dept, COUNT(*), SUM(salary), AVG(salary), MIN(salary), MAX(salary) \
@@ -119,7 +148,10 @@ fn aggregates_with_and_without_group_by() {
         vec![vec![Some(Value::FLOAT(8.0.into()))]]
     );
     // Filtered aggregate.
-    assert_eq!(ints(&db.exec("SELECT COUNT(*) FROM emp WHERE dept = 10")), vec![[2]]);
+    assert_eq!(
+        ints(&db.exec("SELECT COUNT(*) FROM emp WHERE dept = 10")),
+        vec![[2]]
+    );
 }
 
 #[test]
@@ -137,8 +169,14 @@ fn order_by_and_limit() {
         ints(&db.exec("SELECT a, b FROM t ORDER BY a, b")),
         vec![[1, 1], [1, 2], [2, 3], [3, 1]]
     );
-    assert_eq!(ints(&db.exec("SELECT a FROM t ORDER BY b, a LIMIT 2")), vec![[1], [3]]);
-    assert_eq!(ints(&db.exec("SELECT a FROM t LIMIT 0")), Vec::<Vec<i32>>::new());
+    assert_eq!(
+        ints(&db.exec("SELECT a FROM t ORDER BY b, a LIMIT 2")),
+        vec![[1], [3]]
+    );
+    assert_eq!(
+        ints(&db.exec("SELECT a FROM t LIMIT 0")),
+        Vec::<Vec<i32>>::new()
+    );
     assert_eq!(ints(&db.exec("SELECT a FROM t LIMIT 10")).len(), 4);
     assert_eq!(
         ints(&db.exec("SELECT a, COUNT(*) FROM t GROUP BY a ORDER BY a")),
@@ -159,7 +197,10 @@ fn order_by_desc() {
 #[test]
 fn values_statement() {
     let db = Db::new(8);
-    assert_eq!(ints(&db.exec("VALUES (1, 2), (3, 4)")), vec![[1, 2], [3, 4]]);
+    assert_eq!(
+        ints(&db.exec("VALUES (1, 2), (3, 4)")),
+        vec![[1, 2], [3, 4]]
+    );
 }
 
 #[test]
@@ -173,10 +214,16 @@ fn inner_and_left_joins_without_index_use_nested_loop_join() {
     );
     let left = db.exec("SELECT emp.id, dept.name FROM emp LEFT JOIN dept ON emp.dept = dept.id");
     assert_eq!(left.len(), 4);
-    assert_eq!(left[3], vec![int(4), None], "unmatched left row is NULL-padded");
+    assert_eq!(
+        left[3],
+        vec![int(4), None],
+        "unmatched left row is NULL-padded"
+    );
     // Non-equality join predicate.
     assert_eq!(
-        ints(&db.exec("SELECT emp.id, dept.id FROM emp JOIN dept ON emp.dept < dept.id WHERE emp.id = 4")),
+        ints(&db.exec(
+            "SELECT emp.id, dept.id FROM emp JOIN dept ON emp.dept < dept.id WHERE emp.id = 4"
+        )),
         vec![[4, 40]]
     );
     // Join + filter + aggregate.
@@ -197,8 +244,14 @@ fn inner_join_with_index_on_inner_side_uses_nested_index_join() {
     db.exec("CREATE TABLE u (tid INTEGER, w INTEGER)");
     db.exec("INSERT INTO u VALUES (1, 100), (2, 200), (2, 201), (9, 900)");
     let expected = vec![[100, 10], [200, 20], [201, 20]];
-    assert_eq!(ints(&db.exec("SELECT u.w, t.v FROM u JOIN t ON u.tid = t.id")), expected);
-    assert_eq!(ints(&db.exec("SELECT u.w, t.v FROM u JOIN t ON t.id = u.tid")), expected);
+    assert_eq!(
+        ints(&db.exec("SELECT u.w, t.v FROM u JOIN t ON u.tid = t.id")),
+        expected
+    );
+    assert_eq!(
+        ints(&db.exec("SELECT u.w, t.v FROM u JOIN t ON t.id = u.tid")),
+        expected
+    );
 }
 
 #[test]
@@ -206,17 +259,26 @@ fn index_scan_and_index_maintenance_through_dml() {
     let db = Db::new(64);
     db.exec("CREATE TABLE t (id INTEGER, v INTEGER)");
     db.exec("CREATE INDEX t_id ON t (id)");
-    assert!(db.exec("SELECT v FROM t WHERE id = 3").is_empty(), "empty index scans cleanly");
+    assert!(
+        db.exec("SELECT v FROM t WHERE id = 3").is_empty(),
+        "empty index scans cleanly"
+    );
     db.exec("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
     assert_eq!(ints(&db.exec("SELECT v FROM t WHERE id = 3")), vec![[30]]);
     assert_eq!(ints(&db.exec("SELECT v FROM t WHERE 3 = id")), vec![[30]]);
     assert!(db.exec("SELECT v FROM t WHERE id = 7").is_empty());
 
-    assert_eq!(ints(&db.exec("UPDATE t SET v = v + 1 WHERE id = 3")), vec![[1]]);
+    assert_eq!(
+        ints(&db.exec("UPDATE t SET v = v + 1 WHERE id = 3")),
+        vec![[1]]
+    );
     assert_eq!(ints(&db.exec("SELECT v FROM t WHERE id = 3")), vec![[31]]);
 
     // Updating the key column moves the index entry.
-    assert_eq!(ints(&db.exec("UPDATE t SET id = 33 WHERE id = 3")), vec![[1]]);
+    assert_eq!(
+        ints(&db.exec("UPDATE t SET id = 33 WHERE id = 3")),
+        vec![[1]]
+    );
     assert_eq!(ints(&db.exec("SELECT v FROM t WHERE id = 33")), vec![[31]]);
     assert!(db.exec("SELECT v FROM t WHERE id = 3").is_empty());
 
@@ -245,21 +307,39 @@ fn unique_index_rejects_duplicate_key() {
 fn create_index_backfills_existing_rows() {
     let db = emp_db();
     db.exec("CREATE INDEX emp_id ON emp (id)");
-    assert_eq!(ints(&db.exec("SELECT salary FROM emp WHERE id = 3")), vec![[300]]);
+    assert_eq!(
+        ints(&db.exec("SELECT salary FROM emp WHERE id = 3")),
+        vec![[300]]
+    );
 }
 
 #[test]
 fn update_and_delete_without_index() {
     let db = emp_db();
-    assert_eq!(ints(&db.exec("UPDATE emp SET salary = salary * 10 WHERE dept = 10")), vec![[2]]);
+    assert_eq!(
+        ints(&db.exec("UPDATE emp SET salary = salary * 10 WHERE dept = 10")),
+        vec![[2]]
+    );
     assert_eq!(
         ints(&db.exec("SELECT salary FROM emp WHERE dept = 10 ORDER BY salary")),
         vec![[1000], [2000]]
     );
-    assert_eq!(ints(&db.exec("UPDATE emp SET dept = 99, salary = 0 WHERE id = 4")), vec![[1]]);
-    assert_eq!(ints(&db.exec("SELECT dept, salary FROM emp WHERE id = 4")), vec![[99, 0]]);
-    assert_eq!(ints(&db.exec("DELETE FROM emp WHERE salary >= 1000")), vec![[2]]);
-    assert_eq!(ints(&db.exec("SELECT id FROM emp ORDER BY id")), vec![[3], [4]]);
+    assert_eq!(
+        ints(&db.exec("UPDATE emp SET dept = 99, salary = 0 WHERE id = 4")),
+        vec![[1]]
+    );
+    assert_eq!(
+        ints(&db.exec("SELECT dept, salary FROM emp WHERE id = 4")),
+        vec![[99, 0]]
+    );
+    assert_eq!(
+        ints(&db.exec("DELETE FROM emp WHERE salary >= 1000")),
+        vec![[2]]
+    );
+    assert_eq!(
+        ints(&db.exec("SELECT id FROM emp ORDER BY id")),
+        vec![[3], [4]]
+    );
     assert_eq!(ints(&db.exec("DELETE FROM emp WHERE id = 42")), vec![[0]]);
 }
 
@@ -268,9 +348,18 @@ fn many_rows_span_pages_and_survive_eviction() {
     // 4 frames forces the heap and sort to spill pages through the disk manager.
     let db = Db::new(4);
     db.exec("CREATE TABLE big (id INTEGER, v INTEGER)");
-    let values: Vec<String> = (0..2000).rev().map(|i| format!("({i}, {})", i % 7)).collect();
-    assert_eq!(ints(&db.exec(&format!("INSERT INTO big VALUES {}", values.join(", ")))), vec![[2000]]);
-    assert_eq!(ints(&db.exec("SELECT COUNT(*), SUM(id) FROM big")), vec![[2000, 1999 * 1000]]);
+    let values: Vec<String> = (0..2000)
+        .rev()
+        .map(|i| format!("({i}, {})", i % 7))
+        .collect();
+    assert_eq!(
+        ints(&db.exec(&format!("INSERT INTO big VALUES {}", values.join(", ")))),
+        vec![[2000]]
+    );
+    assert_eq!(
+        ints(&db.exec("SELECT COUNT(*), SUM(id) FROM big")),
+        vec![[2000, 1999 * 1000]]
+    );
     let ordered = ints(&db.exec("SELECT id FROM big ORDER BY id LIMIT 3"));
     assert_eq!(ordered, vec![[0], [1], [2]]);
     assert_eq!(
@@ -310,11 +399,23 @@ fn binder_and_planner_errors_are_reported() {
         ("SELECT * FROM nope", "table not found"),
         ("SELECT * FROM emp, dept", "comma-separated"),
         ("DROP TABLE emp", "unsupported statement"),
-        ("SELECT id FROM emp JOIN dept ON emp.dept = dept.id", "ambiguous"),
-        ("SELECT * FROM emp RIGHT JOIN dept ON emp.dept = dept.id", "unsupported join"),
-        ("SELECT emp.id FROM emp JOIN dept ON emp.dept = dept.id JOIN dept d2 ON d2.id = emp.id", "2-way"),
+        (
+            "SELECT id FROM emp JOIN dept ON emp.dept = dept.id",
+            "ambiguous",
+        ),
+        (
+            "SELECT * FROM emp RIGHT JOIN dept ON emp.dept = dept.id",
+            "unsupported join",
+        ),
+        (
+            "SELECT emp.id FROM emp JOIN dept ON emp.dept = dept.id JOIN dept d2 ON d2.id = emp.id",
+            "2-way",
+        ),
         ("SELECT id FROM emp WHERE id LIKE 1", "unsupported"),
-        ("SELECT id FROM emp WHERE id % 2 = 0", "unsupported binary operator"),
+        (
+            "SELECT id FROM emp WHERE id % 2 = 0",
+            "unsupported binary operator",
+        ),
         ("SELECT 'text'", "unsupported literal"),
         ("SELECT id FROM emp LIMIT id", "LIMIT"),
         ("SELECT foo.id FROM emp", ""),
@@ -327,7 +428,10 @@ fn binder_and_planner_errors_are_reported() {
         ("SELECT CONCAT(id) FROM emp", ""),
         ("SELECT id FROM (SELECT id FROM emp) sub", ""),
         ("INSERT INTO emp SELECT * FROM emp", ""),
-        ("SELECT id FROM emp WHERE id IN (1, 2)", "unsupported expression"),
+        (
+            "SELECT id FROM emp WHERE id IN (1, 2)",
+            "unsupported expression",
+        ),
         ("SELECT emp.* FROM emp", ""),
     ];
     let mut failures = Vec::new();

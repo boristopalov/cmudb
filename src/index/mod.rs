@@ -129,7 +129,10 @@ mod tests {
             ),
         ];
         for (err, msg) in inserts {
-            assert_eq!(IndexError::Insert(err).to_string(), format!("insert failed: {msg}"));
+            assert_eq!(
+                IndexError::Insert(err).to_string(),
+                format!("insert failed: {msg}")
+            );
         }
         assert_eq!(
             RemoveError::GenericError("x".into()).to_string(),

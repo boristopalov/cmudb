@@ -18,11 +18,8 @@ use tempfile::tempdir;
 fn main() {
     let num_frames: usize = 64;
     let dir = tempdir().expect("failed to create tempdir for db");
-    let dm = DiskManager::new(
-        dir.path().join("cmudb.data"),
-        dir.path().join("cmudb.log"),
-    )
-    .expect("failed to create disk manager");
+    let dm = DiskManager::new(dir.path().join("cmudb.data"), dir.path().join("cmudb.log"))
+        .expect("failed to create disk manager");
     let scheduler = DiskScheduler::new(dm);
     let replacer = ArcReplacer::new(num_frames);
     let bpm = Arc::new(create_buffer_pool_manager(num_frames, replacer, scheduler));
@@ -105,9 +102,7 @@ fn execute(plan: &Plan, exec: &mut dyn Executor) -> Result<(), String> {
     match plan {
         Plan::Insert(_) => {
             if let Some((tup, _)) = exec.next().map_err(|e| format!("exec: {}", e.0))? {
-                let n = i32::from_ne_bytes(
-                    tup.data.as_slice().try_into().unwrap_or([0, 0, 0, 0]),
-                );
+                let n = i32::from_ne_bytes(tup.data.as_slice().try_into().unwrap_or([0, 0, 0, 0]));
                 println!("INSERT {n}");
             }
         }

@@ -231,9 +231,9 @@ impl Expression {
             } => {
                 let mut idx = *col_idx as usize;
                 if *tuple_idx == 1 {
-                    idx += schema.join_offset.expect(
-                        "tuple_idx=1 column reference evaluated against a non-join schema",
-                    );
+                    idx += schema
+                        .join_offset
+                        .expect("tuple_idx=1 column reference evaluated against a non-join schema");
                 }
                 schema
                     .get_value(tuple, idx)

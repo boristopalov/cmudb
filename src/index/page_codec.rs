@@ -190,7 +190,10 @@ mod tests {
     fn errors_display_readably() {
         let cases = [
             (PageCodecError::BadMagic, "bad page magic"),
-            (PageCodecError::UnsupportedVersion(3), "unsupported page version 3"),
+            (
+                PageCodecError::UnsupportedVersion(3),
+                "unsupported page version 3",
+            ),
             (
                 PageCodecError::WrongPageKind {
                     expected: 1,

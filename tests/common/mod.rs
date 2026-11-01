@@ -86,7 +86,10 @@ impl Db {
                 }
                 rows.push(vec![Some(Value::INT(n))]);
             }
-            Plan::CreateTable(_) | Plan::CreateIndex(_) | Plan::DropTable(_) | Plan::DropIndex(_) => {
+            Plan::CreateTable(_)
+            | Plan::CreateIndex(_)
+            | Plan::DropTable(_)
+            | Plan::DropIndex(_) => {
                 exec.next().map_err(|e| format!("exec: {}", e.0))?;
             }
             _ => {
