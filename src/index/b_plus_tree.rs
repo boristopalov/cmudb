@@ -5,8 +5,10 @@ use crate::index::b_plus_page::{
     HeaderPage, INVALID_PAGE_ID, InternalPage, LeafPage, NUM_TOMBSTONES, Page, PageId, PageKind,
 };
 use crate::index::context::TreeContext;
-use crate::index::page_codec::PageCodecError;
-use crate::index::page_view::{HeaderPageView, LeafInsertError, LeafPageView, NodeView};
+use crate::index::page_codec::{KIND_LEAF, PageCodecError, peek_common_header};
+use crate::index::page_view::{
+    HeaderPageView, InternalPageView, LeafInsertError, LeafPageView, NodeView,
+};
 use crate::index::{
     Index, IndexError, IndexIter, InsertError, InsertResult, RemoveError, RemoveResult,
 };
@@ -63,12 +65,15 @@ fn safe_for_remove(page: &NodeView<&[u8]>) -> bool {
 }
 
 /// The child of the internal page in `buf` to descend into for `key`, or `None` when `buf`
-/// holds a leaf.
+/// holds a leaf. A leaf is only told apart by its kind here; whoever reads it validates it.
 fn child_for_key(buf: &[u8], key_len: u32, key: &IndexKey) -> Result<Option<PageId>, IndexError> {
-    match NodeView::new(buf, key_len)? {
-        NodeView::Leaf(_) => Ok(None),
-        NodeView::Internal(node) => node.child_for(&key.0).ok_or(NO_CHILD_FOR_KEY).map(Some),
+    if peek_common_header(buf)? == KIND_LEAF {
+        return Ok(None);
     }
+    InternalPageView::new(buf, key_len)?
+        .child_for(&key.0)
+        .ok_or(NO_CHILD_FOR_KEY)
+        .map(Some)
 }
 
 fn page_id_of(page: &PageMut<'_>) -> Result<PageId, IndexError> {
@@ -907,13 +912,7 @@ impl Iterator for BPlusTreeIter {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let buf = self.leaf.as_ref()?;
-            let leaf = match LeafPageView::new(&buf[..], self.key_len) {
-                Ok(leaf) => leaf,
-                Err(e) => {
-                    self.leaf = None;
-                    return Some(Err(IndexError::PageError(e)));
-                }
-            };
+            let leaf = LeafPageView::trusted(&buf[..], self.key_len);
 
             if self.slot_idx >= leaf.size() as usize {
                 let next_leaf_id = leaf.next_leaf_id();
@@ -1087,6 +1086,68 @@ mod tests {
                 .scan((Bound::Unbounded, Bound::Unbounded))
                 .and_then(|it| it.collect::<Result<Vec<_>, _>>())
                 .map(|_| ())
+        ));
+    }
+
+    /// A tree of two leaves with no tombstones, returning the tree and the two leaf ids.
+    fn two_leaf_tree(bpm: &Arc<BufferPoolManager>) -> (BPlusTree, PageId, PageId) {
+        let tree = BPlusTree::new("idx".to_string(), NO_TOMBSTONE_KEY_LEN, bpm.clone()).unwrap();
+        for k in 0..15u8 {
+            let rid = RecordId {
+                page_id: u32::from(k),
+                slot_id: 0,
+            };
+            tree.insert(
+                make_key(k, NO_TOMBSTONE_KEY_LEN as usize),
+                IndexValue::IndexValue(rid),
+            )
+            .unwrap();
+        }
+        let root = InternalPage::decode(
+            bpm.read_page(tree.read_header().unwrap().root_page_id)
+                .unwrap()
+                .data(),
+            NO_TOMBSTONE_KEY_LEN,
+        )
+        .unwrap();
+        (tree, root.children[0], root.children[1])
+    }
+
+    fn scan_all(tree: &BPlusTree) -> Result<Vec<(IndexKey, IndexValue)>, IndexError> {
+        tree.scan((Bound::Unbounded, Bound::Unbounded))?.collect()
+    }
+
+    #[test]
+    fn a_corrupt_leaf_in_the_middle_of_a_scan_is_an_error() {
+        let (bpm, _tmp) = make_bpm(16);
+        let (tree, _, right) = two_leaf_tree(&bpm);
+        assert_eq!(scan_all(&tree).unwrap().len(), 15);
+        bpm.write_page(right).unwrap().data_mut()[LEAF_FIXED_HEADER_BYTES] = 0xff;
+        assert!(
+            matches!(
+                scan_all(&tree),
+                Err(IndexError::PageError(PageCodecError::Malformed(_)))
+            ),
+            "the second leaf's keys are out of order"
+        );
+    }
+
+    #[test]
+    fn a_cycle_in_the_leaf_chain_is_an_error() {
+        let (bpm, _tmp) = make_bpm(16);
+        let (tree, left, right) = two_leaf_tree(&bpm);
+        let mut leaf = tree.decode_leaf(right).unwrap();
+        leaf.next_leaf_id = left;
+        leaf.encode(
+            bpm.write_page(right).unwrap().data_mut(),
+            NO_TOMBSTONE_KEY_LEN,
+        )
+        .unwrap();
+        assert!(matches!(
+            scan_all(&tree),
+            Err(IndexError::PageError(PageCodecError::Malformed(
+                "leaf chain contains a cycle"
+            )))
         ));
     }
 
