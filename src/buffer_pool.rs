@@ -134,6 +134,10 @@ impl<'a> PageMut<'a> {
         self.frame_guard.page_id
     }
 
+    pub fn data(&self) -> &[u8] {
+        &self.frame_guard.buf
+    }
+
     pub fn data_mut(&mut self) -> &mut [u8] {
         &mut self.frame_guard.buf
     }

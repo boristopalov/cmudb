@@ -114,3 +114,39 @@ impl<'a> BufReader<'a> {
         self.buf.len().saturating_sub(self.pos)
     }
 }
+
+/// Reads a little-endian `u16` at `off`. Panics when `off..off + 2` is outside `buf`.
+#[inline]
+pub fn get_u16_le(buf: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes(buf[off..off + 2].try_into().expect("2-byte slice"))
+}
+
+/// Reads a little-endian `u32` at `off`. Panics when `off..off + 4` is outside `buf`.
+#[inline]
+pub fn get_u32_le(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(buf[off..off + 4].try_into().expect("4-byte slice"))
+}
+
+/// Reads a little-endian `u64` at `off`. Panics when `off..off + 8` is outside `buf`.
+#[inline]
+pub fn get_u64_le(buf: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(buf[off..off + 8].try_into().expect("8-byte slice"))
+}
+
+/// Writes `v` as a little-endian `u16` at `off`. Panics when `off..off + 2` is outside `buf`.
+#[inline]
+pub fn put_u16_le(buf: &mut [u8], off: usize, v: u16) {
+    buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Writes `v` as a little-endian `u32` at `off`. Panics when `off..off + 4` is outside `buf`.
+#[inline]
+pub fn put_u32_le(buf: &mut [u8], off: usize, v: u32) {
+    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Writes `v` as a little-endian `u64` at `off`. Panics when `off..off + 8` is outside `buf`.
+#[inline]
+pub fn put_u64_le(buf: &mut [u8], off: usize, v: u64) {
+    buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
