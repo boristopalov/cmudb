@@ -1028,7 +1028,11 @@ impl<'a> Executor for HashJoinExecutor<'a> {
                     .collect::<Result<_, _>>()?,
             );
 
-            // probe the hash table for this key
+            // probe the hash table for this key. A NULL key never equals anything,
+            // including another NULL, so it cannot match.
+            if key.0.iter().any(Option::is_none) {
+                continue;
+            }
             let tuple_matches = self.left_hash_table.as_mut().unwrap().get_mut(&key);
             if tuple_matches.is_some() {
                 // we have a match, we need to yield the combined tuples
