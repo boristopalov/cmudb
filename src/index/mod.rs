@@ -99,3 +99,41 @@ impl fmt::Display for RemoveError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn errors_convert_and_display() {
+        let e: IndexError = RemoveError::KeyNotFound.into();
+        assert_eq!(e.to_string(), "remove failed: key not found");
+        let e: IndexError = PageCodecError::BadMagic.into();
+        assert_eq!(e.to_string(), "page decode/encode error: bad page magic");
+        let e: IndexError = BpmError::NoFreeFrame.into();
+        assert!(e.to_string().starts_with("BPM error"));
+        assert_eq!(IndexError::Lookup.to_string(), "lookup error");
+        assert_eq!(
+            IndexError::LatchError.to_string(),
+            "error reading or acquiring latch"
+        );
+        let inserts = [
+            (InsertError::DuplicateKey, "key already exists"),
+            (InsertError::InvalidKey, "invalid key"),
+            (InsertError::InvalidValue, "invalid value"),
+            (InsertError::BpmError, "bpm error"),
+            (InsertError::BadRoot, "error getting root while inserting"),
+            (
+                InsertError::GenericError("boom".into()),
+                "error while inserting: boom",
+            ),
+        ];
+        for (err, msg) in inserts {
+            assert_eq!(IndexError::Insert(err).to_string(), format!("insert failed: {msg}"));
+        }
+        assert_eq!(
+            RemoveError::GenericError("x".into()).to_string(),
+            "error while removing: x"
+        );
+    }
+}

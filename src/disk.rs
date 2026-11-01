@@ -260,3 +260,127 @@ impl DiskManager {
         warn!("{context}; page_id->offset mapping: {:?}", snapshot);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(fill: u8) -> PageData {
+        Box::new([fill; PAGE_SIZE])
+    }
+
+    fn manager(dir: &tempfile::TempDir) -> DiskManager {
+        DiskManager::new(dir.path().join("db"), dir.path().join("log")).unwrap()
+    }
+
+    #[test]
+    fn write_then_read_round_trips_and_overwrites_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let dm = manager(&dir);
+        dm.write_page(7, page(0xAB)).unwrap();
+        dm.write_page(3, page(0x01)).unwrap();
+        assert_eq!(*dm.read_page(7, page(0)).unwrap(), [0xAB; PAGE_SIZE]);
+        assert_eq!(*dm.read_page(3, page(0)).unwrap(), [0x01; PAGE_SIZE]);
+
+        // Rewriting a page reuses its offset instead of growing the file.
+        let len = std::fs::metadata(dir.path().join("db")).unwrap().len();
+        dm.write_page(7, page(0xCD)).unwrap();
+        assert_eq!(std::fs::metadata(dir.path().join("db")).unwrap().len(), len);
+        assert_eq!(*dm.read_page(7, page(0)).unwrap(), [0xCD; PAGE_SIZE]);
+        assert_eq!(dm.num_writes.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn reading_an_unwritten_page_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = manager(&dir).read_page(42, page(0)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn freed_slots_are_reused_before_growing_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dm = manager(&dir);
+        dm.write_page(1, page(1)).unwrap();
+        dm.free_slots.lock().push(0);
+        dm.write_page(2, page(2)).unwrap();
+        assert_eq!(dm.page_lookup_table.lock().get(&2), Some(&0));
+        assert_eq!(*dm.read_page(2, page(0)).unwrap(), [2; PAGE_SIZE]);
+    }
+
+    #[test]
+    fn scheduler_runs_requests_in_order_and_shuts_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = DiskScheduler::new(manager(&dir));
+        let (wtx, wrx) = mpsc::channel();
+        let (rtx, rrx) = mpsc::channel();
+        scheduler
+            .schedule(vec![
+                DiskRequest {
+                    page_id: 5,
+                    is_write: true,
+                    data: page(9),
+                    promise: wtx,
+                },
+                DiskRequest {
+                    page_id: 5,
+                    is_write: false,
+                    data: page(0),
+                    promise: rtx,
+                },
+            ])
+            .unwrap();
+        wrx.recv().unwrap().unwrap();
+        assert_eq!(*rrx.recv().unwrap().unwrap(), [9; PAGE_SIZE]);
+        assert!(Arc::strong_count(&scheduler.disk_manager()) >= 2);
+        scheduler.shutdown().unwrap();
+    }
+
+    #[test]
+    fn scheduler_survives_a_dropped_promise() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = DiskScheduler::new(manager(&dir));
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        scheduler
+            .schedule(vec![DiskRequest {
+                page_id: 1,
+                is_write: true,
+                data: page(1),
+                promise: tx,
+            }])
+            .unwrap();
+        // The worker logs the failed delivery and keeps serving requests.
+        let (tx, rx) = mpsc::channel();
+        scheduler
+            .schedule(vec![DiskRequest {
+                page_id: 1,
+                is_write: false,
+                data: page(0),
+                promise: tx,
+            }])
+            .unwrap();
+        assert_eq!(*rx.recv().unwrap().unwrap(), [1; PAGE_SIZE]);
+    }
+
+    #[test]
+    fn scheduler_errors_display() {
+        let (tx, _rx) = mpsc::channel();
+        let req = DiskRequest {
+            page_id: 3,
+            is_write: false,
+            data: page(0),
+            promise: tx,
+        };
+        let closed: DiskSchedulerError = SendError(req).into();
+        assert_eq!(closed.to_string(), "failed to send disk request for page 3");
+        assert_eq!(
+            DiskSchedulerError::Shutdown.to_string(),
+            "disk scheduler is shut down"
+        );
+        assert_eq!(
+            DiskSchedulerError::WorkerPanicked.to_string(),
+            "disk worker thread panicked"
+        );
+    }
+}
