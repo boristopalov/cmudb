@@ -38,6 +38,8 @@ pub struct ArcReplacer {
     /// TODO: should be ref, not Node?>
     nodes: Vec<Node>,
 
+    unused_node_indices: Vec<usize>,
+
     page_indices: HashMap<usize, usize>,
 
     frame_indices: HashMap<usize, usize>,
@@ -85,6 +87,7 @@ impl ArcReplacer {
     pub fn new(cap: usize) -> Self {
         Self {
             nodes: Vec::with_capacity(cap),
+            unused_node_indices: Vec::new(),
             page_indices: HashMap::new(),
             frame_indices: HashMap::new(),
             mru_list: ListHead::default(),
@@ -140,8 +143,11 @@ impl ArcReplacer {
             match self.nodes[idx].list {
                 ArcList::Mfu | ArcList::Mru => {
                     info!("record_access page_id={page_id} frame_id={frame_id} -> front of MFU");
-                    let node = &mut self.nodes[idx];
-                    node.frame_id = Some(frame_id);
+                    if let Some(previous_frame) = self.nodes[idx].frame_id.replace(frame_id)
+                        && previous_frame != frame_id
+                    {
+                        self.frame_indices.remove(&previous_frame);
+                    }
                     self.frame_indices.insert(frame_id, idx);
                     self.move_to_front(idx, ArcList::Mfu);
                 }
@@ -232,8 +238,16 @@ impl ArcReplacer {
             next: None,
             prev: None,
         };
-        self.nodes.push(new_node);
-        let idx = self.nodes.len() - 1;
+        let idx = match self.unused_node_indices.pop() {
+            Some(idx) => {
+                self.nodes[idx] = new_node;
+                idx
+            }
+            None => {
+                self.nodes.push(new_node);
+                self.nodes.len() - 1
+            }
+        };
         self.page_indices.insert(page_id, idx);
         self.frame_indices.insert(frame_id, idx);
         self.push(idx, ArcList::Mru);
@@ -345,12 +359,17 @@ impl ArcReplacer {
         };
 
         let page_id = self.nodes[idx].page_id;
+        debug_assert!(
+            self.nodes[idx].frame_id.is_none(),
+            "ghost node for page {page_id} still holds a frame"
+        );
         info!(
             "trim_ghost_tail: drop ghost page_id={page_id} from list={:?}",
             ghost_list
         );
         self.detach(idx);
         self.page_indices.remove(&page_id);
+        self.unused_node_indices.push(idx);
         true
     }
 
@@ -446,6 +465,42 @@ mod tests {
         let mut arc_replacer = ArcReplacer::new(1);
         arc_replacer.mru_ghost_list.length = 2;
         arc_replacer.record_access(1, 1);
+    }
+
+    #[test]
+    fn node_storage_stays_bounded_by_twice_the_capacity() {
+        let capacity = 2;
+        let mut arc_replacer = ArcReplacer::new(capacity);
+        for frame_id in 0..capacity {
+            arc_replacer.record_access(frame_id, frame_id);
+            arc_replacer.set_evictable(frame_id, true);
+        }
+        for page_id in capacity..1_000 {
+            let frame_id = arc_replacer.evict().expect("an evictable frame");
+            arc_replacer.record_access(frame_id, page_id);
+            arc_replacer.set_evictable(frame_id, true);
+        }
+        assert!(
+            arc_replacer.nodes.len() <= 2 * capacity,
+            "replacer kept {} nodes for capacity {capacity}",
+            arc_replacer.nodes.len()
+        );
+    }
+
+    #[test]
+    fn page_moved_to_another_frame_forgets_its_old_frame() {
+        let mut arc_replacer = ArcReplacer::new(4);
+        arc_replacer.record_access(1, 10);
+        arc_replacer.record_access(2, 10);
+        assert!(!arc_replacer.frame_indices.contains_key(&1));
+        arc_replacer.set_evictable(2, true);
+        assert_eq!(arc_replacer.size(), 1);
+        arc_replacer.set_evictable(1, true);
+        assert_eq!(
+            arc_replacer.size(),
+            1,
+            "stale frame 1 changed the evictable count"
+        );
     }
 
     #[test]
