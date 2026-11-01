@@ -13,7 +13,6 @@ use crate::processor::plan::{
     SortPlanNode, UpdatePlanNode, ValuesPlanNode, WindowFunctionPlanNode,
 };
 use crate::table_heap::{RecordId, TableHeap, TableHeapError, TableHeapIterator, Tuple};
-use std::cmp::Ordering;
 use std::collections::hash_map::IntoIter;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -451,13 +450,7 @@ impl<'a> Executor for AggregationExecutor<'a> {
         let mut agg_hash_table: HashMap<ExprKey, AggVal> = HashMap::new();
         while let Some((tuple, _)) = self.child.next()? {
             let schema = self.child.schema();
-            let groups = ExprKey(
-                self.plan
-                    .group_bys
-                    .iter()
-                    .map(|expr| expr.evaluate(&tuple, schema).ok()?)
-                    .collect(),
-            );
+            let groups = eval_key(&self.plan.group_bys, &tuple, schema)?;
             let entry = agg_hash_table.entry(groups).or_insert_with(|| {
                 AggVal(
                     self.plan
@@ -502,7 +495,7 @@ impl<'a> Executor for AggregationExecutor<'a> {
     }
 }
 
-#[derive(Eq, PartialEq, Hash)]
+#[derive(Eq, PartialEq, Hash, PartialOrd, Ord)]
 struct ExprKey(Vec<Option<Value>>);
 
 impl ExprKey {
@@ -981,10 +974,13 @@ impl<'a> Executor for SortExecutor<'a> {
         while let Some(row) = self.child.next()? {
             buf.push(row);
         }
-        let schema = &self.plan.schema;
-        let order_by = &self.plan.order_by_exprs;
-        buf.sort_by(|a, b| cmp_tuples(&a.0, &b.0, order_by, schema));
-        self.sorted = buf.into_iter();
+        let sorted = sorted_by_exprs(
+            buf,
+            |row| &row.0,
+            &self.plan.order_by_exprs,
+            &self.plan.schema,
+        )?;
+        self.sorted = sorted.into_iter();
         Ok(())
     }
 
@@ -1023,16 +1019,20 @@ impl<'a> ExternalMergeSortExecutor<'a> {
     }
 }
 
-fn cmp_tuples(a: &Tuple, b: &Tuple, exprs: &[Expression], schema: &Schema) -> Ordering {
-    for expr in exprs {
-        let va = expr.evaluate(a, schema).ok().flatten();
-        let vb = expr.evaluate(b, schema).ok().flatten();
-        match va.cmp(&vb) {
-            Ordering::Equal => continue,
-            ord => return ord,
-        }
-    }
-    Ordering::Equal
+/// Rows ordered by `exprs` evaluated on each row's tuple, NULLs first; equal rows keep
+/// their input order.
+fn sorted_by_exprs<T>(
+    rows: Vec<T>,
+    tuple_of: impl Fn(&T) -> &Tuple,
+    exprs: &[Expression],
+    schema: &Schema,
+) -> Result<Vec<T>, ExecutorError> {
+    let mut keyed = rows
+        .into_iter()
+        .map(|row| Ok((eval_key(exprs, tuple_of(&row), schema)?, row)))
+        .collect::<Result<Vec<_>, ExecutorError>>()?;
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(keyed.into_iter().map(|(_, row)| row).collect())
 }
 
 /// Input bytes the external merge sort sorts in memory before spilling them as one run.
@@ -1041,9 +1041,9 @@ const SORT_RUN_BUDGET_BYTES: usize = 5_000 * PAGE_SIZE;
 impl<'a> ExternalMergeSortExecutor<'a> {
     fn spill_sorted_run(&self, rows: &mut Vec<Tuple>) -> Result<TableHeap, ExecutorError> {
         let (order_by, schema) = (&self.plan.order_by_exprs, &self.plan.schema);
-        rows.sort_by(|a, b| cmp_tuples(a, b, order_by, schema));
+        let sorted = sorted_by_exprs(std::mem::take(rows), |t| t, order_by, schema)?;
         let run = TableHeap::new(self.bpm.clone())?;
-        for t in rows.drain(..) {
+        for t in sorted {
             run.insert(&t)?;
         }
         Ok(run)
@@ -1054,26 +1054,31 @@ impl<'a> ExternalMergeSortExecutor<'a> {
         let out = TableHeap::new(self.bpm.clone())?;
         let mut a_rows = a.iter();
         let mut b_rows = b.iter();
-        let mut a_head = a_rows.next().transpose()?.map(|(t, _)| t);
-        let mut b_head = b_rows.next().transpose()?.map(|(t, _)| t);
+        let next_keyed =
+            |rows: &mut TableHeapIterator| -> Result<Option<(ExprKey, Tuple)>, ExecutorError> {
+                match rows.next().transpose()? {
+                    Some((t, _)) => Ok(Some((eval_key(order_by, &t, schema)?, t))),
+                    None => Ok(None),
+                }
+            };
+        let mut a_head = next_keyed(&mut a_rows)?;
+        let mut b_head = next_keyed(&mut b_rows)?;
         loop {
             let take_a = match (&a_head, &b_head) {
-                (Some(ta), Some(tb)) => cmp_tuples(ta, tb, order_by, schema) != Ordering::Greater,
+                (Some((ka, _)), Some((kb, _))) => ka <= kb,
                 (Some(_), None) => true,
                 (None, Some(_)) => false,
                 (None, None) => return Ok(out),
             };
-            if take_a {
-                if let Some(t) = a_head.take() {
-                    out.insert(&t)?;
-                }
-                a_head = a_rows.next().transpose()?.map(|(t, _)| t);
+            let (head, rows) = if take_a {
+                (&mut a_head, &mut a_rows)
             } else {
-                if let Some(t) = b_head.take() {
-                    out.insert(&t)?;
-                }
-                b_head = b_rows.next().transpose()?.map(|(t, _)| t);
+                (&mut b_head, &mut b_rows)
+            };
+            if let Some((_, t)) = head.take() {
+                out.insert(&t)?;
             }
+            *head = next_keyed(rows)?;
         }
     }
 }
@@ -1199,7 +1204,7 @@ impl<'a> Executor for WindowFunctionExecutor<'a> {
         let partition_by: &[Expression] = self.plan.partition_by_exprs.as_deref().unwrap_or(&[]);
         let order_by: &[Expression] = self.plan.order_by_exprs.as_deref().unwrap_or(&[]);
         let sort_exprs: Vec<Expression> = partition_by.iter().chain(order_by).cloned().collect();
-        tups.sort_by(|a, b| cmp_tuples(a, b, &sort_exprs, child_schema));
+        let tups = sorted_by_exprs(tups, |t| t, &sort_exprs, child_schema)?;
 
         let running = self.plan.order_by_exprs.is_some();
         let fresh_aggregates = || -> Vec<AggState> {
@@ -1749,6 +1754,43 @@ mod tests {
             decode_ints(&schema, merged_with_empty.iter().map(|r| r.unwrap().0)),
             vec![vec![1, 0], vec![3, 0], vec![5, 0]]
         );
+    }
+
+    fn divide_by_zero(col_idx: u32) -> Expression {
+        Expression::Binary {
+            left: Box::new(col(col_idx)),
+            right: Box::new(Expression::Constant(Some(Value::INT(0)))),
+            op: crate::processor::plan::Op::Div,
+        }
+    }
+
+    #[test]
+    fn sort_key_evaluation_errors_are_reported_not_sorted_as_null() {
+        let schema = int_schema(&["a"]);
+        let rows = values_plan(&schema, &[&[2], &[1]]);
+        let plan = SortPlanNode {
+            schema: schema.clone(),
+            child: Box::new(values_plan(&schema, &[])),
+            order_by_exprs: vec![divide_by_zero(0)],
+        };
+        let mut sort = SortExecutor::new(&plan, values_child(&rows));
+        let err = sort.open().unwrap_err();
+        assert!(err.0.contains("division by zero"), "{}", err.0);
+    }
+
+    #[test]
+    fn group_by_evaluation_errors_are_reported_not_grouped_as_null() {
+        let schema = int_schema(&["a"]);
+        let rows = values_plan(&schema, &[&[2], &[1]]);
+        let plan = AggregationPlanNode {
+            schema: int_schema(&["g"]),
+            child: Box::new(values_plan(&schema, &[])),
+            group_bys: vec![divide_by_zero(0)],
+            aggregates: vec![],
+        };
+        let mut agg = AggregationExecutor::new(&plan, values_child(&rows));
+        let err = agg.open().unwrap_err();
+        assert!(err.0.contains("division by zero"), "{}", err.0);
     }
 
     #[test]
