@@ -115,6 +115,41 @@ pub fn read_common_header(r: &mut BufReader<'_>) -> Result<u8, PageCodecError> {
     Ok(kind)
 }
 
+/// Validates the common header in place and returns the page kind, without a cursor.
+pub fn peek_common_header(buf: &[u8]) -> Result<u8, PageCodecError> {
+    if buf.len() < COMMON_HEADER_BYTES {
+        return Err(PageCodecError::BufferError(BufferError::BufferTooSmall {
+            needed: COMMON_HEADER_BYTES,
+            actual: buf.len(),
+        }));
+    }
+    if buf[0..4] != MAGIC {
+        return Err(PageCodecError::BadMagic);
+    }
+    let version = u16::from_le_bytes([buf[4], buf[5]]);
+    if version != VERSION {
+        return Err(PageCodecError::UnsupportedVersion(version));
+    }
+    Ok(buf[KIND_OFFSET])
+}
+
+/// Like `peek_common_header`, but also checks the kind.
+pub fn expect_common_header(buf: &[u8], expected: u8) -> Result<(), PageCodecError> {
+    let actual = peek_common_header(buf)?;
+    if actual != expected {
+        return Err(PageCodecError::WrongPageKind { expected, actual });
+    }
+    Ok(())
+}
+
+/// Writes the common header at the start of `buf`.
+pub fn put_common_header(buf: &mut [u8], kind: u8) {
+    buf[0..4].copy_from_slice(&MAGIC);
+    buf[4..6].copy_from_slice(&VERSION.to_le_bytes());
+    buf[KIND_OFFSET] = kind;
+    buf[7] = 0;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
