@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, Write};
+use std::path::Path;
 use std::sync::Arc;
 
 use cmudb::catalog::{Catalog, Schema, Value};
@@ -15,14 +16,19 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use tempfile::tempdir;
 
+const NUM_FRAMES: usize = 64;
+
 fn main() {
-    let num_frames: usize = 64;
-    let dir = tempdir().expect("failed to create tempdir for db");
-    let dm = DiskManager::new(dir.path().join("cmudb.data"), dir.path().join("cmudb.log"))
+    let db_dir = tempdir().expect("failed to create tempdir for db");
+    run_shell(db_dir.path());
+}
+
+fn run_shell(db_dir: &Path) {
+    let dm = DiskManager::new(db_dir.join("cmudb.data"), db_dir.join("cmudb.log"))
         .expect("failed to create disk manager");
     let scheduler = DiskScheduler::new(dm);
-    let replacer = ArcReplacer::new(num_frames);
-    let bpm = Arc::new(create_buffer_pool_manager(num_frames, replacer, scheduler));
+    let replacer = ArcReplacer::new(NUM_FRAMES);
+    let bpm = Arc::new(create_buffer_pool_manager(NUM_FRAMES, replacer, scheduler));
     let catalog = Catalog::new(bpm.clone());
 
     let dialect = GenericDialect {};
@@ -66,9 +72,6 @@ fn main() {
             prompt(&mut stdout, true);
         }
     }
-
-    // keep the tempdir alive for the whole session
-    drop(dir);
 }
 
 fn prompt(out: &mut io::Stdout, continuation: bool) {
