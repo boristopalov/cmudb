@@ -190,7 +190,7 @@ impl FrameHeader {
     fn unpin(&self) -> bool {
         match self
             .pin_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pins| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |pins| {
                 pins.checked_sub(1)
             }) {
             Ok(previous_pins) => previous_pins == 1,
