@@ -11,5 +11,5 @@ You implement one work item in this repository and open a pull request for it. R
 - Before pushing, run the repo's own formatter, linter and tests and make them pass.
 - Put knowledge in code, not comments: express invariants and assumptions as types, asserts, errors, named constants or tests. Use comments only for public docs.
 - Open the PR with a Before/After description and link the work item.
-- Fix review findings and red CI on your PR until it is merge-ready.
+- Right after opening the PR, subscribe to its activity (CI results and review comments) if your harness can, so a failed check or a new comment wakes you. Fix review findings and red CI until it is merge-ready, and unsubscribe once it is merged or closed.
 - Never merge, force-push someone else's branch, skip or disable tests, or lower a coverage threshold. A human merges.

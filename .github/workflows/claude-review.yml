@@ -15,9 +15,16 @@ jobs:
     uses: boristopalov/agent-factory/.github/workflows/review.yml@main
     with:
       pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
-      hint: >-
-        cmudb is a Rust DBMS modeled on CMU's BusTub, so pay particular attention
-        to buffer pool pins, latch ordering and page/slot layout.
+      hint: |
+        cmudb is a Rust DBMS modeled on CMU's BusTub (buffer pool, disk scheduler,
+        table heap, B+ tree index with latch crabbing, binder/planner/executors).
+        Also check:
+        - SQL semantics: NULL handling, joins, aggregates.
+        - Page and slot layout: off-by-one errors in offsets and sizes.
+        - Concurrency: latch and lock ordering, pins that are never released, guards
+          held across I/O or across calls that can re-enter the buffer pool.
+        - The comment policy in CONTRIBUTING.md: knowledge that should be in code
+          (types, asserts, Result errors, named constants, tests), not comments.
     secrets: inherit
     permissions:
       contents: read

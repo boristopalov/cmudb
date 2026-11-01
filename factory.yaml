@@ -76,13 +76,14 @@ stages:
     max_parallel: 2
     sets_state: In Progress
     output: pull_request
+    watches_own_pr: true       # subscribes to its PR's CI and review events, fixes until merge-ready
     next: [review, test]
 
   review:
     agent: review
     trigger: { github: { pull_request: [opened, synchronize, reopened, ready_for_review] } }
     enforced_by: .github/workflows/claude-review.yml
-    next: implement            # findings go back to the PR's implementer
+    next: implement            # findings wake the PR's implementer
 
   test:
     agent: test
