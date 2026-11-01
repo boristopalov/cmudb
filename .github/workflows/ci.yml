@@ -15,7 +15,7 @@ env:
 
 jobs:
   lint:
-    name: fmt and clippy
+    name: fmt, clippy and comment policy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -24,7 +24,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+      - name: Comment policy (see CONTRIBUTING.md)
+        run: python3 scripts/check_comments.py
 
   test:
     name: unit, integration and e2e tests
