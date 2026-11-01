@@ -376,3 +376,69 @@ fn soak_randomized_workload_with_more_pages_than_frames() {
             .expect("no leaked pins or frames after the churn"),
     );
 }
+
+const HOT_PAGES: usize = 6;
+const HOT_FRAMES: usize = 4;
+const HOT_READERS: usize = 8;
+const HOT_READS_PER_THREAD: usize = 20_000;
+const HOT_DEADLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn read_hot_page(
+    bpm: &Arc<BufferPoolManager>,
+    page_id: usize,
+) -> Option<cmudb::buffer_pool::PageRef<'_>> {
+    match bpm.read_page(page_id) {
+        Ok(page) => {
+            assert_eq!(
+                page.data()[..8],
+                (page_id as u64).to_le_bytes(),
+                "a pinned frame holds the page it was pinned for"
+            );
+            Some(page)
+        }
+        Err(BpmError::NoFreeFrame) => {
+            thread::yield_now();
+            None
+        }
+        Err(e) => panic!("unexpected error reading page {page_id}: {e:?}"),
+    }
+}
+
+#[test]
+fn readers_racing_on_hot_pages_never_deadlock_or_evict_a_pinned_frame() {
+    let (bpm, _tmp) = make_bpm(HOT_FRAMES);
+    for page_id in 0..HOT_PAGES {
+        let mut page = bpm.new_page().expect("new page");
+        page.data_mut()[..8].copy_from_slice(&(page_id as u64).to_le_bytes());
+    }
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    for reader in 0..HOT_READERS {
+        let bpm = Arc::clone(&bpm);
+        let done_tx = done_tx.clone();
+        thread::spawn(move || {
+            for i in 0..HOT_READS_PER_THREAD {
+                let outer_id = (reader + i) % HOT_PAGES;
+                let Some(outer) = read_hot_page(&bpm, outer_id) else {
+                    continue;
+                };
+                let inner = read_hot_page(&bpm, (outer_id + 1) % HOT_PAGES);
+                drop(inner);
+                drop(outer);
+            }
+            done_tx.send(()).expect("test still waiting");
+        });
+    }
+    drop(done_tx);
+    for _ in 0..HOT_READERS {
+        done_rx
+            .recv_timeout(HOT_DEADLOCK_TIMEOUT)
+            .expect("every reader finishes; a timeout means the buffer pool deadlocked");
+    }
+
+    let all_frames_released: Vec<_> = (0..HOT_FRAMES).map(|_| bpm.new_page().map(drop)).collect();
+    assert!(
+        all_frames_released.iter().all(Result::is_ok),
+        "no pin outlives its guard"
+    );
+}

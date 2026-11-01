@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::thread;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 #[cfg(feature = "deadlock_detection")]
@@ -31,7 +31,6 @@ struct FrameHeader {
     frame_id: usize,
     page_id: Option<usize>,
     buf: Page,
-    pin_count: AtomicU32,
     dirty: AtomicBool,
 }
 
@@ -52,6 +51,9 @@ struct Meta {
     replacer: replacer::ArcReplacer,
     free_list: Vec<usize>,
     page_table: HashMap<usize, usize>,
+    /// Pins per frame. Kept beside the replacer under one lock, so a frame is marked
+    /// evictable only while nothing pins it.
+    pins: Vec<u32>,
 }
 
 #[derive(Debug)]
@@ -117,12 +119,9 @@ impl<'a> PageRef<'a> {
 impl<'a> Drop for PageRef<'a> {
     fn drop(&mut self) {
         let frame_id = self.frame_guard.frame_id;
-        let released_last_pin = self.frame_guard.unpin();
         // SAFETY: `frame_guard` is dropped exactly once, here in `Drop::drop`, and is never read afterwards.
         unsafe { ManuallyDrop::drop(&mut self.frame_guard) };
-        if released_last_pin {
-            self.bpm.mark_evictable_after_frame_released(frame_id);
-        }
+        self.bpm.release_pin(frame_id);
     }
 }
 
@@ -143,12 +142,9 @@ impl<'a> PageMut<'a> {
 impl<'a> Drop for PageMut<'a> {
     fn drop(&mut self) {
         let frame_id = self.frame_guard.frame_id;
-        let released_last_pin = self.frame_guard.unpin();
         // SAFETY: `frame_guard` is dropped exactly once, here in `Drop::drop`, and is never read afterwards.
         unsafe { ManuallyDrop::drop(&mut self.frame_guard) };
-        if released_last_pin {
-            self.bpm.mark_evictable_after_frame_released(frame_id);
-        }
+        self.bpm.release_pin(frame_id);
     }
 }
 
@@ -187,26 +183,8 @@ type PageRefResult<'a> = Result<PageRef<'a>, BpmError>;
 type PageMutResult<'a> = Result<PageMut<'a>, BpmError>;
 
 impl FrameHeader {
-    fn unpin(&self) -> bool {
-        match self
-            .pin_count
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |pins| {
-                pins.checked_sub(1)
-            }) {
-            Ok(previous_pins) => previous_pins == 1,
-            Err(_) => {
-                warn!(
-                    "tried to unpin a frame with 0 pins frame_id={}",
-                    self.frame_id
-                );
-                false
-            }
-        }
-    }
-
     pub fn clear(&mut self) {
         self.dirty.store(false, Ordering::Release);
-        self.pin_count.store(0, Ordering::Release);
         self.page_id = None;
     }
 }
@@ -236,7 +214,6 @@ impl BufferPoolManager {
                 frame_id: i,
                 page_id: None,
                 buf: [0u8; disk::PAGE_SIZE],
-                pin_count: AtomicU32::new(0),
                 dirty: AtomicBool::new(false),
             }));
             free_list.push(i);
@@ -248,6 +225,7 @@ impl BufferPoolManager {
                 replacer,
                 free_list,
                 page_table: HashMap::with_capacity(num_frames),
+                pins: vec![0; num_frames],
             }),
             scheduler: Mutex::new(scheduler),
             next_page_id: AtomicUsize::new(0),
@@ -264,7 +242,7 @@ impl BufferPoolManager {
         frame.clear();
         frame.page_id = Some(page_id);
         frame.dirty.store(true, Ordering::Release);
-        frame.pin_count.store(1, Ordering::Release);
+        meta.pins[frame_id] = 1;
         meta.page_table.insert(page_id, frame_id);
         meta.replacer.record_access(frame_id, page_id);
         meta.replacer.set_evictable(frame_id, false);
@@ -286,15 +264,17 @@ impl BufferPoolManager {
                 Self::tid()
             );
             meta.replacer.record_access(frame_id, page_id);
+            meta.pins[frame_id] += 1;
             meta.replacer.set_evictable(frame_id, false);
             drop(meta);
 
             let frame = self.frame(frame_id)?.write();
             let frame_was_reassigned_after_lookup = frame.page_id != Some(page_id);
             if frame_was_reassigned_after_lookup {
+                drop(frame);
+                self.release_pin(frame_id);
                 continue;
             }
-            frame.pin_count.fetch_add(1, Ordering::AcqRel);
             frame.dirty.store(true, Ordering::Release);
             return Ok(PageMut {
                 frame_guard: ManuallyDrop::new(frame),
@@ -325,15 +305,17 @@ impl BufferPoolManager {
                 Self::tid()
             );
             meta.replacer.record_access(frame_id, page_id);
+            meta.pins[frame_id] += 1;
             meta.replacer.set_evictable(frame_id, false);
             drop(meta);
 
             let frame = self.frame(frame_id)?.read();
             let frame_was_reassigned_after_lookup = frame.page_id != Some(page_id);
             if frame_was_reassigned_after_lookup {
+                drop(frame);
+                self.release_pin(frame_id);
                 continue;
             }
-            frame.pin_count.fetch_add(1, Ordering::AcqRel);
             return Ok(PageRef {
                 frame_guard: ManuallyDrop::new(frame),
                 frame_id,
@@ -380,7 +362,7 @@ impl BufferPoolManager {
 
         frame.buf = *page_data;
         frame.page_id = Some(page_id);
-        frame.pin_count.store(1, Ordering::Release);
+        meta.pins[frame_id] = 1;
         frame.dirty.store(dirty, Ordering::Release);
         meta.page_table.insert(page_id, frame_id);
         meta.replacer.record_access(frame_id, page_id);
@@ -445,14 +427,14 @@ impl BufferPoolManager {
             Self::tid()
         );
 
-        let mut frame = self.frame(frame_id)?.write();
-        if frame.pin_count.load(Ordering::Acquire) > 0 {
+        if meta.pins[frame_id] > 0 {
             warn!(
                 "tid={} get_free_frame: attempted to evict pinned frame_id={frame_id}",
                 Self::tid()
             );
             return Err(BpmError::FrameInUse);
         }
+        let mut frame = self.frame(frame_id)?.write();
 
         let Some(page_id) = frame.page_id else {
             return Ok(FrameReservation {
@@ -505,8 +487,17 @@ impl BufferPoolManager {
         meta.replacer.set_evictable(frame_id, true);
     }
 
-    fn mark_evictable_after_frame_released(&self, frame_id: usize) {
-        self.meta.lock().replacer.set_evictable(frame_id, true);
+    fn release_pin(&self, frame_id: usize) {
+        let mut meta = self.meta.lock();
+        match meta.pins[frame_id].checked_sub(1) {
+            Some(remaining) => {
+                meta.pins[frame_id] = remaining;
+                if remaining == 0 {
+                    meta.replacer.set_evictable(frame_id, true);
+                }
+            }
+            None => warn!("tried to unpin a frame with 0 pins frame_id={frame_id}"),
+        }
     }
 
     fn get_next_page_id(&self) -> usize {
@@ -559,7 +550,7 @@ mod tests {
         let (bpm, _dir) = make_bpm(1);
         let page = bpm.new_page().unwrap();
         let page_id = page.page_id().unwrap();
-        page.frame_guard.pin_count.store(0, Ordering::Release);
+        bpm.meta.lock().pins[page.frame_id()] = 0;
         drop(page);
 
         let finished = finishes_within(Duration::from_secs(5), move || {
