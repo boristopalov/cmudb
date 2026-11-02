@@ -402,6 +402,7 @@ impl Database {
 
     /// Lets go of the database the way a killed process does: nothing is rolled back or
     /// written, and the lock on the data file is released. For crash tests.
+    #[cfg(any(test, feature = "testing"))]
     pub fn abandon(mut self) {
         drop(self._lock.take());
         std::mem::forget(self);
