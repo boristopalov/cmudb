@@ -978,14 +978,12 @@ impl Iterator for BPlusTreeIter {
 mod tests {
     use super::*;
     use crate::buf::put_u32_le;
-    use crate::create_buffer_pool_manager;
-    use crate::disk::{DiskManager, DiskScheduler};
+
     use crate::index::b_plus_page::{
         LEAF_FIXED_HEADER_BYTES, RECORD_ID_ENCODED_BYTES, TOMBSTONE_SLOT_ENCODED_BYTES,
     };
-    use crate::replacer::ArcReplacer;
+
     use crate::table_heap::RecordId;
-    use tempfile::tempdir;
 
     const FOUR_ENTRY_LEAF_KEY_LEN: u32 = 2000;
 
@@ -993,7 +991,7 @@ mod tests {
 
     #[test]
     fn no_tombstone_key_len_gives_fourteen_entry_leaves_without_tombstones() {
-        let (bpm, _tmp) = make_bpm(10);
+        let (bpm, _tmp) = crate::testing::bpm(10);
         let tree = BPlusTree::new("idx".to_string(), NO_TOMBSTONE_KEY_LEN, bpm).unwrap();
         assert_eq!(tree.leaf_max_size, 14);
         assert_eq!(
@@ -1009,7 +1007,7 @@ mod tests {
     #[test]
     fn failed_rebalance_leaves_the_underfull_leaf_unchanged() {
         let key_len = NO_TOMBSTONE_KEY_LEN as usize;
-        let (bpm, _tmp) = make_bpm(32);
+        let (bpm, _tmp) = crate::testing::bpm(32);
         let tree = BPlusTree::new("idx".to_string(), NO_TOMBSTONE_KEY_LEN, bpm.clone()).unwrap();
         for k in 0..15u8 {
             let rid = RecordId {
@@ -1066,7 +1064,7 @@ mod tests {
     #[test]
     fn a_corrupt_tombstone_makes_every_operation_fail_without_panicking() {
         let key_len = 8usize;
-        let (bpm, _tmp) = make_bpm(8);
+        let (bpm, _tmp) = crate::testing::bpm(8);
         let tree = BPlusTree::new("idx".to_string(), key_len as u32, bpm.clone()).unwrap();
         for k in 1..=3u8 {
             let rid = RecordId {
@@ -1137,7 +1135,7 @@ mod tests {
 
     #[test]
     fn a_corrupt_leaf_in_the_middle_of_a_scan_is_an_error() {
-        let (bpm, _tmp) = make_bpm(16);
+        let (bpm, _tmp) = crate::testing::bpm(16);
         let (tree, _, right) = two_leaf_tree(&bpm);
         assert_eq!(scan_all(&tree).unwrap().len(), 15);
         let high_byte_of_first_page_id =
@@ -1151,7 +1149,7 @@ mod tests {
 
     #[test]
     fn a_cycle_in_the_leaf_chain_is_an_error() {
-        let (bpm, _tmp) = make_bpm(16);
+        let (bpm, _tmp) = crate::testing::bpm(16);
         let (tree, left, right) = two_leaf_tree(&bpm);
         let mut leaf = tree.decode_leaf(right).unwrap();
         leaf.next_leaf_id = left;
@@ -1171,7 +1169,7 @@ mod tests {
     #[test]
     fn removing_the_last_key_of_a_root_leaf_empties_the_tree() {
         let key_len = NO_TOMBSTONE_KEY_LEN as usize;
-        let (bpm, _tmp) = make_bpm(8);
+        let (bpm, _tmp) = crate::testing::bpm(8);
         let tree = BPlusTree::new("idx".to_string(), NO_TOMBSTONE_KEY_LEN, bpm).unwrap();
         let rid = RecordId {
             page_id: 1,
@@ -1187,22 +1185,9 @@ mod tests {
 
     #[test]
     fn four_entry_leaf_key_len_gives_four_entry_leaves() {
-        let (bpm, _tmp) = make_bpm(10);
+        let (bpm, _tmp) = crate::testing::bpm(10);
         let tree = BPlusTree::new("idx".to_string(), FOUR_ENTRY_LEAF_KEY_LEN, bpm).unwrap();
         assert_eq!(tree.leaf_max_size, 4);
-    }
-
-    fn make_bpm(num_frames: usize) -> (Arc<BufferPoolManager>, tempfile::TempDir) {
-        let dir = tempdir().expect("tempdir");
-        let db_path = dir.path().join("db");
-        let log_path = dir.path().join("log");
-        let dm = DiskManager::new(&db_path, &log_path).expect("disk manager");
-        let scheduler = DiskScheduler::new(dm);
-        let replacer = ArcReplacer::new(num_frames);
-        (
-            Arc::new(create_buffer_pool_manager(num_frames, replacer, scheduler)),
-            dir,
-        )
     }
 
     fn make_key(first_byte: u8, key_len: usize) -> IndexKey {
@@ -1241,7 +1226,7 @@ mod tests {
 
     #[test]
     fn leaf_pages_iterator_walks_leaf_chain() {
-        let (bpm, _tmp) = make_bpm(10);
+        let (bpm, _tmp) = crate::testing::bpm(10);
         let key_len = FOUR_ENTRY_LEAF_KEY_LEN;
         let tree = BPlusTree::new("idx".to_string(), key_len, bpm.clone()).unwrap();
 
@@ -1283,7 +1268,7 @@ mod tests {
 
     #[test]
     fn insert_splits_root_leaf_into_internal_root() {
-        let (bpm, _tmp) = make_bpm(10);
+        let (bpm, _tmp) = crate::testing::bpm(10);
         let key_len = FOUR_ENTRY_LEAF_KEY_LEN;
         let tree = BPlusTree::new("idx".to_string(), key_len, bpm.clone()).unwrap();
 
@@ -1324,7 +1309,7 @@ mod tests {
 
     #[test]
     fn insert_duplicate_key_errors() {
-        let (bpm, _tmp) = make_bpm(10);
+        let (bpm, _tmp) = crate::testing::bpm(10);
         let key_len = 32u32;
         let tree = BPlusTree::new("idx".to_string(), key_len, bpm.clone()).unwrap();
 
@@ -1352,7 +1337,7 @@ mod tests {
 
     #[test]
     fn print_tree_smoke() {
-        let (bpm, _tmp) = make_bpm(10);
+        let (bpm, _tmp) = crate::testing::bpm(10);
         let key_len = FOUR_ENTRY_LEAF_KEY_LEN;
         let tree = BPlusTree::new("idx".to_string(), key_len, bpm.clone()).unwrap();
 
@@ -1372,7 +1357,7 @@ mod tests {
 
     #[test]
     fn remove_missing_key_errors_and_does_not_mutate_tree() {
-        let (bpm, _tmp) = make_bpm(10);
+        let (bpm, _tmp) = crate::testing::bpm(10);
         let key_len = 32u32;
         let tree = BPlusTree::new("idx".to_string(), key_len, bpm.clone()).unwrap();
 
@@ -1414,7 +1399,7 @@ mod tests {
 
     #[test]
     fn remove_last_key_marks_tombstone_and_search_returns_none() {
-        let (bpm, _tmp) = make_bpm(10);
+        let (bpm, _tmp) = crate::testing::bpm(10);
         let key_len = 32u32;
         let tree = BPlusTree::new("idx".to_string(), key_len, bpm.clone()).unwrap();
 
@@ -1441,7 +1426,7 @@ mod tests {
 
     #[test]
     fn remove_marks_tombstones_without_changing_leaf_key_counts() {
-        let (bpm, _tmp) = make_bpm(10);
+        let (bpm, _tmp) = crate::testing::bpm(10);
         let key_len = FOUR_ENTRY_LEAF_KEY_LEN;
         let tree = BPlusTree::new("idx".to_string(), key_len, bpm.clone()).unwrap();
 
@@ -1493,7 +1478,7 @@ mod tests {
 
     #[test]
     fn wrong_key_length_is_a_key_length_error_for_every_operation() {
-        let (bpm, _tmp) = make_bpm(10);
+        let (bpm, _tmp) = crate::testing::bpm(10);
         let tree = BPlusTree::new("idx".to_string(), 8, bpm).unwrap();
         let short = IndexKey(vec![1, 2, 3]);
         let rid = IndexValue::IndexValue(RecordId {
@@ -1516,7 +1501,7 @@ mod tests {
 
     #[test]
     fn key_lengths_that_cannot_fit_a_page_are_rejected() {
-        let (bpm, _tmp) = make_bpm(10);
+        let (bpm, _tmp) = crate::testing::bpm(10);
         for key_len in [0, 1 << 20] {
             let err = BPlusTree::new("idx".to_string(), key_len, bpm.clone()).unwrap_err();
             assert!(matches!(err, IndexError::UnsupportedKeyLength(l) if l == key_len));
@@ -1525,7 +1510,7 @@ mod tests {
 
     #[test]
     fn search_on_empty_tree_returns_none() {
-        let (bpm, _tmp) = make_bpm(10);
+        let (bpm, _tmp) = crate::testing::bpm(10);
         let key_len = 32u32;
         let tree = BPlusTree::new("idx".to_string(), key_len, bpm).unwrap();
         let key = make_key(1, key_len as usize);
@@ -1536,7 +1521,7 @@ mod tests {
 
     #[test]
     fn search_finds_inserted_keys_and_returns_none_for_missing() {
-        let (bpm, _tmp) = make_bpm(10);
+        let (bpm, _tmp) = crate::testing::bpm(10);
         let key_len = FOUR_ENTRY_LEAF_KEY_LEN;
         let tree = BPlusTree::new("idx".to_string(), key_len, bpm.clone()).unwrap();
 
@@ -1693,7 +1678,7 @@ mod tests {
 
         impl Harness {
             fn new(key_len: usize) -> Self {
-                let (bpm, tmp) = make_bpm(64);
+                let (bpm, tmp) = crate::testing::bpm(64);
                 let tree = BPlusTree::new("idx".to_string(), key_len as u32, bpm.clone()).unwrap();
                 Self {
                     tree,
@@ -2097,7 +2082,7 @@ mod tests {
         use std::collections::btree_map::Entry;
 
         let key_len = 400usize;
-        let (bpm, _dir) = make_bpm(512);
+        let (bpm, _dir) = crate::testing::bpm(512);
         let tree = BPlusTree::new("idx".to_string(), key_len as u32, bpm).unwrap();
         assert!(tree.leaf_max_size < 25 && tree.internal_max_size < 25);
 

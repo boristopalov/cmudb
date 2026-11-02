@@ -641,15 +641,8 @@ mod tests {
     }
 
     fn test_catalog() -> (Catalog, tempfile::TempDir) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let dm = crate::disk::DiskManager::new(dir.path().join("db"), dir.path().join("log"))
-            .expect("disk manager");
-        let bpm = Arc::new(crate::create_buffer_pool_manager(
-            32,
-            crate::replacer::ArcReplacer::new(32),
-            crate::disk::DiskScheduler::new(dm),
-        ));
-        (Catalog::new(bpm), dir)
+        let (catalog, _bpm, dir) = crate::testing::catalog(32);
+        (catalog, dir)
     }
 
     #[test]

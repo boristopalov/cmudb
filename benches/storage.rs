@@ -1,9 +1,6 @@
 //! Buffer pool and table heap benchmarks. Run with `cargo bench --features bench --bench storage`.
 
 use cmudb::buffer_pool::BufferPoolManager;
-use cmudb::create_buffer_pool_manager;
-use cmudb::disk::{DiskManager, DiskScheduler};
-use cmudb::replacer::ArcReplacer;
 use cmudb::table_heap::{RecordId, TableHeap, Tuple};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use rand::seq::SliceRandom;
@@ -18,17 +15,6 @@ const HOT_PAGES: usize = 8;
 const COLD_PAGES: usize = POOL_FRAMES * 4;
 const TUPLE_BYTES: usize = 100;
 const HEAP_ROWS: usize = 10_000;
-
-fn make_bpm(frames: usize) -> (Arc<BufferPoolManager>, TempDir) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).expect("disk");
-    let bpm = Arc::new(create_buffer_pool_manager(
-        frames,
-        ArcReplacer::new(frames),
-        DiskScheduler::new(dm),
-    ));
-    (bpm, dir)
-}
 
 fn allocate_pages(bpm: &Arc<BufferPoolManager>, count: usize) -> Vec<usize> {
     (0..count)
@@ -48,7 +34,7 @@ fn tuple(i: usize) -> Tuple {
 }
 
 fn filled_heap(rows: usize) -> (TableHeap, Vec<RecordId>, Arc<BufferPoolManager>, TempDir) {
-    let (bpm, dir) = make_bpm(POOL_FRAMES);
+    let (bpm, dir) = cmudb::testing::bpm(POOL_FRAMES);
     let heap = TableHeap::new(bpm.clone()).expect("heap");
     let rids = (0..rows)
         .map(|i| heap.insert(&tuple(i)).expect("insert"))
@@ -82,7 +68,7 @@ fn buffer_pool(c: &mut Criterion) {
     let mut group = c.benchmark_group("buffer_pool");
     group.throughput(Throughput::Elements(1));
 
-    let (bpm, _dir) = make_bpm(POOL_FRAMES);
+    let (bpm, _dir) = cmudb::testing::bpm(POOL_FRAMES);
     let hot = allocate_pages(&bpm, HOT_PAGES);
     assert!(
         hot.iter().all(|&p| bpm.is_resident(p)),
@@ -131,7 +117,7 @@ fn table_heap(c: &mut Criterion) {
     group.bench_function("insert_10k", |b| {
         b.iter_batched(
             || {
-                let (bpm, dir) = make_bpm(POOL_FRAMES);
+                let (bpm, dir) = cmudb::testing::bpm(POOL_FRAMES);
                 let heap = TableHeap::new(bpm.clone()).expect("heap");
                 (heap, bpm, dir)
             },

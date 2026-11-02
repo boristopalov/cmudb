@@ -53,7 +53,7 @@ inserted row and key, and each query returns the expected rows. The join and ind
 benches also check that the planner still picks the plan they are named after, so a change
 fails the run instead of showing up as a speedup. CI never runs a benchmark, but
 `tests/bench_queries.rs` runs the query benches' result and plan checks as an ordinary test.
-The query benches run SQL through the same harness as `tests/common`, so they measure whichever
+The query benches run SQL through `cmudb::Database`, via the `tests/common` harness, so they measure whichever
 executor model the branch has. Their timings include parsing, binding and planning each
 statement, not just execution, which matters most for small queries like `index_point_lookup`.
 

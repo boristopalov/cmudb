@@ -895,27 +895,16 @@ fn join_predicate(predicate: Expression, left_cols: usize) -> JoinPredicate {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
     use super::{Binder, BoundStatement};
     use crate::catalog::{Catalog, DataType, Schema};
-    use crate::create_buffer_pool_manager;
-    use crate::disk::{DiskManager, DiskScheduler};
     use crate::processor::plan::{ColIdx, Expression, JoinColumn, JoinPredicate, Side};
-    use crate::replacer::ArcReplacer;
 
     fn catalog_with_tables(tables: &[(&str, &[&str])]) -> (Catalog, tempfile::TempDir) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).expect("disk");
-        let bpm = Arc::new(create_buffer_pool_manager(
-            16,
-            ArcReplacer::new(16),
-            DiskScheduler::new(dm),
-        ));
-        let catalog = Catalog::new(bpm);
+        let (catalog, _bpm, dir) = crate::testing::catalog(16);
         for (name, cols) in tables {
             let schema = Schema::new(
                 cols.iter()

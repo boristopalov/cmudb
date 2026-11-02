@@ -15,8 +15,10 @@ criterion = { version = "0.7", optional = true, default-features = false, featur
 [features]
 bench = ["dep:criterion"]
 deadlock_detection = ["parking_lot/deadlock_detection"]
+testing = []
 
 [dev-dependencies]
+cmudb = { path = ".", features = ["testing"] }
 env_logger = "0.11.5"
 
 [[bench]]

@@ -2,85 +2,59 @@
 
 use cmudb::catalog::{Catalog, Value};
 use cmudb::concurrency::{IsolationLevel, Transaction, TransactionManager, TransactionState};
-use cmudb::create_buffer_pool_manager;
-use cmudb::disk::{DiskManager, DiskScheduler};
-use cmudb::parser::Binder;
-use cmudb::planner::Planner;
-use cmudb::processor::executor::{ExecutorContext, collect_rows};
-use cmudb::processor::executor_factory::create_executor;
-use cmudb::processor::plan::Plan;
-use cmudb::replacer::ArcReplacer;
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
+use cmudb::{Database, DmlOp, StatementResult};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tempfile::{TempDir, tempdir};
 
 type Rows = Vec<Vec<Option<i32>>>;
 
 struct Db {
-    catalog: Catalog,
+    db: Database,
     bpm: Arc<cmudb::buffer_pool::BufferPoolManager>,
     mgr: Arc<TransactionManager>,
-    _dir: TempDir,
 }
 
 impl Db {
     fn new() -> Self {
-        let frames = 64;
-        let dir = tempdir().unwrap();
-        let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).unwrap();
-        let bpm = Arc::new(create_buffer_pool_manager(
-            frames,
-            ArcReplacer::new(frames),
-            DiskScheduler::new(dm),
-        ));
+        let db = Database::scratch(64).unwrap();
         Self {
-            catalog: Catalog::new(bpm.clone()),
-            mgr: Arc::new(TransactionManager::new(bpm.clone())),
-            bpm,
-            _dir: dir,
+            bpm: db.bpm().clone(),
+            mgr: db.txn_mgr().clone(),
+            db,
         }
+    }
+
+    fn catalog(&self) -> &Catalog {
+        self.db.catalog()
     }
 
     fn begin(&self) -> Arc<Transaction> {
         self.mgr.begin(IsolationLevel::SnapshotIsolation)
     }
 
-    /// Runs one statement in `txn`. Returns the rows it produced (for INSERT, the count).
+    /// Runs `sql` in `txn`. Returns the rows it produced (for INSERT, the count).
     fn exec(&self, txn: &Arc<Transaction>, sql: &str) -> Result<Rows, String> {
-        let ast = Parser::parse_sql(&GenericDialect, sql).map_err(|e| e.to_string())?;
-        let bound = Binder::new(&self.catalog).bind(ast).map_err(|e| e.0)?;
-        let planner = Planner::new(&self.catalog);
-        let ctx = ExecutorContext::new(
-            &self.catalog,
-            self.bpm.clone(),
-            txn.clone(),
-            self.mgr.clone(),
-        );
+        let results = self.db.execute_in(txn, sql).map_err(|e| e.to_string())?;
         let mut out = Vec::new();
-        for stmt in bound {
-            let plan = planner.plan(stmt).map_err(|e| e.0)?;
-            let mut exec = create_executor(&ctx, &plan);
-            exec.open().map_err(|e| e.0)?;
-            let rows = collect_rows(&mut *exec).map_err(|e| e.0)?;
-            if let Plan::Insert(_) = plan {
-                let n = i32::from_ne_bytes(rows[0].0.data.as_slice().try_into().unwrap());
-                out.push(vec![Some(n)]);
-                continue;
-            }
-            let schema = exec.schema().clone();
-            for (tuple, _) in rows {
-                out.push(
-                    (0..schema.cols.len())
-                        .map(|i| match schema.get_value(&tuple, i).unwrap() {
+        for result in results {
+            match result {
+                StatementResult::Count {
+                    op: DmlOp::Insert,
+                    rows,
+                } => out.push(vec![Some(i32::try_from(rows).unwrap())]),
+                StatementResult::Rows { rows, .. } => out.extend(rows.into_iter().map(|row| {
+                    row.into_iter()
+                        .map(|v| match v {
                             Some(Value::INT(v)) => Some(v),
                             Some(Value::BOOLEAN(b)) => Some(b as i32),
                             None => None,
                             Some(other) => panic!("unexpected value {other:?}"),
                         })
-                        .collect(),
-                );
+                        .collect()
+                })),
+                StatementResult::Count { .. }
+                | StatementResult::Ddl(_)
+                | StatementResult::Txn(_) => {}
             }
         }
         Ok(out)
@@ -462,8 +436,8 @@ fn garbage_collection_keeps_what_running_snapshots_need() {
     db.auto("DELETE FROM accounts WHERE id = 2");
     let rid1 = {
         let table = db
-            .catalog
-            .get_table(db.catalog.table_oid("accounts").unwrap())
+            .catalog()
+            .get_table(db.catalog().table_oid("accounts").unwrap())
             .unwrap();
         let first_slot_holds_id_1_and_updates_stay_in_place = table.heap.iter().next();
         first_slot_holds_id_1_and_updates_stay_in_place
@@ -656,13 +630,7 @@ mod failure_paths {
     /// page, and both commit and abort fail until the pin is dropped.
     #[test]
     fn failed_commit_keeps_the_write_set_so_abort_can_undo_it() {
-        let dir = tempdir().unwrap();
-        let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).unwrap();
-        let bpm = Arc::new(create_buffer_pool_manager(
-            1,
-            ArcReplacer::new(1),
-            DiskScheduler::new(dm),
-        ));
+        let (bpm, _dir) = cmudb::testing::bpm(1);
         let heap = TableHeap::new(bpm.clone()).unwrap();
         let mgr = TransactionManager::new(bpm.clone());
 

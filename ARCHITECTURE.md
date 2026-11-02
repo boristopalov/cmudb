@@ -19,9 +19,10 @@ A SQL statement flows top to bottom:
 | Buffer pool | `src/buffer_pool.rs`, `src/replacer.rs` (ARC) | `PageRef` / `PageMut` guards |
 | Disk | `src/disk.rs` | `DiskScheduler` thread over `DiskManager` |
 
-The catalog is in memory. Today the pipeline is wired up in several places: the shell
-(`src/main.rs`), the test harness (`tests/common`) and some test files. BOR-21 moves it into
-one library entry point.
+The catalog is in memory. `cmudb::Database` (`src/database.rs`) runs the whole pipeline and
+owns the session's transaction block (`BEGIN`, `COMMIT`, `ROLLBACK`, autocommit). It returns a
+typed `StatementResult` per statement. The shell (`src/main.rs`) only prints those results, and
+`tests/common` is a thin wrapper over `Database`.
 
 ## Pins and latches
 
@@ -58,8 +59,7 @@ one library entry point.
 4. Have `src/planner.rs` emit it, or, until it does, build its plan by hand in
    `tests/executors.rs`, as hash join, external merge sort, window functions and `DROP`
    do today.
-5. Reach it through SQL in tests. Once BOR-21's library entry point lands, that is the one
-   place statements run from.
+5. Reach it through SQL in tests, through `Database` (or `tests/common`, which wraps it).
 
 ## Tests
 
@@ -70,6 +70,7 @@ one library entry point.
 | SQL end to end | `tests/sql_e2e.rs` on the `tests/common` harness; `tests/e2e.rs`, `tests/mvcc.rs` and `tests/batch_execution.rs` |
 | Hand-built plans | `tests/executors.rs` |
 | Shell binary | `tests/cli.rs` |
+| Fixtures | `cmudb::testing` (`bpm(frames)`, `catalog(frames)`), built for unit tests and, through the `testing` feature, for `tests/` and `benches/` |
 | Benchmark result and plan checks | `tests/bench_queries.rs`, cases in `tests/bench_cases` |
 
 A known gap is a typed error plus a test marked `#[ignore = "known gap: …"]` that names it,
