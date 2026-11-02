@@ -101,9 +101,12 @@ pub fn read_visible_through_index(
     index: &TableIndex,
     key: &IndexKey,
     rid: RecordId,
-) -> Result<Option<Tuple>, TableHeapError> {
-    Ok(read_visible(txn, txn_mgr, heap, rid)?
-        .filter(|t| index.key_of_tuple(t).as_ref() == Some(key)))
+) -> Result<Option<Tuple>, MvccError> {
+    let Some(tuple) = read_visible(txn, txn_mgr, heap, rid)? else {
+        return Ok(None);
+    };
+    let still_has_key = index.key_of_tuple(&tuple)?.as_ref() == Some(key);
+    Ok(still_has_key.then_some(tuple))
 }
 
 /// Taints `txn` if `res` failed: a statement that fails halfway leaves partial writes behind,
@@ -194,19 +197,20 @@ fn check_unique(
     own: Option<RecordId>,
 ) -> Result<(), MvccError> {
     let index = &info.index;
-    let Some(key) = index.key_of_tuple(tuple) else {
+    let Some(key) = index.key_of_tuple(tuple)? else {
         return Ok(());
     };
     for rid in index.entries_for_key(&key)? {
         if Some(rid) == own {
             continue;
         }
-        let (meta, holds_key) = heap.read_with(rid, |meta, bytes| {
+        let (meta, stored_key) = heap.read_with(rid, |meta, bytes| {
             let t = Tuple {
                 data: bytes.to_vec(),
             };
-            (meta, index.key_of_tuple(&t).as_ref() == Some(&key))
+            (meta, index.key_of_tuple(&t))
         })?;
+        let holds_key = stored_key?.as_ref() == Some(&key);
         let pending_elsewhere = is_txn_id(meta.ts) && meta.ts != txn.id();
         if !holds_key && !pending_elsewhere {
             continue;
@@ -268,8 +272,8 @@ pub fn update_tuple(
             write_version(txn, txn_mgr, heap, rid, Some(new))?;
             for info in sorted(indexes) {
                 let index = &info.index;
-                let new_key = index.key_of_tuple(new);
-                if new_key.is_none() || index.key_of_tuple(old) == new_key {
+                let new_key = index.key_of_tuple(new)?;
+                if new_key.is_none() || index.key_of_tuple(old)? == new_key {
                     continue;
                 }
                 let _latch = index.unique_latch.lock();

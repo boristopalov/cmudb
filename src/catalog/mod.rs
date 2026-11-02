@@ -172,7 +172,10 @@ impl Catalog {
             let (tuple, rid) = row.map_err(|e| {
                 CatalogError::IndexCreationError(format!("failed to scan table: {}", e.0))
             })?;
-            if let Some(key) = index.key_of_tuple(&tuple) {
+            let key = index.key_of_tuple(&tuple).map_err(|e| {
+                CatalogError::IndexCreationError(format!("failed to index row {rid}: {e}"))
+            })?;
+            if let Some(key) = key {
                 let taken = index.entries_for_key(&key).map_err(|e| {
                     CatalogError::IndexCreationError(format!("failed to index row {rid}: {e}"))
                 })?;
@@ -680,6 +683,31 @@ mod tests {
                 "row with id {id} is findable through the new index"
             );
         }
+    }
+
+    #[test]
+    fn create_index_fails_and_registers_nothing_when_an_existing_row_is_too_short() {
+        let (catalog, _dir) = test_catalog();
+        let schema = Schema::new(vec![
+            (DataType::INT, "id".to_string()),
+            (DataType::INT, "v".to_string()),
+        ]);
+        let oid = catalog.create_table("t".into(), schema).unwrap();
+        let table = catalog.get_table(oid).unwrap();
+        let one_col = Schema::new(vec![(DataType::INT, "id".to_string())]);
+        let short = one_col.encode_tuple(&[Some(Value::INT(1))]).unwrap();
+        table.heap.insert(&short).unwrap();
+
+        let result = catalog.create_index(
+            catalog.bpm.clone(),
+            oid,
+            "t_v".into(),
+            &["v"],
+            IndexType::BPlusTree,
+        );
+
+        assert!(matches!(result, Err(CatalogError::IndexCreationError(_))));
+        assert!(catalog.get_table_indexes(oid).unwrap().is_empty());
     }
 
     #[test]
