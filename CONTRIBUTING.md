@@ -13,7 +13,7 @@ cargo llvm-cov --fail-under-lines 80   # needs cargo-llvm-cov
 ```
 
 Benchmarks in `benches/` stay out of CI on purpose: they sit behind the `bench` feature, so
-none of the commands above builds them. When you change an API they use, or the benches
+none of the commands above builds them (the comment policy check still covers them). When you change an API they use, or the benches
 themselves, check them locally. The second command runs each bench once without timing it,
 including the checks it makes on its results:
 
@@ -43,7 +43,7 @@ it:
 
 `scripts/check_comments.py` enforces this in CI:
 
-- No `//` line comments and no `/* */` block comments in `src/` or `tests/`.
+- No `//` line comments and no `/* */` block comments in `src/`, `tests/` or `benches/`.
 - Doc comments (`///`, `//!`) are allowed to say what an item does, returns or
   fails with. They may not carry hidden knowledge, so words such as TODO,
   FIXME, hack, workaround, "for now", temporary, invariant, assume, must,
