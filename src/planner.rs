@@ -568,14 +568,10 @@ fn check_window_input_width(scope: &Scope, input: &Schema) -> Result<(), Planner
 /// function and its position `first_call..` among the SELECT's window calls.
 fn window_output_schema(window: &BoundWindow, input: &Schema, first_call: usize) -> Schema {
     let input_cols = input.cols.iter().map(|c| (c.dtype, c.name.clone()));
-    let call_cols = window.calls.iter().enumerate().map(|(i, (arg, agg_type))| {
-        let dtype = match agg_type {
-            AggType::COUNT | AggType::RANK => DataType::INT,
-            _ => arg.dtype().unwrap_or(DataType::INT),
-        };
+    let call_cols = window.calls.iter().enumerate().map(|(i, call)| {
         (
-            dtype,
-            format!("{}_{}", agg_type_name(agg_type), first_call + i),
+            call.dtype,
+            format!("{}_{}", agg_type_name(&call.agg_type), first_call + i),
         )
     });
     Schema::new(input_cols.chain(call_cols).collect())
@@ -598,7 +594,11 @@ fn window_plan(window: BoundWindow, child: Plan, input: &Schema, schema: Schema)
         child: Box::new(child),
         order_by_exprs: (!window.order_by.is_empty()).then_some(window.order_by),
         partition_by_exprs: (!window.partition_by.is_empty()).then_some(window.partition_by),
-        aggregates: window.calls,
+        aggregates: window
+            .calls
+            .into_iter()
+            .map(|call| (call.arg, call.agg_type))
+            .collect(),
         columns,
     })
 }

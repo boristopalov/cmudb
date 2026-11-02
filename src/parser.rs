@@ -702,7 +702,11 @@ impl<'a> Binder<'a> {
             .ok_or(BinderError::WindowOutsideProjection)?;
         let placeholder = ctx.input_width + ctx.calls.len();
         ctx.calls.push((window, ctx.windows[window].calls.len()));
-        ctx.windows[window].calls.push((arg, agg_type));
+        ctx.windows[window].calls.push(BoundWindowCall {
+            arg,
+            agg_type,
+            dtype,
+        });
         Ok(Expression::Column {
             col: ColIdx(placeholder as u32),
             dtype,
@@ -1471,12 +1475,19 @@ pub struct BoundSelect {
     pub limit: Option<u32>,
 }
 
-/// One OVER clause of a SELECT and the window function calls over it, each an
-/// `(argument, function)` pair evaluated against the FROM output.
+/// One OVER clause of a SELECT and the window function calls over it.
 pub struct BoundWindow {
     pub partition_by: Vec<Expression>,
     pub order_by: Vec<SortExpr>,
-    pub calls: Vec<(Expression, AggType)>,
+    pub calls: Vec<BoundWindowCall>,
+}
+
+/// A window function call: its argument, evaluated against the FROM output, the function, and
+/// the type of its result, which the SELECT's projection and ORDER BY read.
+pub struct BoundWindowCall {
+    pub arg: Expression,
+    pub agg_type: AggType,
+    pub dtype: DataType,
 }
 
 pub struct BoundJoin {
