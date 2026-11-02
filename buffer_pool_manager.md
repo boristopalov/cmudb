@@ -8,8 +8,9 @@ The rules for holding guards are in `ARCHITECTURE.md`.
 - **Frames**: `Vec<RwLock<FrameHeader>>`. A frame holds a page buffer, its page id and a
   dirty flag. The frame's `RwLock` is the page latch.
 - **Meta** (one `Mutex`): the page table (`page_id -> frame_id`), the free list, the ARC
-  replacer and every frame's pin count. Pins sit beside the replacer so a frame is marked
-  evictable only while nothing pins it.
+  replacer, every frame's pin count, the next new page id and the deleted page ids waiting
+  for reuse. Pins sit beside the replacer so a frame is marked evictable only while nothing
+  pins it.
 - **Disk scheduler**: a worker thread that runs page reads and writes; the pool waits on
   each request's reply.
 
@@ -17,8 +18,10 @@ The rules for holding guards are in `ARCHITECTURE.md`.
 - `read_page(id)` returns a `PageRef`: one pin and the frame's read latch.
 - `write_page(id)` returns a `PageMut`: one pin and the write latch, with the page marked
   dirty.
-- `new_page()` allocates the next page id and returns a dirty `PageMut` for the caller to
-  initialise.
+- `new_page()` allocates a page id, reusing the lowest deleted one if there is one, and
+  returns a dirty `PageMut` for the caller to initialise.
+- `delete_page(id)` drops an unpinned page from its frame and the replacer without writing
+  it, frees its slot on disk and returns its id for reuse.
 - Dropping either guard releases the latch, then the pin. A frame whose pin count reaches
   zero becomes evictable. Unpinning never flushes.
 

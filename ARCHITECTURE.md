@@ -49,10 +49,12 @@ typed `StatementResult` per statement. The shell (`src/main.rs`) only prints tho
 - Across modules: an index's `unique_latch` (several indexes in ascending oid order), then
   page latches, then the transaction manager's version map. Commit takes `commit_latch`
   before any page latch.
-- `delete_page` frees a page's frame and its slot on disk. It fails while a guard pins the
-  page, so only scratch pages no other reader can reach are deleted: `ORDER BY` spills its
-  sorted runs to scratch `TableHeap`s once its input passes the sort memory budget and frees
-  each run's pages (`TableHeap::free`) once it is merged or the sort closes.
+- `delete_page` frees a page's frame, its slot on disk and its page id; `new_page` hands
+  freed ids out again, lowest first, before it grows the pool. It fails while a guard pins
+  the page, so only scratch pages no other reader can reach are deleted. Executors spill to
+  `SpillHeap`s, which free their pages (`TableHeap::free`) when freed or dropped: `ORDER BY`
+  frees each sorted run once it is merged or the sort closes, and hash join frees each
+  partition pair once it is joined and the rest on close.
 
 ## Adding an executor
 

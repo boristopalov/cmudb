@@ -130,24 +130,26 @@ impl ArcReplacer {
         );
     }
 
-    /// Stops tracking `frame_id` and the page it holds, leaving no ghost entry behind, for a
-    /// page that is deleted rather than evicted. Returns whether the frame was tracked.
-    pub fn remove(&mut self, frame_id: usize) -> bool {
-        let Some(idx) = self.frame_indices.remove(&frame_id) else {
-            return false;
-        };
-        let node = self.nodes[idx];
-        if node.evictable {
+    /// Forgets `page_id` entirely, whether it holds a frame or sits on a ghost list, for a
+    /// page that is deleted rather than evicted, so a later page that reuses the id starts
+    /// fresh instead of counting as a ghost hit. Returns the frame the page held, if any.
+    pub fn remove(&mut self, page_id: usize) -> Option<usize> {
+        let idx = self.page_indices.remove(&page_id)?;
+        let node = &mut self.nodes[idx];
+        let frame_id = node.frame_id.take();
+        if std::mem::replace(&mut node.evictable, false) {
             self.evictable_count -= 1;
         }
+        if let Some(frame_id) = frame_id {
+            self.frame_indices.remove(&frame_id);
+        }
         info!(
-            "remove frame_id={frame_id} page_id={} list={:?}",
-            node.page_id, node.list
+            "remove page_id={page_id} frame_id={frame_id:?} list={:?}",
+            self.nodes[idx].list
         );
         self.detach(idx);
-        self.page_indices.remove(&node.page_id);
         self.unused_node_indices.push(idx);
-        true
+        frame_id
     }
 
     fn is_full(&self) -> bool {
@@ -750,15 +752,19 @@ mod tests {
     }
 
     #[test]
-    fn a_removed_frame_is_never_evicted_and_leaves_no_ghost() {
+    fn a_removed_page_frees_its_frame_and_leaves_no_ghost() {
         let mut arc_replacer = ArcReplacer::new(2);
         arc_replacer.record_access(1, 10);
         arc_replacer.record_access(2, 20);
         arc_replacer.set_evictable(1, true);
         arc_replacer.set_evictable(2, true);
 
-        assert!(arc_replacer.remove(1));
-        assert!(!arc_replacer.remove(1), "frame 1 is no longer tracked");
+        assert_eq!(arc_replacer.remove(10), Some(1));
+        assert_eq!(
+            arc_replacer.remove(10),
+            None,
+            "page 10 is no longer tracked"
+        );
         assert_eq!(arc_replacer.size(), 1);
         assert!(
             !arc_replacer.page_indices.contains_key(&10),
@@ -775,6 +781,37 @@ mod tests {
             Some(1),
             "a removed frame is tracked again once a new page uses it"
         );
+    }
+
+    #[test]
+    fn removing_a_pinned_page_leaves_the_evictable_count_alone() {
+        let mut arc_replacer = ArcReplacer::new(2);
+        arc_replacer.record_access(0, 10);
+        arc_replacer.record_access(1, 11);
+        arc_replacer.set_evictable(1, true);
+        assert_eq!(arc_replacer.remove(10), Some(0));
+        assert_eq!(arc_replacer.size(), 1);
+        assert_eq!(arc_replacer.evict(), Some(1));
+    }
+
+    #[test]
+    fn a_reused_page_id_is_not_a_ghost_hit_once_its_ghost_is_removed() {
+        let mut arc_replacer = ArcReplacer::new(1);
+        arc_replacer.record_access(0, 10);
+        arc_replacer.set_evictable(0, true);
+        assert_eq!(arc_replacer.evict(), Some(0));
+        assert_eq!(arc_replacer.mru_ghost_list.length, 1);
+
+        assert_eq!(arc_replacer.remove(10), None, "a ghost holds no frame");
+        assert_eq!(arc_replacer.mru_ghost_list.length, 0);
+
+        arc_replacer.record_access(0, 10);
+        assert_eq!(
+            arc_replacer.nodes[arc_replacer.page_indices[&10]].list,
+            ArcList::Mru,
+            "a reused id was admitted to MFU as if it were a ghost hit"
+        );
+        assert_eq!(arc_replacer.mru_target_size, 0);
     }
 
     #[test]

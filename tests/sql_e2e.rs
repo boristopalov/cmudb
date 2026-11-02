@@ -292,9 +292,7 @@ fn spill_test_rows(db: &Db) {
 #[test]
 fn order_by_past_the_sort_memory_budget_spills_and_matches_the_in_memory_sort() {
     let in_memory = Db::new(SPILL_TEST_FRAMES);
-    let spilling = Db::with_sort_memory_budget(SPILL_TEST_FRAMES, SPILL_TEST_BUDGET_BYTES);
     spill_test_rows(&in_memory);
-    spill_test_rows(&spilling);
 
     for sql in [
         "SELECT id FROM s ORDER BY k",
@@ -305,6 +303,8 @@ fn order_by_past_the_sort_memory_budget_spills_and_matches_the_in_memory_sort() 
         "SELECT id FROM s ORDER BY k DESC NULLS LAST, v DESC",
         "SELECT id FROM s ORDER BY v DESC, k LIMIT 25",
     ] {
+        let spilling = Db::with_sort_memory_budget(SPILL_TEST_FRAMES, SPILL_TEST_BUDGET_BYTES);
+        spill_test_rows(&spilling);
         let pages_before = spilling.bpm().allocated_page_count();
         let live_before = spilling.bpm().live_page_count();
 

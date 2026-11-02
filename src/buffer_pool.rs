@@ -17,8 +17,8 @@ use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::thread;
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 #[cfg(feature = "deadlock_detection")]
@@ -54,6 +54,21 @@ struct Meta {
     /// Pins per frame. Kept beside the replacer under one lock, so a frame is marked
     /// evictable only while nothing pins it.
     pins: Vec<u32>,
+    /// One past the highest page id handed out.
+    next_page_id: usize,
+    /// Deleted page ids below `next_page_id`, handed out again lowest first.
+    free_page_ids: BTreeSet<usize>,
+}
+
+impl Meta {
+    fn allocate_page_id(&mut self) -> usize {
+        if let Some(page_id) = self.free_page_ids.pop_first() {
+            return page_id;
+        }
+        let page_id = self.next_page_id;
+        self.next_page_id += 1;
+        page_id
+    }
 }
 
 #[derive(Debug)]
@@ -61,8 +76,6 @@ pub struct BufferPoolManager {
     frames: Vec<RwLock<FrameHeader>>,
     meta: Mutex<Meta>,
     scheduler: Mutex<disk::DiskScheduler>,
-    next_page_id: AtomicUsize,
-    deleted_pages: AtomicUsize,
 }
 
 #[cfg(feature = "deadlock_detection")]
@@ -251,10 +264,10 @@ impl BufferPoolManager {
                 free_list,
                 page_table: HashMap::with_capacity(num_frames),
                 pins: vec![0; num_frames],
+                next_page_id: 0,
+                free_page_ids: BTreeSet::new(),
             }),
             scheduler: Mutex::new(scheduler),
-            next_page_id: AtomicUsize::new(0),
-            deleted_pages: AtomicUsize::new(0),
         }
     }
 
@@ -263,7 +276,7 @@ impl BufferPoolManager {
         let mut meta = self.meta.lock();
         let reservation = self.get_free_frame(&mut meta)?;
         let frame_id = reservation.frame_id;
-        let page_id = self.get_next_page_id();
+        let page_id = meta.allocate_page_id();
         let mut frame = self.frame(frame_id)?.write();
         frame.clear();
         frame.page_id = Some(page_id);
@@ -282,7 +295,7 @@ impl BufferPoolManager {
     /// Deletes `page_id`: drops it from its frame, if it is in one, without writing it, and
     /// frees its slot on disk for a later page. Fails with [`BpmError::PagePinned`] while a
     /// guard holds the page, and with [`BpmError::NoSuchPage`] for a page that is unallocated
-    /// or already deleted. The id is not handed out again.
+    /// or already deleted. [`BufferPoolManager::new_page`] hands the id out again.
     pub(crate) fn delete_page(&self, page_id: usize) -> Result<(), BpmError> {
         let mut meta = self.meta.lock();
         let resident = match meta.page_table.get(&page_id).copied() {
@@ -292,7 +305,6 @@ impl BufferPoolManager {
             Some(frame_id) => {
                 self.frame(frame_id)?.write().clear();
                 meta.page_table.remove(&page_id);
-                meta.replacer.remove(frame_id);
                 meta.free_list.push(frame_id);
                 true
             }
@@ -306,15 +318,16 @@ impl BufferPoolManager {
         if !resident && !on_disk {
             return Err(BpmError::NoSuchPage { page_id });
         }
-        self.deleted_pages.fetch_add(1, Ordering::AcqRel);
+        meta.replacer.remove(page_id);
+        meta.free_page_ids.insert(page_id);
         info!("tid={} delete_page page_id={page_id}", Self::tid());
         Ok(())
     }
 
     /// Returns how many pages this pool has handed out and not deleted.
     pub fn live_page_count(&self) -> usize {
-        let _meta = self.meta.lock();
-        self.next_page_id.load(Ordering::Acquire) - self.deleted_pages.load(Ordering::Acquire)
+        let meta = self.meta.lock();
+        meta.next_page_id - meta.free_page_ids.len()
     }
 
     pub fn write_page(self: &Arc<Self>, page_id: usize) -> PageMutResult<'_> {
@@ -575,13 +588,11 @@ impl BufferPoolManager {
         }
     }
 
-    fn get_next_page_id(&self) -> usize {
-        self.next_page_id.fetch_add(1, Ordering::AcqRel)
-    }
-
-    /// Returns how many page ids this pool has handed out; ids run densely from 0.
+    /// Returns one past the highest page id this pool has handed out; ids run densely
+    /// from 0, and [`BufferPoolManager::new_page`] hands out deleted ids again before it
+    /// grows this count.
     pub fn allocated_page_count(&self) -> usize {
-        self.next_page_id.load(Ordering::Acquire)
+        self.meta.lock().next_page_id
     }
 
     /// Reports whether `page_id` currently sits in a frame, so a read of it would not touch disk.
@@ -603,6 +614,10 @@ impl BufferPoolManager {
         };
 
         let frame = self.frame(frame_id)?.read();
+        let frame_was_reassigned_after_lookup = frame.page_id != Some(page_id);
+        if frame_was_reassigned_after_lookup {
+            return Err(BpmError::PageNotCached { page_id });
+        }
         self.write_to_disk(page_id, &frame.buf)?;
         frame.dirty.store(false, Ordering::Release);
         Ok(())
@@ -614,7 +629,117 @@ mod tests {
     use super::*;
     use crate::disk::{DiskManager, DiskScheduler};
     use crate::replacer::ArcReplacer;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
+
+    #[test]
+    fn a_deleted_page_id_is_handed_out_again_before_a_new_one() {
+        let (bpm, _dir) = crate::testing::bpm(2);
+        let ids: Vec<usize> = (0..4)
+            .map(|_| bpm.new_page().unwrap().page_id().unwrap())
+            .collect();
+        bpm.delete_page(ids[2]).unwrap();
+        bpm.delete_page(ids[1]).unwrap();
+        assert_eq!(bpm.live_page_count(), 2);
+        assert_eq!(bpm.allocated_page_count(), 4);
+
+        let reused: Vec<usize> = (0..3)
+            .map(|_| bpm.new_page().unwrap().page_id().unwrap())
+            .collect();
+        assert_eq!(reused, vec![ids[1], ids[2], 4], "lowest free id first");
+        assert_eq!(bpm.allocated_page_count(), 5);
+        assert_eq!(bpm.live_page_count(), 5);
+    }
+
+    #[test]
+    fn a_reused_page_id_reads_its_new_bytes_not_the_deleted_pages() {
+        let (bpm, _dir) = crate::testing::bpm(1);
+        let deleted = {
+            let mut page = bpm.new_page().unwrap();
+            page.data_mut().fill(1);
+            page.page_id().unwrap()
+        };
+        drop(bpm.new_page().unwrap());
+        assert!(!bpm.is_resident(deleted), "setup expected an eviction");
+        bpm.delete_page(deleted).unwrap();
+
+        let reused = {
+            let mut page = bpm.new_page().unwrap();
+            page.data_mut().fill(2);
+            page.page_id().unwrap()
+        };
+        assert_eq!(reused, deleted);
+        drop(bpm.new_page().unwrap());
+        assert!(!bpm.is_resident(reused), "setup expected a second eviction");
+        assert!(
+            bpm.read_page(reused)
+                .unwrap()
+                .data()
+                .iter()
+                .all(|&b| b == 2),
+            "the reused id read stale bytes"
+        );
+    }
+
+    #[test]
+    fn a_flush_that_finds_its_frame_given_to_another_page_reports_the_page_as_not_cached() {
+        let (bpm, _dir) = crate::testing::bpm(1);
+        let page_id = bpm.new_page().unwrap().page_id().unwrap();
+        let frame_id = bpm.meta.lock().page_table[&page_id];
+        bpm.frames[frame_id].write().page_id = Some(page_id + 1);
+
+        assert!(matches!(
+            bpm.flush_page(page_id),
+            Err(BpmError::PageNotCached { page_id: p }) if p == page_id
+        ));
+    }
+
+    #[test]
+    fn concurrent_deletes_and_allocations_never_hand_out_a_live_page_id_twice() {
+        let (bpm, _dir) = crate::testing::bpm(8);
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let bpm = Arc::clone(&bpm);
+                thread::spawn(move || {
+                    let mut owned = Vec::new();
+                    for round in 0..2_000 {
+                        let page_id = {
+                            let mut page = bpm.new_page().unwrap();
+                            let page_id = page.page_id().unwrap();
+                            page.data_mut()[..8].copy_from_slice(&(page_id as u64).to_le_bytes());
+                            page_id
+                        };
+                        owned.push(page_id);
+                        if round % 2 == 1 {
+                            let victim = owned.swap_remove(round % owned.len());
+                            let stored = u64::from_le_bytes(
+                                bpm.read_page(victim).unwrap().data()[..8]
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                            assert_eq!(stored, victim as u64, "page {victim} was handed out twice");
+                            bpm.delete_page(victim).unwrap();
+                        }
+                    }
+                    owned
+                })
+            })
+            .collect();
+        let mut live: Vec<usize> = workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect();
+        let count = live.len();
+        live.sort_unstable();
+        live.dedup();
+        assert_eq!(live.len(), count, "two workers own the same page id");
+        assert_eq!(bpm.live_page_count(), count);
+        assert!(
+            bpm.allocated_page_count() <= count + 4,
+            "deleted ids were not reused: {} ids for {count} live pages",
+            bpm.allocated_page_count()
+        );
+    }
 
     #[test]
     fn deleting_a_resident_page_frees_its_frame_without_writing_it() {
@@ -644,7 +769,7 @@ mod tests {
             "a deleted page that was never written has nothing on disk to read"
         );
         let next = bpm.new_page().unwrap().page_id().unwrap();
-        assert_ne!(next, page_id, "page ids are not reused");
+        assert_eq!(next, page_id, "the deleted id is handed out again");
     }
 
     #[test]
