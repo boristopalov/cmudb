@@ -6,8 +6,8 @@ mod common;
 use cmudb::catalog::{DataType, Schema, Value};
 use cmudb::processor::plan::{
     AggType, DropIndexPlanNode, DropTablePlanNode, Expression, ExternalMergeSortPlanNode,
-    HashJoinPlanNode, JoinType, LimitPlanNode, Plan, SeqScanPlanNode, SortExpr, SortPlanNode,
-    WindowFunctionPlanNode,
+    HashJoinPlanNode, JoinType, LimitPlanNode, NullOrdering, Plan, SeqScanPlanNode, SortDirection,
+    SortExpr, SortPlanNode, WindowFunctionPlanNode,
 };
 use common::*;
 
@@ -132,12 +132,13 @@ fn external_merge_sort_orders_by_multiple_keys() {
     assert_eq!(
         keys,
         vec![
-            (None, int(5)),
             (int(1), int(1)),
             (int(1), int(2)),
             (int(2), int(3)),
             (int(3), int(1)),
-        ]
+            (None, int(5)),
+        ],
+        "NULL sorts above every value, so it comes last ascending"
     );
 }
 
@@ -154,7 +155,7 @@ fn external_merge_sort_of_empty_input_is_empty() {
 }
 
 #[test]
-fn external_merge_sort_orders_mixed_directions_with_nulls_lowest() {
+fn external_merge_sort_orders_mixed_directions_with_nulls_highest() {
     let db = Db::new(64);
     db.exec("CREATE TABLE t (a INTEGER, b INTEGER)");
     db.exec("INSERT INTO t VALUES (3, 1), (1, 2), (2, 3), (1, 1), (NULL, 5)");
@@ -168,13 +169,82 @@ fn external_merge_sort_orders_mixed_directions_with_nulls_lowest() {
     assert_eq!(
         keys,
         vec![
+            (None, int(5)),
             (int(3), int(1)),
             (int(2), int(3)),
             (int(1), int(1)),
             (int(1), int(2)),
-            (None, int(5)),
-        ]
+        ],
+        "NULL sorts above every value, so it comes first descending"
     );
+}
+
+fn sort_keys_with_nulls(direction: SortDirection, nulls: NullOrdering) -> Vec<SortExpr> {
+    vec![SortExpr::new(col(0), direction).with_nulls(nulls)]
+}
+
+fn nulls_db() -> Db {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE t (a INTEGER)");
+    db.exec("INSERT INTO t VALUES (2), (NULL), (3), (1), (NULL)");
+    db
+}
+
+const NULL_PLACEMENT_CASES: [(SortDirection, NullOrdering, [Option<i32>; 5]); 4] = [
+    (
+        SortDirection::Ascending,
+        NullOrdering::First,
+        [None, None, Some(1), Some(2), Some(3)],
+    ),
+    (
+        SortDirection::Ascending,
+        NullOrdering::Last,
+        [Some(1), Some(2), Some(3), None, None],
+    ),
+    (
+        SortDirection::Descending,
+        NullOrdering::First,
+        [None, None, Some(3), Some(2), Some(1)],
+    ),
+    (
+        SortDirection::Descending,
+        NullOrdering::Last,
+        [Some(3), Some(2), Some(1), None, None],
+    ),
+];
+
+#[test]
+fn sort_places_nulls_first_or_last_in_either_direction() {
+    let db = nulls_db();
+    for (direction, nulls, expected) in NULL_PLACEMENT_CASES {
+        let plan = Plan::Sort(SortPlanNode {
+            schema: int_schema(&["a"]),
+            child: Box::new(scan(&db, "t", &["a"])),
+            order_by_exprs: sort_keys_with_nulls(direction, nulls),
+        });
+        assert_eq!(
+            nullable_ints(&db.run_plan(&plan).unwrap()),
+            expected.map(|v| vec![v]),
+            "{direction:?} NULLS {nulls:?}"
+        );
+    }
+}
+
+#[test]
+fn external_merge_sort_places_nulls_first_or_last_in_either_direction() {
+    let db = nulls_db();
+    for (direction, nulls, expected) in NULL_PLACEMENT_CASES {
+        let plan = Plan::ExternalMergeSort(ExternalMergeSortPlanNode {
+            schema: int_schema(&["a"]),
+            child: Box::new(scan(&db, "t", &["a"])),
+            order_by_exprs: sort_keys_with_nulls(direction, nulls),
+        });
+        assert_eq!(
+            nullable_ints(&db.run_plan(&plan).unwrap()),
+            expected.map(|v| vec![v]),
+            "{direction:?} NULLS {nulls:?}"
+        );
+    }
 }
 
 #[test]
@@ -254,6 +324,32 @@ fn window_partition_without_order_gives_partition_totals() {
             vec![2, 5, 17, 3, 5, 7, 5],
             vec![2, 7, 17, 3, 5, 7, 5],
         ]
+    );
+}
+
+#[test]
+fn window_order_by_puts_null_keys_in_the_last_peer_group() {
+    let db = sales_db();
+    db.exec("INSERT INTO sales VALUES (1, NULL)");
+    let plan = window(
+        &db,
+        Some(vec![col(0)]),
+        Some(vec![col(1)]),
+        vec![AggType::SUM, AggType::RANK],
+    );
+    let dept_1: Vec<_> = nullable_ints(&db.run_plan(&plan).unwrap())
+        .into_iter()
+        .filter(|r| r[0] == Some(1))
+        .collect();
+    assert_eq!(
+        dept_1,
+        vec![
+            vec![Some(1), Some(10), Some(10), Some(1)],
+            vec![Some(1), Some(20), Some(30), Some(2)],
+            vec![Some(1), Some(30), Some(60), Some(3)],
+            vec![Some(1), None, Some(60), Some(4)],
+        ],
+        "a NULL order key sorts above every value, so it ranks last and adds nothing to the sum"
     );
 }
 

@@ -154,26 +154,54 @@ pub enum SortDirection {
     Descending,
 }
 
-/// One `ORDER BY` key: the expression to sort on and which way to sort it.
+/// Where rows whose `ORDER BY` key is NULL go in a sorted result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NullOrdering {
+    First,
+    Last,
+}
+
+impl NullOrdering {
+    /// The placement used when a query names no `NULLS FIRST` or `NULLS LAST`. As in
+    /// PostgreSQL, NULL sorts above every value: last ascending, first descending.
+    pub fn default_for(direction: SortDirection) -> Self {
+        match direction {
+            SortDirection::Ascending => Self::Last,
+            SortDirection::Descending => Self::First,
+        }
+    }
+}
+
+/// One `ORDER BY` key: the expression to sort on, which way to sort it and where its
+/// NULLs go.
 #[derive(Clone)]
 pub struct SortExpr {
     pub expr: Expression,
     pub direction: SortDirection,
+    pub nulls: NullOrdering,
 }
 
 impl SortExpr {
-    pub fn ascending(expr: Expression) -> Self {
+    /// A key sorted in `direction` with NULLs placed by [`NullOrdering::default_for`].
+    pub fn new(expr: Expression, direction: SortDirection) -> Self {
         Self {
             expr,
-            direction: SortDirection::Ascending,
+            direction,
+            nulls: NullOrdering::default_for(direction),
         }
     }
 
+    pub fn ascending(expr: Expression) -> Self {
+        Self::new(expr, SortDirection::Ascending)
+    }
+
     pub fn descending(expr: Expression) -> Self {
-        Self {
-            expr,
-            direction: SortDirection::Descending,
-        }
+        Self::new(expr, SortDirection::Descending)
+    }
+
+    /// This key with its NULLs placed at `nulls` instead of the direction's default.
+    pub fn with_nulls(self, nulls: NullOrdering) -> Self {
+        Self { nulls, ..self }
     }
 }
 

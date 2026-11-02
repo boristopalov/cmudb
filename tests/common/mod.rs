@@ -157,3 +157,18 @@ pub fn ints(rows: &[Row]) -> Vec<Vec<i32>> {
         })
         .collect()
 }
+
+/// Each row's INT columns, with NULL as `None`; panics on any other type.
+pub fn nullable_ints(rows: &[Row]) -> Vec<Vec<Option<i32>>> {
+    rows.iter()
+        .map(|r| {
+            r.iter()
+                .map(|v| match v {
+                    Some(Value::INT(i)) => Some(*i),
+                    None => None,
+                    other => panic!("expected INT or NULL, got {other:?}"),
+                })
+                .collect()
+        })
+        .collect()
+}

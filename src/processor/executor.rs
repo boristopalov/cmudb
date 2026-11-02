@@ -11,8 +11,9 @@ use crate::processor::plan::{
     AggType, AggregationPlanNode, Arithmetic, CreateIndexPlanNode, CreateTablePlanNode,
     DeletePlanNode, DropIndexPlanNode, DropTablePlanNode, Expression, ExternalMergeSortPlanNode,
     FilterPlanNode, HashJoinPlanNode, IndexScanPlanNode, InsertPlanNode, JoinType, LimitPlanNode,
-    NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, ProjectionPlanNode, SeqScanPlanNode,
-    SortDirection, SortExpr, SortPlanNode, UpdatePlanNode, ValuesPlanNode, WindowFunctionPlanNode,
+    NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, NullOrdering, ProjectionPlanNode,
+    SeqScanPlanNode, SortDirection, SortExpr, SortPlanNode, UpdatePlanNode, ValuesPlanNode,
+    WindowFunctionPlanNode,
 };
 use crate::table_heap::{RecordId, TableHeap, TableHeapError, TableHeapIterator, Tuple};
 use std::collections::hash_map::IntoIter;
@@ -1318,18 +1319,28 @@ impl<'a> ExternalMergeSortExecutor<'a> {
 }
 
 /// One evaluated `ORDER BY` key of a row, ordered in its key's direction with NULL
-/// below every value.
+/// placed where its key says.
 struct SortValue {
     value: Option<Value>,
     direction: SortDirection,
+    nulls: NullOrdering,
 }
 
 impl Ord for SortValue {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let ascending = self.value.cmp(&other.value);
-        match self.direction {
-            SortDirection::Ascending => ascending,
-            SortDirection::Descending => ascending.reverse(),
+        use std::cmp::Ordering;
+        let null_vs_value = match self.nulls {
+            NullOrdering::First => Ordering::Less,
+            NullOrdering::Last => Ordering::Greater,
+        };
+        match (&self.value, &other.value) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => null_vs_value,
+            (Some(_), None) => null_vs_value.reverse(),
+            (Some(a), Some(b)) => match self.direction {
+                SortDirection::Ascending => a.cmp(b),
+                SortDirection::Descending => a.cmp(b).reverse(),
+            },
         }
     }
 }
@@ -1363,14 +1374,15 @@ fn eval_sort_key(
             Ok(SortValue {
                 value: key.expr.evaluate(tuple, schema)?,
                 direction: key.direction,
+                nulls: key.nulls,
             })
         })
         .collect::<Result<_, ExecutorError>>()
         .map(SortKey)
 }
 
-/// Rows ordered by `order_by` evaluated on each row's tuple, with NULL below every value
-/// in either direction; equal rows keep their input order.
+/// Rows ordered by `order_by` evaluated on each row's tuple, with each key's NULLs placed
+/// where that key says; equal rows keep their input order.
 fn sorted_by_exprs<T>(
     rows: Vec<T>,
     tuple_of: impl Fn(&T) -> &Tuple,
@@ -2190,6 +2202,79 @@ mod tests {
             ],
             "keys descend and ties keep the left run's row first"
         );
+    }
+
+    fn nullable_int_rows(schema: &Schema, rows: &[&[Option<i32>]]) -> Vec<Tuple> {
+        rows.iter()
+            .map(|r| {
+                let vals: Vec<Option<Value>> = r.iter().map(|v| v.map(Value::INT)).collect();
+                schema.encode_tuple(&vals).expect("encode")
+            })
+            .collect()
+    }
+
+    fn decode_nullable_ints(
+        schema: &Schema,
+        tuples: impl IntoIterator<Item = Tuple>,
+    ) -> Vec<Option<i32>> {
+        tuples
+            .into_iter()
+            .map(|t| match row_values(schema, &t).expect("decode")[..] {
+                [Some(Value::INT(i))] => Some(i),
+                [None] => None,
+                ref other => panic!("expected one INT or NULL, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn external_sort_merges_runs_with_nulls_where_each_key_places_them() {
+        let (bpm, _dir) = buffer_pool();
+        let schema = int_schema(&["k"]);
+        for (direction, nulls, expected) in [
+            (
+                SortDirection::Ascending,
+                NullOrdering::First,
+                [None, None, Some(1), Some(2), Some(3), Some(5)],
+            ),
+            (
+                SortDirection::Ascending,
+                NullOrdering::Last,
+                [Some(1), Some(2), Some(3), Some(5), None, None],
+            ),
+            (
+                SortDirection::Descending,
+                NullOrdering::First,
+                [None, None, Some(5), Some(3), Some(2), Some(1)],
+            ),
+            (
+                SortDirection::Descending,
+                NullOrdering::Last,
+                [Some(5), Some(3), Some(2), Some(1), None, None],
+            ),
+        ] {
+            let plan = ExternalMergeSortPlanNode {
+                schema: schema.clone(),
+                child: Box::new(values_plan(&schema, &[])),
+                order_by_exprs: vec![SortExpr::new(col(0), direction).with_nulls(nulls)],
+            };
+            let exec = ExternalMergeSortExecutor::new(
+                &plan,
+                values_child(&plan.child),
+                bpm.clone(),
+                DEFAULT_BATCH_SIZE,
+            );
+            let mut a = nullable_int_rows(&schema, &[&[Some(2)], &[None], &[Some(5)]]);
+            let mut b = nullable_int_rows(&schema, &[&[None], &[Some(1)], &[Some(3)]]);
+            let run_a = exec.spill_sorted_run(&mut a).unwrap();
+            let run_b = exec.spill_sorted_run(&mut b).unwrap();
+            let merged = exec.merge_runs(&run_a, &run_b).unwrap();
+            assert_eq!(
+                decode_nullable_ints(&schema, merged.iter().map(|r| r.unwrap().0)),
+                expected,
+                "{direction:?} NULLS {nulls:?}"
+            );
+        }
     }
 
     fn divide_by_zero(col_idx: u32) -> Expression {

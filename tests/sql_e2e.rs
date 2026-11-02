@@ -212,13 +212,60 @@ fn order_by_mixes_directions_per_key() {
 }
 
 #[test]
-fn order_by_desc_puts_nulls_last() {
+fn order_by_puts_nulls_last_ascending_and_first_descending_by_default() {
     let db = emp_db();
-    let rows = db.exec("SELECT id FROM emp ORDER BY bonus DESC");
     assert_eq!(
-        rows,
-        vec![vec![int(4)], vec![int(2)], vec![int(1)], vec![int(3)]],
-        "NULL sorts below every value, so it comes last when descending"
+        db.exec("SELECT id FROM emp ORDER BY bonus"),
+        vec![vec![int(1)], vec![int(2)], vec![int(4)], vec![int(3)]],
+        "NULL sorts above every value, so it comes last ascending"
+    );
+    assert_eq!(
+        db.exec("SELECT id FROM emp ORDER BY bonus DESC"),
+        vec![vec![int(3)], vec![int(4)], vec![int(2)], vec![int(1)]],
+        "NULL sorts above every value, so it comes first descending"
+    );
+}
+
+#[test]
+fn order_by_nulls_first_or_last_places_nulls_in_either_direction() {
+    let db = emp_db();
+    for (sql, expected) in [
+        (
+            "SELECT id FROM emp ORDER BY bonus ASC NULLS FIRST",
+            [3, 1, 2, 4],
+        ),
+        (
+            "SELECT id FROM emp ORDER BY bonus NULLS FIRST",
+            [3, 1, 2, 4],
+        ),
+        (
+            "SELECT id FROM emp ORDER BY bonus ASC NULLS LAST",
+            [1, 2, 4, 3],
+        ),
+        (
+            "SELECT id FROM emp ORDER BY bonus DESC NULLS FIRST",
+            [3, 4, 2, 1],
+        ),
+        (
+            "SELECT id FROM emp ORDER BY bonus DESC NULLS LAST",
+            [4, 2, 1, 3],
+        ),
+    ] {
+        let ids: Vec<i32> = ints(&db.exec(sql)).into_iter().map(|r| r[0]).collect();
+        assert_eq!(ids, expected, "{sql}");
+    }
+}
+
+#[test]
+fn order_by_nulls_option_applies_per_key() {
+    let db = emp_db();
+    assert_eq!(
+        ints(&db.exec("SELECT id FROM emp ORDER BY active DESC NULLS LAST, id DESC")),
+        vec![[3], [1], [2], [4]]
+    );
+    assert_eq!(
+        ints(&db.exec("SELECT id FROM emp ORDER BY active NULLS FIRST, bonus DESC NULLS LAST")),
+        vec![[4], [2], [1], [3]]
     );
 }
 
@@ -235,14 +282,6 @@ fn order_by_desc_applies_after_group_by() {
 fn order_by_options_that_are_not_supported_are_rejected() {
     let db = emp_db();
     for (sql, expected) in [
-        (
-            "SELECT id FROM emp ORDER BY bonus NULLS FIRST",
-            "NULLS FIRST/LAST",
-        ),
-        (
-            "SELECT id FROM emp ORDER BY bonus DESC NULLS LAST",
-            "NULLS FIRST/LAST",
-        ),
         ("SELECT id FROM emp ORDER BY id WITH FILL", "WITH FILL"),
         ("SELECT id FROM emp ORDER BY id INTERPOLATE", "INTERPOLATE"),
     ] {
