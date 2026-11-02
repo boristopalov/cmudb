@@ -167,7 +167,7 @@ fn committed_data_is_on_disk_without_closing() {
         "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);\
          BEGIN; INSERT INTO t VALUES (2); COMMIT;",
     );
-    std::mem::forget(db);
+    db.abandon();
 
     let db = open(dir.path());
     assert_eq!(ints(&db, "SELECT a FROM t;"), vec![vec![1], vec![2]]);
@@ -279,9 +279,19 @@ fn a_file_that_is_not_a_database_is_refused() {
 }
 
 #[test]
+fn a_directory_open_in_one_database_cannot_be_opened_again_until_it_closes() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = open(dir.path());
+    let second = Database::open(dir.path(), FRAMES).err().unwrap();
+    assert!(matches!(second, PersistError::InUse), "{second}");
+    first.close().unwrap();
+    open(dir.path()).close().unwrap();
+}
+
+#[test]
 fn a_new_database_is_on_disk_before_its_first_commit() {
     let dir = tempfile::tempdir().unwrap();
-    std::mem::forget(open(dir.path()));
+    open(dir.path()).abandon();
     let db = open(dir.path());
     assert!(db.catalog().snapshot().tables.is_empty());
     assert!(matches!(
@@ -302,7 +312,7 @@ fn a_kill_while_a_block_grows_a_table_leaves_a_database_that_opens() {
             &db,
             &format!("BEGIN; INSERT INTO t VALUES {};", values.join(", ")),
         );
-        std::mem::forget(db);
+        db.abandon();
     }
 
     let db = Database::open(dir.path(), 8).expect("reopen after a kill");

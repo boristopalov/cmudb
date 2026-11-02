@@ -22,7 +22,8 @@ A SQL statement flows top to bottom:
 `cmudb::Database::open(dir)` keeps a database in `dir/cmudb.data`; `Database::scratch` uses a
 temporary directory instead. Page 0 of the data file is a header that points at a chain of
 metadata pages (`src/database_file.rs`) holding the catalog, the page allocator's next and free
-ids, and the transaction clocks. The data file is written after every commit through `Database`
+ids, and the transaction clocks. The data file is locked while a `Database` has it open, so a
+second process gets `PersistError::InUse`. The data file is written after every commit through `Database`
 and on close or drop. There is no WAL (BOR-71): the buffer pool also writes pages when it evicts
 them, so a crash or kill between those writes can leave the file unopenable or inconsistent.
 Opening a table whose page links point past the recorded allocation fails with

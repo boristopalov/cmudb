@@ -57,6 +57,8 @@ pub enum PersistError {
     Bpm(BpmError),
     /// The data file's header page is not a cmudb header.
     NotADatabase,
+    /// Another open database holds the lock on the data file.
+    InUse,
     /// The data file was written with another [`FORMAT_VERSION`].
     UnsupportedFormat(u32),
     /// The metadata chain or its payload is damaged.
@@ -77,6 +79,7 @@ impl fmt::Display for PersistError {
             PersistError::Io(e) => write!(f, "io error: {e}"),
             PersistError::Bpm(e) => write!(f, "buffer pool error: {e}"),
             PersistError::NotADatabase => f.write_str("the data file is not a cmudb database"),
+            PersistError::InUse => f.write_str("the database is open in another process"),
             PersistError::UnsupportedFormat(v) => write!(
                 f,
                 "the data file has format version {v}, but this cmudb reads version {FORMAT_VERSION}"
@@ -592,6 +595,10 @@ mod tests {
             (
                 PersistError::NotADatabase,
                 "the data file is not a cmudb database",
+            ),
+            (
+                PersistError::InUse,
+                "the database is open in another process",
             ),
             (
                 PersistError::UnsupportedFormat(7),

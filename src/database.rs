@@ -260,6 +260,8 @@ pub struct Database {
     sort_memory_budget_bytes: usize,
     /// Set for a database from [`Database::open`], whose metadata is written to its data file.
     persisted: Option<Mutex<Persisted>>,
+    /// The data file of a database from [`Database::open`], locked for as long as it is open.
+    _lock: Option<std::fs::File>,
     _dir: Option<TempDir>,
 }
 
@@ -292,6 +294,7 @@ impl Database {
             session: Mutex::new(None),
             sort_memory_budget_bytes: DEFAULT_SORT_MEMORY_BUDGET_BYTES,
             persisted: None,
+            _lock: None,
             _dir: None,
         }
     }
@@ -321,23 +324,36 @@ impl Database {
     /// by being dropped. A transaction committed directly on [`Database::txn_mgr`] is written
     /// at the next of those. Pages evicted from the buffer pool are written in between, and
     /// there is no log to undo them, so a crash or kill can leave the data file unopenable or
-    /// inconsistent.
+    /// inconsistent. The data file is locked while the database is open, so a second open of
+    /// the same directory fails with [`PersistError::InUse`].
     pub fn open(dir: impl AsRef<Path>, frames: usize) -> Result<Self, PersistError> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
         let data_path = dir.join(DATA_FILE);
         let is_new = std::fs::metadata(&data_path).map_or(true, |m| m.len() == 0);
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&data_path)?;
+        lock.try_lock().map_err(|e| match e {
+            std::fs::TryLockError::WouldBlock => PersistError::InUse,
+            std::fs::TryLockError::Error(e) => PersistError::Io(e),
+        })?;
         let dm = DiskManager::new(data_path, dir.join(LOG_FILE))?;
         let bpm = Arc::new(create_buffer_pool_manager(
             frames,
             ArcReplacer::new(frames),
             DiskScheduler::new(dm),
         ));
-        if is_new {
-            Self::create_persisted(bpm)
+        let mut db = if is_new {
+            Self::create_persisted(bpm)?
         } else {
-            Self::load_persisted(bpm)
-        }
+            Self::load_persisted(bpm)?
+        };
+        db._lock = Some(lock);
+        Ok(db)
     }
 
     fn create_persisted(bpm: Arc<BufferPoolManager>) -> Result<Self, PersistError> {
@@ -382,6 +398,13 @@ impl Database {
         let result = self.shut_down();
         self.persisted = None;
         result
+    }
+
+    /// Lets go of the database the way a killed process does: nothing is rolled back or
+    /// written, and the lock on the data file is released. For crash tests.
+    pub fn abandon(mut self) {
+        drop(self._lock.take());
+        std::mem::forget(self);
     }
 
     fn shut_down(&self) -> Result<(), PersistError> {
@@ -1101,7 +1124,7 @@ mod tests {
             "the insert committed"
         );
         db.execute("INSERT INTO t VALUES (2);").unwrap();
-        std::mem::forget(db);
+        db.abandon();
 
         let db = Database::open(dir.path(), 16).unwrap();
         assert_eq!(
