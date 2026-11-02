@@ -418,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_that_fails_midway_stays_invisible_and_abort_resumes() {
+    fn a_commit_that_fails_on_one_write_stays_invisible_and_abort_resumes() {
         let (mgr, heap, _dir) = setup();
         let rids: Vec<_> = [b"aaaa", b"bbbb", b"cccc"]
             .iter()
@@ -442,8 +442,16 @@ mod tests {
         assert_eq!(slot(&heap, rids[2]).0, txn.id());
 
         assert!(mgr.abort(&txn).is_err());
-        assert_eq!(slot(&heap, rids[0]), (0, b"aaaa".to_vec()));
-        assert_eq!(mgr.num_version_chains(), 2);
+        assert_eq!(slot(&heap, rids[1]).0, 7);
+        assert_eq!(mgr.version_chain_len(rids[1]), 1);
+        assert!(txn.write_set().contains(&rids[1]));
+        for (rid, data) in [(rids[0], b"aaaa"), (rids[2], b"cccc")] {
+            let restored = (0, data.to_vec());
+            let pending = (txn.id(), b"xxxx".to_vec());
+            let state = slot(&heap, rid);
+            assert!(state == restored || state == pending, "{rid}: {state:?}");
+            assert_eq!(mgr.version_chain_len(rid), usize::from(state == pending));
+        }
 
         heap.update_meta(
             rids[1],
