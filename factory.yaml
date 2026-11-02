@@ -99,7 +99,7 @@ stages:
     trigger: { schedule: weekly }   # never in CI
     scheduled: true
     inputs: [recent agent sessions, their PRs and diffs, rubric.md, ledger.md]
-    limits: { max_proposals: 3, min_sessions: 2, cooldown_weeks: 2 }
+    limits: { max_proposals: 3, min_sessions: 2 }
     output: findings report, plus a pull_request on agent-factory
 
 # A PR is merge-ready when every gate passes. The implement agent may merge

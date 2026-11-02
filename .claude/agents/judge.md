@@ -14,7 +14,6 @@ Each run:
    - Propose a change only for a pattern seen in 2 or more separate sessions, or once if severe (a shipped bug, a safety or permission violation, merged code that breaks the comment policy). Log one-offs in the ledger and leave them.
    - A pattern logged in 3 runs in a row without a proposal must get one now.
    - At most 3 proposals per run, ranked by impact. Each is a minimal edit, never a rewrite.
-   - Don't touch a file changed in the last 2 weeks unless the evidence shows that change made things worse.
    - Don't re-propose anything the ledger shows rejected unless you have new evidence; say what's new.
 4. Write a short report: counts of sessions reviewed and findings per rubric item, then each proposal with the failure, evidence links, the exact edit, the expected effect, and how next week's run will tell whether it worked. Report the counts even when you propose nothing; a clean week is a valid outcome.
 5. Add this run to ledger.md: findings, proposals, and the outcome of earlier proposals (merged, or rejected with Boris's reason).
