@@ -1833,6 +1833,23 @@ mod tests {
     }
 
     #[test]
+    fn descending_sort_keeps_tied_rows_in_input_order() {
+        let schema = int_schema(&["k", "v"]);
+        let rows = values_plan(&schema, &[&[1, 0], &[2, 0], &[1, 1], &[2, 1], &[1, 2]]);
+        let plan = SortPlanNode {
+            schema: schema.clone(),
+            child: Box::new(values_plan(&schema, &[])),
+            order_by_exprs: vec![SortExpr::descending(col(0))],
+        };
+        let mut sort = SortExecutor::new(&plan, values_child(&rows));
+        assert_eq!(
+            decode_ints(&schema, drain(&mut sort)),
+            vec![vec![2, 0], vec![2, 1], vec![1, 0], vec![1, 1], vec![1, 2]],
+            "rows with equal keys keep their input order"
+        );
+    }
+
+    #[test]
     fn external_sort_merges_descending_runs_in_descending_order() {
         let (bpm, _dir) = buffer_pool();
         let schema = int_schema(&["k", "v"]);
