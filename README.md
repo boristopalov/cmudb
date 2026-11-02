@@ -41,8 +41,8 @@ Only treat a change as real when it is larger than the run-to-run spread (the br
 When you run them, every bench first checks what it reads: the heap and B+ tree return every
 inserted row and key, and each query returns the expected rows. The join and index query
 benches also check that the planner still picks the plan they are named after, so a change
-fails the run instead of showing up as a speedup. CI only type-checks the benches, so these
-checks run only when someone runs them.
+fails the run instead of showing up as a speedup. CI never runs a benchmark, but
+`tests/bench_queries.rs` runs the query benches' result and plan checks as an ordinary test.
 The query benches run SQL through the same harness as `tests/common`, so they measure whichever
 executor model the branch has. Their timings include parsing, binding and planning each
 statement, not just execution, which matters most for small queries like `index_point_lookup`.
