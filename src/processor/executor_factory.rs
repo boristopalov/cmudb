@@ -102,28 +102,15 @@ pub fn create_executor_with_batch_size<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer_pool::BufferPoolManager;
-    use crate::catalog::{Catalog, DataType, Schema, Value};
-    use crate::concurrency::{IsolationLevel, TransactionManager};
-    use crate::create_buffer_pool_manager;
-    use crate::disk::{DiskManager, DiskScheduler};
-    use crate::processor::executor::ExecutorContext;
-    use crate::processor::executor::collect_rows;
-    use crate::processor::plan::{Expression, InsertPlanNode, SeqScanPlanNode, ValuesPlanNode};
-    use crate::replacer::ArcReplacer;
-    use std::sync::Arc;
-    use tempfile::tempdir;
 
-    fn make_catalog() -> (Catalog, Arc<BufferPoolManager>, tempfile::TempDir) {
-        let num_frames = 16;
-        let dir = tempdir().expect("tempdir");
-        let dm = DiskManager::new(&dir.path().join("db"), &dir.path().join("log"))
-            .expect("disk manager");
-        let scheduler = DiskScheduler::new(dm);
-        let replacer = ArcReplacer::new(num_frames);
-        let bpm = Arc::new(create_buffer_pool_manager(num_frames, replacer, scheduler));
-        (Catalog::new(bpm.clone()), bpm, dir)
-    }
+    use crate::catalog::{DataType, Schema, Value};
+    use crate::concurrency::{IsolationLevel, TransactionManager};
+
+    use crate::processor::executor::ExecutorContext;
+    use crate::processor::executor::{collect_rows, rows_affected};
+    use crate::processor::plan::{Expression, InsertPlanNode, SeqScanPlanNode, ValuesPlanNode};
+
+    use std::sync::Arc;
 
     fn make_schema() -> Schema {
         Schema::new(vec![
@@ -134,7 +121,7 @@ mod tests {
 
     #[test]
     fn insert_then_seq_scan_returns_inserted_rows() {
-        let (catalog, bpm, _dir) = make_catalog();
+        let (catalog, bpm, _dir) = crate::testing::catalog(16);
         let table_oid = catalog
             .create_table("t".to_string(), make_schema())
             .expect("create table");
@@ -168,13 +155,7 @@ mod tests {
         );
         let mut insert_exec = create_executor(&ctx, &insert_plan);
         insert_exec.open().expect("open insert");
-        let batch = insert_exec
-            .next_batch()
-            .expect("insert next_batch")
-            .expect("insert produces a count tuple");
-        assert_eq!(batch.len(), 1);
-        let (count_tuple, _) = batch.into_iter().next().unwrap();
-        let count = i32::from_ne_bytes(count_tuple.data.as_slice().try_into().unwrap());
+        let count = rows_affected(&insert_plan, &mut *insert_exec).expect("insert");
         assert_eq!(count, 3, "insert should report 3 rows");
         drop(insert_exec);
         txn_mgr.commit(&ctx.txn).expect("commit insert");

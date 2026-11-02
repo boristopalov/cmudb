@@ -1,31 +1,7 @@
 mod common;
 
-use cmudb::catalog::{Catalog, Schema, Value};
-use cmudb::concurrency::{IsolationLevel, TransactionManager};
-use cmudb::create_buffer_pool_manager;
-use cmudb::disk::{DiskManager, DiskScheduler};
-use cmudb::parser::Binder;
-use cmudb::planner::Planner;
-use cmudb::processor::executor::ExecutorContext;
-use cmudb::processor::executor_factory::create_executor;
-use cmudb::processor::plan::Plan;
-use cmudb::replacer::ArcReplacer;
+use cmudb::table_heap::RecordId;
 use common::{Db, ints};
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
-use std::sync::Arc;
-use tempfile::tempdir;
-
-struct TestContext<'a> {
-    planner: Planner<'a>,
-    binder: Binder<'a>,
-}
-
-fn new_test_context<'a>(catalog: &'a Catalog) -> TestContext<'a> {
-    let binder = Binder::new(catalog);
-    let planner = Planner::new(catalog);
-    TestContext { planner, binder }
-}
 
 #[test]
 fn create_insert_select_round_trip() {
@@ -41,129 +17,53 @@ fn create_insert_select_round_trip() {
     );
 }
 
+/// The record id of every slot in `table`'s heap, in heap order.
+fn heap_rids(db: &Db, table: &str) -> Vec<RecordId> {
+    let heap = &db.catalog().get_table(db.table_oid(table)).unwrap().heap;
+    heap.iter().map(|slot| slot.unwrap().1).collect()
+}
+
 #[test]
 fn scan_driven_sql_update_visits_each_original_row_once() {
-    use cmudb::catalog::DataType;
-
     for row_count in [8, 700] {
-        let dir = tempdir().unwrap();
-        let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).unwrap();
-        let bpm = Arc::new(create_buffer_pool_manager(
-            1,
-            ArcReplacer::new(1),
-            DiskScheduler::new(dm),
-        ));
-        let catalog = Catalog::new(bpm.clone());
-        let txn_mgr = Arc::new(TransactionManager::new(bpm.clone()));
-        let context = new_test_context(&catalog);
-        let execute_sql = |sql: &str| {
-            let ast = Parser::parse_sql(&GenericDialect, sql).unwrap();
-            let statements = context.binder.bind(ast).unwrap();
-            let mut result = Vec::new();
-            for statement in statements {
-                let plan = context.planner.plan(statement).unwrap();
-                let ctx = ExecutorContext::new(
-                    &catalog,
-                    bpm.clone(),
-                    txn_mgr.begin(IsolationLevel::SnapshotIsolation),
-                    txn_mgr.clone(),
-                );
-                let mut exec = create_executor(&ctx, &plan);
-                exec.open().unwrap();
-                let produces_single_status_row =
-                    matches!(plan, Plan::Insert(_) | Plan::CreateTable(_));
-                if produces_single_status_row {
-                    result.extend(exec.next_batch().unwrap().unwrap());
-                } else {
-                    while let Some(batch) = exec.next_batch().unwrap() {
-                        result.extend(batch);
-                        assert!(
-                            result.len() <= row_count,
-                            "statement emitted more rows than the table holds: {sql}"
-                        );
-                    }
-                    assert!(exec.next_batch().unwrap().is_none());
-                }
-                exec.close().unwrap();
-                txn_mgr.commit(&ctx.txn).unwrap();
-            }
-            result
-        };
-        execute_sql("CREATE TABLE items (id INTEGER, value INTEGER)");
+        let db = Db::new(1);
+        db.exec("CREATE TABLE items (id INTEGER, value INTEGER)");
         let values = (0..row_count)
             .map(|id| format!("({id}, 0)"))
             .collect::<Vec<_>>()
             .join(", ");
-        let inserted = execute_sql(&format!("INSERT INTO items VALUES {values}"));
         assert_eq!(
-            i32::from_ne_bytes(inserted[0].0.data.as_slice().try_into().unwrap()),
-            row_count as i32
+            ints(&db.exec(&format!("INSERT INTO items VALUES {values}"))),
+            vec![[row_count]]
         );
-        let original_rids: Vec<_> = execute_sql("SELECT * FROM items")
-            .into_iter()
-            .map(|(_, rid)| rid)
-            .collect();
-        let updated = execute_sql("UPDATE items SET value = value + 1");
-        assert_eq!(updated.len(), row_count);
-        let schema = Schema::new(vec![
-            (DataType::INT, "id".to_string()),
-            (DataType::INT, "value".to_string()),
-        ]);
-        let final_rows = execute_sql("SELECT * FROM items");
-        assert_eq!(final_rows.len(), row_count);
-        for (id, (tuple, rid)) in final_rows.iter().enumerate() {
-            assert_eq!(
-                schema.get_value(tuple, 0).unwrap(),
-                Some(Value::INT(id as i32))
-            );
-            assert_eq!(schema.get_value(tuple, 1).unwrap(), Some(Value::INT(1)));
-            assert_eq!(
-                *rid, original_rids[id],
-                "updates happen in place, so every row keeps its record id"
-            );
-        }
+        let original_rids = heap_rids(&db, "items");
+        assert_eq!(original_rids.len(), row_count as usize);
+
+        assert_eq!(
+            ints(&db.exec("UPDATE items SET value = value + 1")),
+            vec![[row_count]],
+            "the update changes each original row once"
+        );
+
+        let expected: Vec<[i32; 2]> = (0..row_count).map(|id| [id, 1]).collect();
+        assert_eq!(ints(&db.exec("SELECT * FROM items")), expected);
+        assert_eq!(
+            heap_rids(&db, "items"),
+            original_rids,
+            "updates happen in place, so every row keeps its record id"
+        );
     }
 }
 
 #[test]
 fn where_and_join_queries_over_table_scans_open_their_children() {
-    use cmudb::processor::executor::collect_rows;
-
-    let dir = tempdir().unwrap();
-    let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).unwrap();
-    let bpm = Arc::new(create_buffer_pool_manager(
-        16,
-        ArcReplacer::new(16),
-        DiskScheduler::new(dm),
-    ));
-    let catalog = Catalog::new(bpm.clone());
-    let txn_mgr = Arc::new(TransactionManager::new(bpm.clone()));
-    let context = new_test_context(&catalog);
-    let run_sql = |sql: &str| {
-        let ast = Parser::parse_sql(&GenericDialect, sql).unwrap();
-        let mut rows = Vec::new();
-        for statement in context.binder.bind(ast).unwrap() {
-            let plan = context.planner.plan(statement).unwrap();
-            let ctx = ExecutorContext::new(
-                &catalog,
-                bpm.clone(),
-                txn_mgr.begin(IsolationLevel::SnapshotIsolation),
-                txn_mgr.clone(),
-            );
-            let mut exec = create_executor(&ctx, &plan);
-            exec.open().unwrap();
-            rows = collect_rows(&mut *exec).unwrap();
-            exec.close().unwrap();
-            txn_mgr.commit(&ctx.txn).unwrap();
-        }
-        rows
-    };
-
-    run_sql("CREATE TABLE t (a INTEGER, b INTEGER)");
-    run_sql("INSERT INTO t VALUES (1, 2), (3, 4), (5, 6)");
-    assert_eq!(run_sql("SELECT a FROM t WHERE b > 3").len(), 2);
+    let db = Db::new(16);
+    db.exec("CREATE TABLE t (a INTEGER, b INTEGER)");
+    db.exec("INSERT INTO t VALUES (1, 2), (3, 4), (5, 6)");
+    assert_eq!(db.exec("SELECT a FROM t WHERE b > 3").len(), 2);
     assert_eq!(
-        run_sql("SELECT * FROM t AS x JOIN t AS y ON x.a = y.a").len(),
+        db.exec("SELECT * FROM t AS x JOIN t AS y ON x.a = y.a")
+            .len(),
         3
     );
 }

@@ -9,10 +9,7 @@
 use cmudb::buffer_pool::BufferPoolManager;
 use cmudb::catalog::{Catalog, DataType, IndexType, Schema, Value};
 use cmudb::concurrency::{IsolationLevel, TransactionManager};
-use cmudb::create_buffer_pool_manager;
-use cmudb::disk::{DiskManager, DiskScheduler};
-use cmudb::processor::executor::ExecutorContext;
-use cmudb::processor::executor::RowCursor;
+use cmudb::processor::executor::{ExecutorContext, RowCursor, rows_affected};
 use cmudb::processor::executor_factory::create_executor_with_batch_size;
 use cmudb::processor::plan::{
     AggType, AggregationPlanNode, ColIdx, ColumnAssignment, DeletePlanNode, Expression,
@@ -21,11 +18,10 @@ use cmudb::processor::plan::{
     NestedLoopJoinPlanNode, Op, Plan, ProjectionPlanNode, SeqScanPlanNode, Side, SortExpr,
     SortPlanNode, UpdatePlanNode, ValuesPlanNode, WindowFunctionPlanNode,
 };
-use cmudb::replacer::ArcReplacer;
 use std::collections::HashMap;
 use std::ops::Bound;
 use std::sync::Arc;
-use tempfile::{TempDir, tempdir};
+use tempfile::TempDir;
 
 /// Batch sizes to exercise: 1 (degenerate), sizes below the join fan-out (7),
 /// sizes right at / above it, and one larger than every input.
@@ -167,15 +163,7 @@ fn values_plan(schema: Schema, rows: &Rows) -> Plan {
 /// Builds a fresh database with `l`, `r` and `s` (plus an index on `s.k`), loading every table
 /// through the batched insert path with an awkward batch size.
 fn setup() -> Env {
-    let num_frames = 64;
-    let dir = tempdir().expect("tempdir");
-    let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).expect("disk");
-    let bpm = Arc::new(create_buffer_pool_manager(
-        num_frames,
-        ArcReplacer::new(num_frames),
-        DiskScheduler::new(dm),
-    ));
-    let catalog = Catalog::new(bpm.clone());
+    let (catalog, bpm, dir) = cmudb::testing::catalog(64);
     let l_oid = catalog
         .create_table("l".to_string(), l_schema())
         .expect("create l");
@@ -218,10 +206,8 @@ fn setup() -> Env {
         let ctx = env.ctx();
         let mut exec = create_executor_with_batch_size(&ctx, &plan, 3);
         exec.open().expect("open insert");
-        let batch = exec.next_batch().expect("insert").expect("count row");
-        assert_eq!(batch.len(), 1);
-        let count = i32::from_ne_bytes(batch.rows[0].0.data.as_slice().try_into().unwrap());
-        assert_eq!(count, rows.len() as i32);
+        let count = rows_affected(&plan, &mut *exec).expect("insert");
+        assert_eq!(count, rows.len() as u64);
         assert!(exec.next_batch().expect("insert after end").is_none());
         drop(exec);
         env.commit(&ctx);

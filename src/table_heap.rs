@@ -465,20 +465,10 @@ fn record_page_id(page_id: Option<usize>) -> Result<u32, TableHeapError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::create_buffer_pool_manager;
-    use crate::disk::{DiskManager, DiskScheduler};
-    use crate::replacer::ArcReplacer;
-    use tempfile::tempdir;
 
     fn make_heap() -> (TableHeap, tempfile::TempDir) {
-        let dir = tempdir().expect("tempdir");
-        let dm = DiskManager::new(&dir.path().join("db"), &dir.path().join("log"))
-            .expect("disk manager");
-        let scheduler = DiskScheduler::new(dm);
-        let replacer = ArcReplacer::new(8);
-        let bpm = Arc::new(create_buffer_pool_manager(8, replacer, scheduler));
-        let heap = TableHeap::new(bpm).expect("create heap");
-        (heap, dir)
+        let (bpm, dir) = crate::testing::bpm(8);
+        (TableHeap::new(bpm).expect("create heap"), dir)
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::processor::plan::{
     AggType, AggregationPlanNode, Arithmetic, CreateIndexPlanNode, CreateTablePlanNode,
     DeletePlanNode, DropIndexPlanNode, DropTablePlanNode, Expression, ExternalMergeSortPlanNode,
     FilterPlanNode, HashJoinPlanNode, IndexScanPlanNode, InputRow, InsertPlanNode, JoinRow,
-    JoinType, LimitPlanNode, NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, NullOrdering,
+    JoinType, LimitPlanNode, NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, NullOrdering, Plan,
     ProjectionPlanNode, SeqScanPlanNode, SortDirection, SortExpr, SortPlanNode, UpdatePlanNode,
     ValuesPlanNode, WindowFunctionPlanNode,
 };
@@ -312,11 +312,14 @@ impl<'a> Executor for SeqScanExecutor<'a> {
     }
 }
 
+/// Inserts every row its child yields, then yields one row holding the inserted-row count,
+/// laid out by [`rows_affected_schema`].
 pub struct InsertExecutor<'a> {
     ctx: &'a ExecutorContext<'a>,
     plan: &'a InsertPlanNode,
     child: Box<dyn Executor + 'a>,
     table: Option<Arc<TableInfo>>,
+    count_schema: Schema,
     done: bool,
 }
 
@@ -331,6 +334,7 @@ impl<'a> InsertExecutor<'a> {
             plan,
             child,
             table: None,
+            count_schema: rows_affected_schema(),
             done: false,
         }
     }
@@ -355,7 +359,7 @@ impl<'a> Executor for InsertExecutor<'a> {
             .ok_or_else(|| not_opened("InsertExecutor"))?;
 
         let indexes = self.ctx.catalog.get_table_indexes(self.plan.table_oid)?;
-        let mut count: i32 = 0;
+        let mut count: u64 = 0;
         while let Some(batch) = self.child.next_batch()? {
             for (tuple, _) in batch {
                 mvcc::insert_tuple(&self.ctx.txn, &table.heap, &indexes, &tuple)?;
@@ -364,11 +368,18 @@ impl<'a> Executor for InsertExecutor<'a> {
         }
 
         self.done = true;
-        Ok(single_row(inserted_count_tuple(count)))
+        let count = i32::try_from(count).map_err(|_| {
+            ExecutorError(format!(
+                "inserted {count} rows, more than the count column can hold"
+            ))
+        })?;
+        let count_row = self.count_schema.encode_tuple(&[Some(Value::INT(count))])?;
+        Ok(single_row(count_row))
     }
 
+    /// The layout of the count row, [`rows_affected_schema`], not the table's.
     fn schema(&self) -> &Schema {
-        &self.plan.schema
+        &self.count_schema
     }
 
     fn close(&mut self) -> Result<(), ExecutorError> {
@@ -376,11 +387,43 @@ impl<'a> Executor for InsertExecutor<'a> {
     }
 }
 
-/// The single row `InsertExecutor` yields: the inserted-row count as raw native-endian
-/// `i32` bytes, not encoded with the plan's schema.
-fn inserted_count_tuple(count: i32) -> Tuple {
-    Tuple {
-        data: count.to_ne_bytes().to_vec(),
+/// The schema of the row `InsertExecutor` yields: one `INT` column named `count`.
+pub fn rows_affected_schema() -> Schema {
+    Schema::new(vec![(DataType::INT, "count".to_string())])
+}
+
+/// Runs a DML executor to the end and returns how many rows it inserted, updated or deleted.
+/// `plan` is the plan `exec` was built from.
+///
+/// Fails with an error for a plan that is not an INSERT, UPDATE or DELETE.
+pub fn rows_affected(plan: &Plan, exec: &mut dyn Executor) -> Result<u64, ExecutorError> {
+    match plan {
+        Plan::Insert(_) => {
+            let rows = collect_rows(exec)?;
+            let [(count_row, _)] = rows.as_slice() else {
+                return Err(ExecutorError(format!(
+                    "INSERT yielded {} rows instead of one count row",
+                    rows.len()
+                )));
+            };
+            match exec.schema().get_value(count_row, 0)? {
+                Some(Value::INT(n)) => u64::try_from(n)
+                    .map_err(|_| ExecutorError(format!("INSERT reported a negative count {n}"))),
+                other => Err(ExecutorError(format!(
+                    "INSERT count row holds {other:?} instead of an INT"
+                ))),
+            }
+        }
+        Plan::Update(_) | Plan::Delete(_) => {
+            let mut n = 0u64;
+            while let Some(batch) = exec.next_batch()? {
+                n += batch.len() as u64;
+            }
+            Ok(n)
+        }
+        _ => Err(ExecutorError(
+            "rows_affected called on a plan that is not INSERT, UPDATE or DELETE".to_string(),
+        )),
     }
 }
 
@@ -2022,24 +2065,7 @@ fn flush_peer_group(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::create_buffer_pool_manager;
-    use crate::disk::{DiskManager, DiskScheduler};
     use crate::processor::plan::{ColIdx, Plan};
-    use crate::replacer::ArcReplacer;
-    use tempfile::TempDir;
-
-    fn buffer_pool() -> (Arc<BufferPoolManager>, TempDir) {
-        let num_frames = 64;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let dm = DiskManager::new(&dir.path().join("db"), &dir.path().join("log"))
-            .expect("disk manager");
-        let bpm = Arc::new(create_buffer_pool_manager(
-            num_frames,
-            ArcReplacer::new(num_frames),
-            DiskScheduler::new(dm),
-        ));
-        (bpm, dir)
-    }
 
     fn int_schema(names: &[&str]) -> Schema {
         Schema::new(
@@ -2113,8 +2139,19 @@ mod tests {
     }
 
     #[test]
+    fn rows_affected_rejects_a_plan_that_is_not_dml() {
+        let plan = values_plan(&int_schema(&["a"]), &[&[1]]);
+        let mut exec = values_child(&plan);
+        exec.open().expect("open");
+
+        let err = rows_affected(&plan, &mut *exec).unwrap_err();
+
+        assert!(err.0.contains("not INSERT, UPDATE or DELETE"), "{}", err.0);
+    }
+
+    #[test]
     fn external_sort_merges_spilled_runs_in_order() {
-        let (bpm, _dir) = buffer_pool();
+        let (bpm, _dir) = crate::testing::bpm(64);
         let schema = int_schema(&["k", "v"]);
         let plan = ExternalMergeSortPlanNode {
             schema: schema.clone(),
@@ -2177,7 +2214,7 @@ mod tests {
 
     #[test]
     fn external_sort_merges_descending_runs_in_descending_order() {
-        let (bpm, _dir) = buffer_pool();
+        let (bpm, _dir) = crate::testing::bpm(64);
         let schema = int_schema(&["k", "v"]);
         let plan = ExternalMergeSortPlanNode {
             schema: schema.clone(),
@@ -2235,7 +2272,7 @@ mod tests {
 
     #[test]
     fn external_sort_merges_runs_with_nulls_where_each_key_places_them() {
-        let (bpm, _dir) = buffer_pool();
+        let (bpm, _dir) = crate::testing::bpm(64);
         let schema = int_schema(&["k"]);
         for (direction, nulls, expected) in [
             (

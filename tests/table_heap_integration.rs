@@ -1,21 +1,13 @@
 use cmudb::buffer_pool::BufferPoolManager;
-use cmudb::create_buffer_pool_manager;
-use cmudb::disk::{DiskManager, DiskScheduler, PAGE_SIZE};
-use cmudb::replacer::ArcReplacer;
+use cmudb::disk::PAGE_SIZE;
 use cmudb::table_heap::{RecordId, TableHeap, TableHeapIterator, Tuple};
 use cmudb::table_page::{TablePageRef, TupleMeta};
 use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
-use tempfile::{TempDir, tempdir};
+use tempfile::TempDir;
 
 fn make_heap(frames: usize) -> (TableHeap, Arc<BufferPoolManager>, TempDir) {
-    let dir = tempdir().unwrap();
-    let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).unwrap();
-    let bpm = Arc::new(create_buffer_pool_manager(
-        frames,
-        ArcReplacer::new(frames),
-        DiskScheduler::new(dm),
-    ));
+    let (bpm, dir) = cmudb::testing::bpm(frames);
     let page_before_the_heap = bpm.new_page().unwrap();
     drop(page_before_the_heap);
     let heap = TableHeap::new(bpm.clone()).unwrap();

@@ -215,30 +215,14 @@ impl TableIndex {
 #[cfg(test)]
 mod tests {
     use std::ops::Bound;
-    use std::sync::Arc;
 
     use ordered_float::OrderedFloat;
-    use tempfile::tempdir;
 
     use super::TableIndex;
-    use crate::buffer_pool::BufferPoolManager;
-    use crate::catalog::{DataType, IndexType, Schema, Value};
-    use crate::create_buffer_pool_manager;
-    use crate::disk::{DiskManager, DiskScheduler};
-    use crate::replacer::ArcReplacer;
-    use crate::table_heap::RecordId;
 
-    fn make_bpm(num_frames: usize) -> (Arc<BufferPoolManager>, tempfile::TempDir) {
-        let dir = tempdir().expect("tempdir");
-        let dm =
-            DiskManager::new(dir.path().join("db"), dir.path().join("log")).expect("disk manager");
-        let scheduler = DiskScheduler::new(dm);
-        let replacer = ArcReplacer::new(num_frames);
-        (
-            Arc::new(create_buffer_pool_manager(num_frames, replacer, scheduler)),
-            dir,
-        )
-    }
+    use crate::catalog::{DataType, IndexType, Schema, Value};
+
+    use crate::table_heap::RecordId;
 
     fn rid(slot_id: u32) -> RecordId {
         RecordId {
@@ -263,7 +247,7 @@ mod tests {
                 Some(Value::INT(14)),
             ])
             .unwrap();
-        let (bpm, _dir) = make_bpm(10);
+        let (bpm, _dir) = crate::testing::bpm(10);
         let index =
             TableIndex::new(bpm, "i".into(), schema, vec![0, 2], IndexType::BPlusTree).unwrap();
 
@@ -278,7 +262,7 @@ mod tests {
             (DataType::INT, "a".to_string()),
             (DataType::INT, "b".to_string()),
         ]);
-        let (bpm, _dir) = make_bpm(10);
+        let (bpm, _dir) = crate::testing::bpm(10);
         let index = TableIndex::new(
             bpm,
             "i".into(),
@@ -306,7 +290,7 @@ mod tests {
     #[test]
     fn float_keys_with_the_same_integer_part_are_distinct_and_ordered() {
         let schema = Schema::new(vec![(DataType::FLOAT, "f".to_string())]);
-        let (bpm, _dir) = make_bpm(16);
+        let (bpm, _dir) = crate::testing::bpm(16);
         let index = TableIndex::new(
             bpm,
             "i".into(),
@@ -340,7 +324,7 @@ mod tests {
     #[test]
     fn same_key_can_be_filed_under_several_rids() {
         let schema = Schema::new(vec![(DataType::INT, "a".to_string())]);
-        let (bpm, _tmp) = make_bpm(16);
+        let (bpm, _tmp) = crate::testing::bpm(16);
         let index = TableIndex::new(
             bpm,
             "idx".to_string(),

@@ -2,10 +2,7 @@
 
 use cmudb::buffer_pool::BufferPoolManager;
 use cmudb::catalog::index_schema::{IndexKey, IndexValue};
-use cmudb::create_buffer_pool_manager;
-use cmudb::disk::{DiskManager, DiskScheduler};
 use cmudb::index::{BPlusTree, Index};
-use cmudb::replacer::ArcReplacer;
 use cmudb::table_heap::RecordId;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use rand::seq::SliceRandom;
@@ -22,13 +19,7 @@ const LOOKUP_KEYS: u64 = 100_000;
 const RANGE_LEN: u64 = 1_000;
 
 fn make_tree() -> (BPlusTree, Arc<BufferPoolManager>, TempDir) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).expect("disk");
-    let bpm = Arc::new(create_buffer_pool_manager(
-        POOL_FRAMES,
-        ArcReplacer::new(POOL_FRAMES),
-        DiskScheduler::new(dm),
-    ));
+    let (bpm, dir) = cmudb::testing::bpm(POOL_FRAMES);
     let tree = BPlusTree::new("bench".to_string(), KEY_LEN, bpm.clone()).expect("tree");
     (tree, bpm, dir)
 }

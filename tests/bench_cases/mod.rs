@@ -4,11 +4,7 @@
 #![allow(dead_code)]
 
 use crate::common::{Db, Row, int, ints};
-use cmudb::parser::Binder;
-use cmudb::planner::Planner;
 use cmudb::processor::plan::Plan;
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
 
 pub const POOL_FRAMES: usize = 1024;
 pub const ROWS: usize = 10_000;
@@ -81,16 +77,7 @@ pub struct Case {
 }
 
 pub fn plan_of(db: &Db, sql: &str) -> Plan {
-    let stmt = Parser::parse_sql(&GenericDialect, sql)
-        .expect("parse")
-        .remove(0);
-    let bound = Binder::new(&db.catalog)
-        .bind(vec![stmt])
-        .unwrap_or_else(|e| panic!("bind {sql}: {}", e.0))
-        .remove(0);
-    Planner::new(&db.catalog)
-        .plan(bound)
-        .unwrap_or_else(|e| panic!("plan {sql}: {}", e.0))
+    db.plan_of(sql)
 }
 
 pub fn plan_contains(plan: &Plan, wanted: fn(&Plan) -> bool) -> bool {
