@@ -93,6 +93,7 @@ pub struct AggregationPlanNode {
     pub aggregates: Vec<(Expression, AggType)>,
 }
 
+#[derive(Debug, PartialEq)]
 pub enum AggType {
     MAX,
     MIN,
@@ -302,7 +303,7 @@ pub type JoinPredicate = Expression<JoinColumn>;
 
 /// A scalar expression whose column references are `C`: a [`ColIdx`] into one input row, or a
 /// [`JoinColumn`] inside a [`JoinPredicate`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Expression<C = ColIdx> {
     Constant(Option<Value>),
     Column {
@@ -544,7 +545,7 @@ impl Arithmetic {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Op {
     Add,
     Sub,
