@@ -9,7 +9,7 @@ use sqlparser::ast::{
     Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Insert, JoinConstraint,
     JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderByExpr, OrderByKind,
     Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
-    Update, Value as SqlValue, WindowSpec, WindowType,
+    Update, Value as SqlValue, WildcardAdditionalOptions, WindowSpec, WindowType,
 };
 
 use crate::catalog::{Catalog, DataType, Schema, Value};
@@ -345,6 +345,18 @@ pub enum Unsupported {
     SortBy,
     /// `LATERAL VIEW`.
     LateralView,
+    /// `* EXCLUDE (...)`.
+    WildcardExclude,
+    /// `* EXCEPT (...)`.
+    WildcardExcept,
+    /// `* REPLACE (...)`.
+    WildcardReplace,
+    /// `* RENAME (...)`.
+    WildcardRename,
+    /// `* ILIKE '<pattern>'`.
+    WildcardIlike,
+    /// `* AS <alias>`.
+    WildcardAlias,
     /// An INSERT target that is not a table name, such as a table function.
     InsertTarget,
     /// An INSERT with no source rows.
@@ -433,6 +445,12 @@ impl fmt::Display for Unsupported {
             Unsupported::DistributeBy => "DISTRIBUTE BY is not supported",
             Unsupported::SortBy => "SORT BY is not supported; use ORDER BY",
             Unsupported::LateralView => "LATERAL VIEW is not supported",
+            Unsupported::WildcardExclude => "SELECT * EXCLUDE is not supported",
+            Unsupported::WildcardExcept => "SELECT * EXCEPT is not supported",
+            Unsupported::WildcardReplace => "SELECT * REPLACE is not supported",
+            Unsupported::WildcardRename => "SELECT * RENAME is not supported",
+            Unsupported::WildcardIlike => "SELECT * ILIKE is not supported",
+            Unsupported::WildcardAlias => "SELECT * AS <alias> is not supported",
             Unsupported::InsertTarget => "unsupported INSERT target",
             Unsupported::InsertWithoutSource => "INSERT without source",
             Unsupported::InsertSource => "INSERT requires VALUES",
@@ -1049,7 +1067,8 @@ impl<'a> Binder<'a> {
                     }
                     out.push(resolved);
                 }
-                SelectItem::Wildcard(_) => {
+                SelectItem::Wildcard(options) => {
+                    reject_wildcard_options(options)?;
                     let mut tables: Vec<&TableScope> = scope.values().collect();
                     tables.sort_by_key(|ts| ts.first_col);
                     for ts in tables {
@@ -1417,6 +1436,35 @@ fn sort_by_select_list(
         .collect()
 }
 
+/// Rejects the options of a `*` select item, so a query using one fails instead of returning
+/// every column unchanged.
+///
+/// Destructures every field of `WildcardAdditionalOptions`, so an option added by a sqlparser
+/// upgrade fails to compile here until it is bound or rejected.
+fn reject_wildcard_options(options: &WildcardAdditionalOptions) -> Result<(), BinderError> {
+    let WildcardAdditionalOptions {
+        wildcard_token: _,
+        opt_ilike,
+        opt_exclude,
+        opt_except,
+        opt_replace,
+        opt_rename,
+        opt_alias,
+    } = options;
+    let unsupported = [
+        (opt_exclude.is_some(), Unsupported::WildcardExclude),
+        (opt_except.is_some(), Unsupported::WildcardExcept),
+        (opt_replace.is_some(), Unsupported::WildcardReplace),
+        (opt_rename.is_some(), Unsupported::WildcardRename),
+        (opt_ilike.is_some(), Unsupported::WildcardIlike),
+        (opt_alias.is_some(), Unsupported::WildcardAlias),
+    ];
+    match unsupported.into_iter().find(|&(present, _)| present) {
+        Some((_, feature)) => Err(feature.into()),
+        None => Ok(()),
+    }
+}
+
 fn resolve_limit(clause: Option<&LimitClause>) -> Result<Option<u32>, BinderError> {
     match clause {
         None => Ok(None),
@@ -1721,7 +1769,7 @@ fn join_predicate(predicate: Expression, left_cols: usize) -> JoinPredicate {
 #[cfg(test)]
 mod tests {
 
-    use sqlparser::dialect::GenericDialect;
+    use sqlparser::dialect::{GenericDialect, RedshiftSqlDialect};
     use sqlparser::parser::Parser;
 
     use super::{Binder, BinderError, BoundDropIndex, BoundDropTable, BoundStatement, Unsupported};
@@ -1775,6 +1823,21 @@ mod tests {
             Ok(_) => panic!("expected `{sql}` to fail to bind"),
             Err(e) => e,
         }
+    }
+
+    #[test]
+    fn wildcard_alias_is_rejected() {
+        let (catalog, _dir) = catalog_with_tables(&[("t", &["a"])]);
+        let mut ast = Parser::parse_sql(&RedshiftSqlDialect {}, "SELECT * AS x FROM t")
+            .expect("Redshift parses a wildcard alias");
+        let bound = Binder::new(&catalog).bind_statement(&ast.remove(0));
+        assert!(
+            matches!(
+                bound,
+                Err(BinderError::Unsupported(Unsupported::WildcardAlias))
+            ),
+            "a wildcard alias fails to bind"
+        );
     }
 
     #[test]
