@@ -40,9 +40,9 @@ Update/delete run inside `TableHeap::write_with`, under the page write latch:
 1. If the newest version belongs to another transaction (a txn id) or was committed after
    our snapshot (`ts > read_ts`), it's a write-write conflict: the transaction is
    **tainted** and the statement fails. There is no waiting; the caller must abort.
-2. On the first write of that tuple by this transaction, push the current version onto
-   the chain.
-3. Overwrite the slot, stamped with our txn id.
+2. Overwrite the slot, stamped with our txn id.
+3. If that was the first write of the tuple by this transaction, push the version it
+   replaced onto the chain, still under the same latch. A write that fails pushes nothing.
 
 Inserts append a slot stamped with the txn id. Any failed write (conflict, duplicate key,
 storage error) taints the transaction, since there are no statement-level savepoints.
@@ -55,8 +55,9 @@ Both happen under the page write latch.
 
 ## Failure handling
 
-- An update's size is checked before its undo entry is pushed, so a rejected write never
-  leaves an orphan entry behind.
+- Undo chains change only after the slot write succeeds, under the same latch: a write
+  pushes its undo entry afterwards, and abort pops the head after restoring it. A failed
+  write leaves the slot and its chain in step, so a retried abort restores the right image.
 - If commit can't stamp a slot (a buffer pool error), it re-stamps the slots it already did
   back to the transaction id, taints the transaction and keeps its write set. Nothing was
   published, so an `abort` then rolls everything back.

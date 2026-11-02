@@ -12,7 +12,7 @@
 //!   form an undo chain per record id, newest first, owned by the [`TransactionManager`].
 //!   Each undo entry is a full image of an older version.
 //! - **Writes** happen in place under the page write latch: check for a write-write
-//!   conflict, push the old version onto the chain, overwrite the heap slot.
+//!   conflict, overwrite the heap slot, then push the old version onto the chain.
 //! - **Commit** stamps every written slot with the commit timestamp and then publishes it.
 //!   **Abort** restores every written slot from the head of its chain.
 //! - **Garbage collection** drops undo entries that no running snapshot can reach.

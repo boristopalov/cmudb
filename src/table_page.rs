@@ -258,18 +258,22 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> TablePage<B> {
         )
     }
 
-    /// Overwrites the MVCC metadata of `slot`, keeping the deleted-tuple counter in sync.
-    ///
-    /// Once the slot exists this cannot fail: the counter saturates rather than erroring, so
-    /// undo bookkeeping done just before the write (pushing or popping a version) stays in
-    /// step with the slot.
+    /// Overwrites the MVCC metadata of `slot`, keeping the deleted-tuple counter in sync. A
+    /// counter that would overflow or drop below zero means the page is corrupt, and the
+    /// write is refused with nothing changed.
     pub fn update_meta(&mut self, slot: u32, meta: TupleMeta) -> Result<(), TablePageError> {
         let current = self.existing_slot(slot)?;
+        let count = self.num_deleted_tuples();
         let deleted = match (current.meta.is_deleted, meta.is_deleted) {
-            (false, true) => self.num_deleted_tuples().saturating_add(1),
-            (true, false) => self.num_deleted_tuples().saturating_sub(1),
-            _ => self.num_deleted_tuples(),
-        };
+            (false, true) => count.checked_add(1),
+            (true, false) => count.checked_sub(1),
+            _ => Some(count),
+        }
+        .ok_or_else(|| {
+            TablePageError(format!(
+                "deleted-tuple counter {count} is corrupt for a change to slot {slot}"
+            ))
+        })?;
         let base = Self::slot_base(slot);
         let b = self.bytes_mut();
         put_u64_le(b, base + SLOT_TS_OFF, meta.ts);
@@ -417,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn update_meta_saturates_a_corrupt_deleted_counter() {
+    fn update_meta_rejects_a_corrupt_deleted_counter() {
         let mut buf = [0u8; PAGE_SIZE];
         let mut page = TablePage::init(&mut buf[..]);
         page.insert(b"x").unwrap();
@@ -428,9 +432,8 @@ mod tests {
             is_deleted: false,
             ..page.slot(0).unwrap().meta
         };
-        page.update_meta(0, live)
-            .expect("an MVCC metadata write on an existing slot never fails");
-        assert!(!page.slot(0).unwrap().meta.is_deleted);
+        assert!(page.update_meta(0, live).is_err());
+        assert!(page.slot(0).unwrap().meta.is_deleted);
         assert_eq!(page.num_deleted_tuples(), 0);
     }
 
