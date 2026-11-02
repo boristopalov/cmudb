@@ -49,6 +49,10 @@ typed `StatementResult` per statement. The shell (`src/main.rs`) only prints tho
 - Across modules: an index's `unique_latch` (several indexes in ascending oid order), then
   page latches, then the transaction manager's version map. Commit takes `commit_latch`
   before any page latch.
+- `delete_page` frees a page's frame and its slot on disk. It fails while a guard pins the
+  page, so only scratch pages no other reader can reach are deleted: `ORDER BY` spills its
+  sorted runs to scratch `TableHeap`s once its input passes the sort memory budget and frees
+  each run's pages (`TableHeap::free`) once it is merged or the sort closes.
 
 ## Adding an executor
 
@@ -58,8 +62,7 @@ typed `StatementResult` per statement. The shell (`src/main.rs`) only prints tho
    `tests/batch_execution.rs` checks this across batch sizes.
 3. Add its arm to `create_executor_with_batch_size` in `executor_factory.rs`.
 4. Have `src/planner.rs` emit it, or, until it does, build its plan by hand in
-   `tests/executors.rs`, as hash join, external merge sort, window functions and `DROP`
-   do today.
+   `tests/executors.rs`, as hash join, window functions and `DROP` do today.
 5. Reach it through SQL in tests, through `Database` (or `tests/common`, which wraps it).
 
 ## Tests

@@ -62,6 +62,7 @@ pub struct BufferPoolManager {
     meta: Mutex<Meta>,
     scheduler: Mutex<disk::DiskScheduler>,
     next_page_id: AtomicUsize,
+    deleted_pages: AtomicUsize,
 }
 
 #[cfg(feature = "deadlock_detection")]
@@ -166,6 +167,14 @@ pub enum BpmError {
     ChannelClosed,
     Io(io::Error),
     FrameInUse,
+    /// A delete asked for a page that a live guard still pins.
+    PagePinned {
+        page_id: usize,
+    },
+    /// A delete asked for a page that is in no frame and not on disk.
+    NoSuchPage {
+        page_id: usize,
+    },
 }
 
 impl fmt::Display for BpmError {
@@ -185,6 +194,12 @@ impl fmt::Display for BpmError {
             }
             BpmError::ChannelClosed => write!(f, "Channel closed"),
             BpmError::FrameInUse => write!(f, "Frame in use"),
+            BpmError::PagePinned { page_id } => {
+                write!(f, "Page {page_id} is pinned and cannot be deleted")
+            }
+            BpmError::NoSuchPage { page_id } => {
+                write!(f, "Page {page_id} is in no frame and not on disk")
+            }
         }
     }
 }
@@ -239,6 +254,7 @@ impl BufferPoolManager {
             }),
             scheduler: Mutex::new(scheduler),
             next_page_id: AtomicUsize::new(0),
+            deleted_pages: AtomicUsize::new(0),
         }
     }
 
@@ -261,6 +277,44 @@ impl BufferPoolManager {
             frame_guard: ManuallyDrop::new(frame),
             bpm: Arc::clone(self),
         })
+    }
+
+    /// Deletes `page_id`: drops it from its frame, if it is in one, without writing it, and
+    /// frees its slot on disk for a later page. Fails with [`BpmError::PagePinned`] while a
+    /// guard holds the page, and with [`BpmError::NoSuchPage`] for a page that is unallocated
+    /// or already deleted. The id is not handed out again.
+    pub(crate) fn delete_page(&self, page_id: usize) -> Result<(), BpmError> {
+        let mut meta = self.meta.lock();
+        let resident = match meta.page_table.get(&page_id).copied() {
+            Some(frame_id) if meta.pins[frame_id] > 0 => {
+                return Err(BpmError::PagePinned { page_id });
+            }
+            Some(frame_id) => {
+                self.frame(frame_id)?.write().clear();
+                meta.page_table.remove(&page_id);
+                meta.replacer.remove(frame_id);
+                meta.free_list.push(frame_id);
+                true
+            }
+            None => false,
+        };
+        let on_disk = self
+            .scheduler
+            .lock()
+            .disk_manager()
+            .deallocate_page(page_id);
+        if !resident && !on_disk {
+            return Err(BpmError::NoSuchPage { page_id });
+        }
+        self.deleted_pages.fetch_add(1, Ordering::AcqRel);
+        info!("tid={} delete_page page_id={page_id}", Self::tid());
+        Ok(())
+    }
+
+    /// Returns how many pages this pool has handed out and not deleted.
+    pub fn live_page_count(&self) -> usize {
+        let _meta = self.meta.lock();
+        self.next_page_id.load(Ordering::Acquire) - self.deleted_pages.load(Ordering::Acquire)
     }
 
     pub fn write_page(self: &Arc<Self>, page_id: usize) -> PageMutResult<'_> {
@@ -561,6 +615,73 @@ mod tests {
     use crate::disk::{DiskManager, DiskScheduler};
     use crate::replacer::ArcReplacer;
     use std::time::Duration;
+
+    #[test]
+    fn deleting_a_resident_page_frees_its_frame_without_writing_it() {
+        let (bpm, _dir) = crate::testing::bpm(1);
+        let page_id = bpm.new_page().unwrap().page_id().unwrap();
+        assert_eq!(bpm.live_page_count(), 1);
+
+        bpm.delete_page(page_id).unwrap();
+
+        assert_eq!(bpm.live_page_count(), 0);
+        assert!(!bpm.is_resident(page_id));
+        {
+            let meta = bpm.meta.lock();
+            assert_eq!(
+                meta.free_list,
+                vec![0],
+                "the frame went back to the free list"
+            );
+            assert_eq!(
+                meta.replacer.size(),
+                0,
+                "the replacer still tracks the frame"
+            );
+        }
+        assert!(
+            matches!(bpm.read_page(page_id), Err(BpmError::Io(_))),
+            "a deleted page that was never written has nothing on disk to read"
+        );
+        let next = bpm.new_page().unwrap().page_id().unwrap();
+        assert_ne!(next, page_id, "page ids are not reused");
+    }
+
+    #[test]
+    fn deleting_an_evicted_page_frees_it_on_disk() {
+        let (bpm, _dir) = crate::testing::bpm(1);
+        let evicted = bpm.new_page().unwrap().page_id().unwrap();
+        let resident = bpm.new_page().unwrap().page_id().unwrap();
+        assert!(!bpm.is_resident(evicted), "setup expected an eviction");
+
+        bpm.delete_page(evicted).unwrap();
+
+        assert_eq!(bpm.live_page_count(), 1);
+        assert!(bpm.is_resident(resident));
+        assert!(matches!(bpm.read_page(evicted), Err(BpmError::Io(_))));
+    }
+
+    #[test]
+    fn deleting_a_pinned_or_unknown_page_fails_and_changes_nothing() {
+        let (bpm, _dir) = crate::testing::bpm(2);
+        let guard = bpm.new_page().unwrap();
+        let pinned = guard.page_id().unwrap();
+        assert!(matches!(
+            bpm.delete_page(pinned),
+            Err(BpmError::PagePinned { page_id }) if page_id == pinned
+        ));
+        drop(guard);
+        assert!(bpm.is_resident(pinned));
+
+        bpm.delete_page(pinned).unwrap();
+        for missing in [pinned, 99] {
+            assert!(matches!(
+                bpm.delete_page(missing),
+                Err(BpmError::NoSuchPage { page_id }) if page_id == missing
+            ));
+        }
+        assert_eq!(bpm.live_page_count(), 0);
+    }
 
     #[test]
     fn allocated_page_count_counts_new_pages_without_allocating() {

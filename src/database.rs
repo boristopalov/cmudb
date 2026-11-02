@@ -8,7 +8,9 @@ use crate::create_buffer_pool_manager;
 use crate::disk::{DiskManager, DiskScheduler};
 use crate::parser::{Binder, BinderError};
 use crate::planner::{Planner, PlannerError};
-use crate::processor::executor::{ExecutorContext, ExecutorError, collect_rows, rows_affected};
+use crate::processor::executor::{
+    DEFAULT_SORT_MEMORY_BUDGET_BYTES, ExecutorContext, ExecutorError, collect_rows, rows_affected,
+};
 use crate::processor::executor_factory::create_executor;
 use crate::processor::plan::Plan;
 use crate::replacer::ArcReplacer;
@@ -200,6 +202,7 @@ pub struct Database {
     bpm: Arc<BufferPoolManager>,
     txn_mgr: Arc<TransactionManager>,
     session: Mutex<Session>,
+    sort_memory_budget_bytes: usize,
     _dir: Option<TempDir>,
 }
 
@@ -224,7 +227,18 @@ impl Database {
             txn_mgr: Arc::new(TransactionManager::new(bpm.clone())),
             bpm,
             session: Mutex::new(None),
+            sort_memory_budget_bytes: DEFAULT_SORT_MEMORY_BUDGET_BYTES,
             _dir: None,
+        }
+    }
+
+    /// The same database with `ORDER BY` sorting up to `bytes` of tuple data in memory and
+    /// spilling sorted runs to scratch pages past that. Defaults to
+    /// [`DEFAULT_SORT_MEMORY_BUDGET_BYTES`].
+    pub fn with_sort_memory_budget(self, bytes: usize) -> Self {
+        Self {
+            sort_memory_budget_bytes: bytes,
+            ..self
         }
     }
 
@@ -353,7 +367,8 @@ impl Database {
             self.bpm.clone(),
             txn.clone(),
             self.txn_mgr.clone(),
-        );
+        )
+        .with_sort_memory_budget(self.sort_memory_budget_bytes);
         let mut exec = create_executor(&ctx, plan);
         exec.open()?;
         let result = match plan {

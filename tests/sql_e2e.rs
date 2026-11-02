@@ -3,6 +3,7 @@
 mod common;
 
 use cmudb::catalog::Value;
+use cmudb::processor::plan::Plan;
 use common::*;
 
 fn emp_db() -> Db {
@@ -266,6 +267,92 @@ fn order_by_nulls_option_applies_per_key() {
     assert_eq!(
         ints(&db.exec("SELECT id FROM emp ORDER BY active NULLS FIRST, bonus DESC NULLS LAST")),
         vec![[4], [2], [1], [3]]
+    );
+}
+
+const SPILL_TEST_ROWS: i32 = 600;
+const SPILL_TEST_BUDGET_BYTES: usize = 256;
+const SPILL_TEST_FRAMES: usize = 32;
+
+fn spill_test_rows(db: &Db) {
+    db.exec("CREATE TABLE s (id INTEGER, k INTEGER, v INTEGER)");
+    let values: Vec<String> = (0..SPILL_TEST_ROWS)
+        .map(|id| {
+            let k = if id % 11 == 0 {
+                "NULL".to_string()
+            } else {
+                ((id * 37) % 50).to_string()
+            };
+            format!("({id}, {k}, {})", (id * 13) % 7)
+        })
+        .collect();
+    db.exec(&format!("INSERT INTO s VALUES {}", values.join(", ")));
+}
+
+#[test]
+fn order_by_past_the_sort_memory_budget_spills_and_matches_the_in_memory_sort() {
+    let in_memory = Db::new(SPILL_TEST_FRAMES);
+    let spilling = Db::with_sort_memory_budget(SPILL_TEST_FRAMES, SPILL_TEST_BUDGET_BYTES);
+    spill_test_rows(&in_memory);
+    spill_test_rows(&spilling);
+
+    for sql in [
+        "SELECT id FROM s ORDER BY k",
+        "SELECT id, k, v FROM s ORDER BY k DESC, v",
+        "SELECT id FROM s ORDER BY k NULLS FIRST, v DESC",
+        "SELECT id FROM s ORDER BY k ASC NULLS LAST, id DESC",
+        "SELECT id FROM s ORDER BY k DESC NULLS FIRST, v",
+        "SELECT id FROM s ORDER BY k DESC NULLS LAST, v DESC",
+        "SELECT id FROM s ORDER BY v DESC, k LIMIT 25",
+    ] {
+        let pages_before = spilling.bpm().allocated_page_count();
+        let live_before = spilling.bpm().live_page_count();
+
+        let spilled = spilling.exec(sql);
+
+        assert!(
+            spilling.bpm().allocated_page_count() > pages_before,
+            "{sql}: the sort did not spill"
+        );
+        assert_eq!(
+            spilling.bpm().live_page_count(),
+            live_before,
+            "{sql}: spilled runs were not freed"
+        );
+        assert_eq!(
+            nullable_ints(&spilled),
+            nullable_ints(&in_memory.exec(sql)),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn order_by_within_the_sort_memory_budget_allocates_no_pages() {
+    let db = Db::new(SPILL_TEST_FRAMES);
+    spill_test_rows(&db);
+    let pages_before = db.bpm().allocated_page_count();
+    let ids: Vec<i32> = ints(&db.exec("SELECT id FROM s ORDER BY id DESC"))
+        .into_iter()
+        .map(|r| r[0])
+        .collect();
+    assert_eq!(ids.first(), Some(&(SPILL_TEST_ROWS - 1)));
+    assert_eq!(db.bpm().allocated_page_count(), pages_before);
+}
+
+#[test]
+fn order_by_plans_an_external_merge_sort() {
+    let db = emp_db();
+    let plan = db.plan_of("SELECT id FROM emp ORDER BY salary DESC LIMIT 2");
+    let Plan::Limit(limit) = plan else {
+        panic!("expected LIMIT at the top");
+    };
+    let Plan::Projection(projection) = *limit.child else {
+        panic!("expected a projection under LIMIT");
+    };
+    assert!(
+        matches!(*projection.child, Plan::ExternalMergeSort(_)),
+        "ORDER BY is not planned as an external merge sort"
     );
 }
 

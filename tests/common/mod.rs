@@ -31,6 +31,16 @@ impl Db {
         }
     }
 
+    /// A [`Db::new`] database whose `ORDER BY` spills sorted runs once its input passes
+    /// `bytes` of tuple data.
+    pub fn with_sort_memory_budget(num_frames: usize, bytes: usize) -> Self {
+        Self {
+            db: Database::scratch(num_frames)
+                .expect("temporary database")
+                .with_sort_memory_budget(bytes),
+        }
+    }
+
     /// Runs every statement in `sql` and returns the rows of the last one.
     /// DML statements return a single row holding the affected-row count.
     pub fn try_exec(&self, sql: &str) -> Result<Vec<Row>, String> {

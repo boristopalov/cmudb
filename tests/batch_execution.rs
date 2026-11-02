@@ -9,7 +9,9 @@
 use cmudb::buffer_pool::BufferPoolManager;
 use cmudb::catalog::{Catalog, DataType, IndexType, Schema, Value};
 use cmudb::concurrency::{IsolationLevel, TransactionManager};
-use cmudb::processor::executor::{ExecutorContext, RowCursor, rows_affected};
+use cmudb::processor::executor::{
+    DEFAULT_SORT_MEMORY_BUDGET_BYTES, ExecutorContext, RowCursor, rows_affected,
+};
 use cmudb::processor::executor_factory::create_executor_with_batch_size;
 use cmudb::processor::plan::{
     AggType, AggregationPlanNode, ColIdx, ColumnAssignment, DeletePlanNode, Expression,
@@ -218,7 +220,16 @@ fn setup() -> Env {
 /// Runs `plan` with the given batch size, checking the batch contract along the way, and
 /// returns the decoded rows in the order they were produced.
 fn run(env: &Env, plan: &Plan, batch_size: usize) -> Rows {
-    let ctx = env.ctx();
+    run_with_sort_budget(env, plan, batch_size, DEFAULT_SORT_MEMORY_BUDGET_BYTES)
+}
+
+fn run_with_sort_budget(
+    env: &Env,
+    plan: &Plan,
+    batch_size: usize,
+    sort_memory_budget_bytes: usize,
+) -> Rows {
+    let ctx = env.ctx().with_sort_memory_budget(sort_memory_budget_bytes);
     let mut exec = create_executor_with_batch_size(&ctx, plan, batch_size);
     exec.open().expect("open");
     let schema = exec.schema().clone();
@@ -260,8 +271,24 @@ fn sorted(mut rows: Rows) -> Rows {
 /// Runs `plan` at every batch size and asserts that all runs produce `expected`.
 /// When `ordered` is false the comparison ignores row order.
 fn assert_all_batch_sizes(env: &Env, plan: &Plan, expected: &Rows, ordered: bool) {
+    assert_all_batch_sizes_with_sort_budget(
+        env,
+        plan,
+        expected,
+        ordered,
+        DEFAULT_SORT_MEMORY_BUDGET_BYTES,
+    );
+}
+
+fn assert_all_batch_sizes_with_sort_budget(
+    env: &Env,
+    plan: &Plan,
+    expected: &Rows,
+    ordered: bool,
+    sort_memory_budget_bytes: usize,
+) {
     for bs in BATCH_SIZES {
-        let got = run(env, plan, bs);
+        let got = run_with_sort_budget(env, plan, bs, sort_memory_budget_bytes);
         if ordered {
             assert_eq!(&got, expected, "batch size {bs}");
         } else {
@@ -434,7 +461,22 @@ fn sorts_emit_in_order_across_batches() {
         order_by_exprs: order_by,
     });
     assert_all_batch_sizes(&env, &external, &expected, true);
+
+    let pages_before = env.bpm.allocated_page_count();
+    let live_before = env.bpm.live_page_count();
+    assert_all_batch_sizes_with_sort_budget(&env, &external, &expected, true, SPILL_EVERY_ROW);
+    assert!(
+        env.bpm.allocated_page_count() > pages_before,
+        "the external sort did not spill"
+    );
+    assert_eq!(
+        env.bpm.live_page_count(),
+        live_before,
+        "spilled runs outlived the sort"
+    );
 }
+
+const SPILL_EVERY_ROW: usize = 0;
 
 #[test]
 fn window_function_output_spans_batches() {
