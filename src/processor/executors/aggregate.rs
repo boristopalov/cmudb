@@ -5,7 +5,7 @@ use crate::processor::executors::{ExprKey, eval_key, not_opened, take_batch};
 use crate::processor::plan::{
     AggType, AggregationPlanNode, Arithmetic, Expression, SortExpr, WindowFunctionPlanNode,
 };
-use crate::table_heap::{RecordId, Tuple};
+use crate::table_heap::Tuple;
 use std::collections::HashMap;
 use std::collections::hash_map::IntoIter;
 use std::vec::IntoIter as VecIter;
@@ -65,7 +65,7 @@ impl<'a> Executor for AggregationExecutor<'a> {
         for (key, state) in iter.by_ref().take(self.batch_size) {
             let mut out = key.0;
             state.append_values(&mut out)?;
-            rows.push((self.plan.schema.encode_tuple(&out)?, RecordId::RESERVED));
+            rows.push((self.plan.schema.encode_tuple(&out)?, None));
         }
         Ok(Batch::from_rows(rows))
     }
@@ -242,7 +242,7 @@ impl<'a> Executor for WindowFunctionExecutor<'a> {
             .iter
             .as_mut()
             .ok_or_else(|| not_opened("WindowFunctionExecutor"))?;
-        let mut rows = iter.by_ref().map(|tup| (tup, RecordId::RESERVED));
+        let mut rows = iter.by_ref().map(|tup| (tup, None));
         Ok(take_batch(&mut rows, self.batch_size))
     }
 

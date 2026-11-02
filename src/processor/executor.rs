@@ -25,6 +25,8 @@ pub enum ExecutorError {
     ColumnRead { col: u32, source: CatalogError },
     /// `next_batch` ran before `open`.
     NotOpened { executor: &'static str },
+    /// An UPDATE or DELETE got an input row that maps back to no table slot.
+    NoRecordId { executor: &'static str },
     /// AND, OR or a filter got an operand other than a BOOLEAN or NULL.
     NotBoolean { value: Value },
     /// A comparison between values of types that do not compare.
@@ -73,6 +75,9 @@ impl fmt::Display for ExecutorError {
             }
             ExecutorError::NotOpened { executor } => {
                 write!(f, "{executor}::next_batch called before open")
+            }
+            ExecutorError::NoRecordId { executor } => {
+                write!(f, "{executor} got a row with no record id to write")
             }
             ExecutorError::NotBoolean { value } => {
                 write!(f, "expected a BOOLEAN operand, got {value:?}")
@@ -184,9 +189,9 @@ pub const DEFAULT_BATCH_SIZE: usize = 1024;
 /// Default for [`ExecutorContext::sort_memory_budget_bytes`].
 pub const DEFAULT_SORT_MEMORY_BUDGET_BYTES: usize = 5_000 * PAGE_SIZE;
 
-/// A single row flowing through the executor tree, with the record id it came from, or
-/// [`RecordId::RESERVED`] for rows that do not map back to a table slot.
-pub type Row = (Tuple, RecordId);
+/// A single row flowing through the executor tree, with the record id of the table slot it
+/// came from, or `None` for rows that do not map back to one.
+pub type Row = (Tuple, Option<RecordId>);
 
 /// A batch of rows passed between executors. Batching spreads the per-call cost of the
 /// pull model (dynamic dispatch, `Option`/`Result` wrapping, state checks) over many rows.
@@ -364,6 +369,12 @@ mod tests {
                     executor: "SeqScanExecutor",
                 },
                 "SeqScanExecutor::next_batch called before open",
+            ),
+            (
+                ExecutorError::NoRecordId {
+                    executor: "DeleteExecutor",
+                },
+                "DeleteExecutor got a row with no record id to write",
             ),
             (
                 ExecutorError::IntegerOverflow {

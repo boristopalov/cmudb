@@ -13,7 +13,7 @@ use crate::processor::plan::{
     Expression, HashJoinPlanNode, InputRow, JoinPredicate, JoinRow, JoinType,
     NestedIndexJoinPlanNode, NestedLoopJoinPlanNode,
 };
-use crate::table_heap::{RecordId, TableHeapIterator, Tuple};
+use crate::table_heap::{TableHeapIterator, Tuple};
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Bound;
@@ -133,7 +133,7 @@ impl<'a> Executor for NestedLoopJoinExecutor<'a> {
                 if is_true(predicate_result) {
                     self.left_matched = true;
                     let row = joined_row(left_schema, lt, right_schema, Some(rt))?;
-                    out.push((self.plan.schema.encode_tuple(&row)?, RecordId::RESERVED));
+                    out.push((self.plan.schema.encode_tuple(&row)?, None));
                 }
             }
 
@@ -143,7 +143,7 @@ impl<'a> Executor for NestedLoopJoinExecutor<'a> {
             }
             if matches!(self.plan.join_type, JoinType::Left) && !self.left_matched {
                 let row = joined_row(left_schema, lt, right_schema, None)?;
-                out.push((self.plan.schema.encode_tuple(&row)?, RecordId::RESERVED));
+                out.push((self.plan.schema.encode_tuple(&row)?, None));
             }
             self.curr_left = None;
         }
@@ -258,7 +258,7 @@ impl<'a> Executor for NestedIndexJoinExecutor<'a> {
                     continue;
                 };
                 let row = joined_row(child_schema, outer, &table.schema, Some(&inner_tuple))?;
-                out.push((self.plan.schema.encode_tuple(&row)?, RecordId::RESERVED));
+                out.push((self.plan.schema.encode_tuple(&row)?, None));
                 self.left_matched = true;
             }
             if !inner_finished {
@@ -267,7 +267,7 @@ impl<'a> Executor for NestedIndexJoinExecutor<'a> {
 
             if matches!(self.plan.join_type, JoinType::Left) && !self.left_matched {
                 let row = joined_row(child_schema, outer, &table.schema, None)?;
-                out.push((self.plan.schema.encode_tuple(&row)?, RecordId::RESERVED));
+                out.push((self.plan.schema.encode_tuple(&row)?, None));
             }
             self.curr_left = None;
             self.inner_matches = None;
@@ -423,7 +423,7 @@ impl<'a> Executor for HashJoinExecutor<'a> {
                 let Some(tup) = self.matches_buffer.pop_front() else {
                     break;
                 };
-                out.push((tup, RecordId::RESERVED));
+                out.push((tup, None));
             }
             if out.len() >= self.batch_size {
                 break;

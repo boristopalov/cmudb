@@ -20,7 +20,7 @@ use crate::buffer_pool::BufferPoolManager;
 use crate::catalog::{Schema, Value};
 use crate::processor::executor::{Batch, ExecutorError, Row};
 use crate::processor::plan::Expression;
-use crate::table_heap::{FreeError, RecordId, TableHeap, TableHeapError, TableHeapIterator, Tuple};
+use crate::table_heap::{FreeError, TableHeap, TableHeapError, TableHeapIterator, Tuple};
 use log::warn;
 use std::sync::Arc;
 /// Pulls up to `batch_size` rows from a fallible row iterator.
@@ -49,7 +49,7 @@ where
 
 /// A batch holding only `tuple`, which maps back to no table slot.
 fn single_row(tuple: Tuple) -> Option<Batch> {
-    Batch::from_rows(vec![(tuple, RecordId::RESERVED)])
+    Batch::from_rows(vec![(tuple, None)])
 }
 
 fn not_opened(executor: &'static str) -> ExecutorError {

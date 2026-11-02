@@ -4,7 +4,7 @@ use crate::concurrency::mvcc;
 use crate::processor::executor::{Batch, Executor, ExecutorContext, ExecutorError};
 use crate::processor::executors::not_opened;
 use crate::processor::plan::{IndexScanPlanNode, SeqScanPlanNode, ValuesPlanNode};
-use crate::table_heap::{RecordId, TableHeapIterator, Tuple};
+use crate::table_heap::{TableHeapIterator, Tuple};
 use std::sync::Arc;
 
 pub struct SeqScanExecutor<'a> {
@@ -45,7 +45,7 @@ impl<'a> Executor for SeqScanExecutor<'a> {
         while rows.len() < self.batch_size {
             let next = iter.next_with(|rid, meta, bytes| {
                 mvcc::visible_version(txn, txn_mgr, rid, meta, bytes)
-                    .map(|data| (Tuple { data }, rid))
+                    .map(|data| (Tuple { data }, Some(rid)))
             });
             match next {
                 Some(row) => rows.push(row?),
@@ -95,7 +95,7 @@ impl<'a> Executor for ValuesExecutor<'a> {
                 .iter()
                 .map(|e| e.evaluate(&no_input_row, &no_input_columns))
                 .collect::<Result<Vec<Option<Value>>, ExecutorError>>()?;
-            rows.push((self.plan.schema.encode_tuple(&vals)?, RecordId::RESERVED));
+            rows.push((self.plan.schema.encode_tuple(&vals)?, None));
         }
         self.cursor = end;
         Ok(Batch::from_rows(rows))
@@ -186,7 +186,7 @@ impl<'a> Executor for IndexScanExecutor<'a> {
                 &key,
                 rid,
             )? {
-                rows.push((tuple, rid));
+                rows.push((tuple, Some(rid)));
             }
         }
         Ok(Batch::from_rows(rows))

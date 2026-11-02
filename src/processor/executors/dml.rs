@@ -124,6 +124,9 @@ impl<'a> Executor for UpdateExecutor<'a> {
         let indexes = self.ctx.catalog.get_table_indexes(self.plan.table_oid)?;
         let mut out = Vec::with_capacity(batch.len());
         for (tuple_to_update, rid) in batch {
+            let rid = rid.ok_or(ExecutorError::NoRecordId {
+                executor: "UpdateExecutor",
+            })?;
             let mut new_values = row_values(schema, &tuple_to_update)?;
             for assignment in &self.plan.assignments {
                 new_values[assignment.col_idx.index()] =
@@ -140,7 +143,7 @@ impl<'a> Executor for UpdateExecutor<'a> {
                 &tuple_to_update,
                 &new_tuple,
             )?;
-            out.push((new_tuple, rid));
+            out.push((new_tuple, Some(rid)));
         }
         Ok(Batch::from_rows(out))
     }
@@ -196,7 +199,10 @@ impl<'a> Executor for DeleteExecutor<'a> {
         };
 
         for (_, rid) in batch.iter() {
-            mvcc::delete_tuple(&self.ctx.txn, &self.ctx.txn_mgr, &table.heap, *rid)?;
+            let rid = rid.ok_or(ExecutorError::NoRecordId {
+                executor: "DeleteExecutor",
+            })?;
+            mvcc::delete_tuple(&self.ctx.txn, &self.ctx.txn_mgr, &table.heap, rid)?;
         }
         Ok(Some(batch))
     }
@@ -207,5 +213,70 @@ impl<'a> Executor for DeleteExecutor<'a> {
 
     fn close(&mut self) -> Result<(), ExecutorError> {
         self.child.close()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::concurrency::{IsolationLevel, TransactionManager};
+    use crate::processor::executors::test_support::*;
+    use crate::processor::plan::{ColIdx, ColumnAssignment};
+
+    #[test]
+    fn update_and_delete_refuse_input_rows_with_no_record_id() {
+        let (catalog, bpm, _dir) = crate::testing::catalog(16);
+        let schema = int_schema(&["a"]);
+        let table_oid = catalog
+            .create_table("t".to_string(), schema.clone())
+            .expect("create table");
+        let txn_mgr = Arc::new(TransactionManager::new(bpm.clone()));
+        let ctx = ExecutorContext::new(
+            &catalog,
+            bpm,
+            txn_mgr.begin(IsolationLevel::SnapshotIsolation),
+            txn_mgr.clone(),
+        );
+        let rows = values_plan(&schema, &[&[1]]);
+
+        let update = UpdatePlanNode {
+            schema: schema.clone(),
+            assignments: vec![ColumnAssignment {
+                col_idx: ColIdx(0),
+                value: col(0),
+            }],
+            child: Box::new(values_plan(&schema, &[])),
+            table_oid,
+        };
+        let mut exec = UpdateExecutor::new(&ctx, &update, values_child(&rows));
+        exec.open().expect("open");
+        let err = exec.next_batch().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ExecutorError::NoRecordId {
+                    executor: "UpdateExecutor"
+                }
+            ),
+            "{err:?}"
+        );
+
+        let delete = DeletePlanNode {
+            schema: schema.clone(),
+            child: Box::new(values_plan(&schema, &[])),
+            table_oid,
+        };
+        let mut exec = DeleteExecutor::new(&ctx, &delete, values_child(&rows));
+        exec.open().expect("open");
+        let err = exec.next_batch().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ExecutorError::NoRecordId {
+                    executor: "DeleteExecutor"
+                }
+            ),
+            "{err:?}"
+        );
     }
 }

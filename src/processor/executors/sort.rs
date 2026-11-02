@@ -5,7 +5,7 @@ use crate::processor::executors::{SpillHeap, fill_batch, not_opened, take_batch}
 use crate::processor::plan::{
     ExternalMergeSortPlanNode, NullOrdering, SortDirection, SortExpr, SortPlanNode,
 };
-use crate::table_heap::{RecordId, TableHeapIterator, Tuple};
+use crate::table_heap::{TableHeapIterator, Tuple};
 use std::sync::Arc;
 use std::vec::IntoIter as VecIter;
 
@@ -281,8 +281,8 @@ impl<'a> Executor for ExternalMergeSortExecutor<'a> {
         Ok(())
     }
 
-    /// Yields the sorted rows with [`RecordId::RESERVED`], since a sort's rows map back to no
-    /// single table slot.
+    /// Yields the sorted rows with no record id, since a sort's rows map back to no single
+    /// table slot.
     fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
         let output = self
             .output
@@ -290,13 +290,11 @@ impl<'a> Executor for ExternalMergeSortExecutor<'a> {
             .ok_or_else(|| not_opened("ExternalMergeSortExecutor"))?;
         match output {
             SortedOutput::InMemory(rows) => Ok(take_batch(
-                &mut rows.by_ref().map(|t| (t, RecordId::RESERVED)),
+                &mut rows.by_ref().map(|t| (t, None)),
                 self.batch_size,
             )),
             SortedOutput::Spilled { iter, .. } => {
-                let mut rows = iter
-                    .by_ref()
-                    .map(|item| item.map(|(tup, _)| (tup, RecordId::RESERVED)));
+                let mut rows = iter.by_ref().map(|item| item.map(|(tup, _)| (tup, None)));
                 fill_batch(&mut rows, self.batch_size)
             }
         }
