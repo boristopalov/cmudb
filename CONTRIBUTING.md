@@ -21,7 +21,7 @@ first use. Lint levels live in `Cargo.toml` under `[lints]`, so a plain
 
 The randomized soak tests take their seed from `CMUDB_SEED` (a fixed default
 when unset) and print it when they fail; rerun with `CMUDB_SEED=<seed>` to
-replay the same operations.
+replay the same operations in each thread (thread interleaving still varies).
 
 CI type-checks the benchmarks in `benches/` but never runs them. To run each bench once
 without timing it, including the checks it makes on its results:

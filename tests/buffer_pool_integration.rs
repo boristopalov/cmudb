@@ -7,7 +7,7 @@ use cmudb::buffer_pool::{BpmError, BufferPoolManager};
 use cmudb::create_buffer_pool_manager;
 use cmudb::disk::{DiskManager, DiskScheduler};
 use cmudb::replacer::ArcReplacer;
-use common::seed::{seed_from_env, stream_rng};
+use common::seed::{Stream, stream_rng, with_seed};
 use env_logger::Env;
 use parking_lot::RwLock;
 use rand::Rng;
@@ -306,16 +306,18 @@ fn test_eviction() {
 
 #[test]
 fn soak_randomized_workload_with_more_pages_than_frames() {
+    with_seed(run_buffer_pool_soak);
+}
+
+fn run_buffer_pool_soak(seed: u64) {
     const NUM_FRAMES: usize = 66;
     const NUM_PAGES: usize = 100;
     const THREADS: usize = 20;
     const OPS_PER_THREAD: usize = 5000;
 
-    let report = seed_from_env();
-    let seed = report.seed();
     let (bpm, _tmp) = make_bpm(NUM_FRAMES);
 
-    let mut setup_rng = stream_rng(seed, THREADS as u64);
+    let mut setup_rng = stream_rng(seed, Stream::Setup);
     let mut expected = Vec::with_capacity(NUM_PAGES);
     for _ in 0..NUM_PAGES {
         let val = setup_rng.random::<u8>();
@@ -335,7 +337,7 @@ fn soak_randomized_workload_with_more_pages_than_frames() {
         let expected = expected.clone();
         let barrier = start_barrier.clone();
         let handle = thread::spawn(move || {
-            let mut rng = stream_rng(seed, t as u64);
+            let mut rng = stream_rng(seed, Stream::Worker(t));
             barrier.wait();
             for _ in 0..OPS_PER_THREAD {
                 let page_id = rng.random_range(0..NUM_PAGES);

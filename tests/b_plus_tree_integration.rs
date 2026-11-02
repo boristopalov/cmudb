@@ -11,7 +11,7 @@ use cmudb::index::BPlusTree;
 use cmudb::index::Index;
 use cmudb::replacer::ArcReplacer;
 use cmudb::table_heap::RecordId;
-use common::seed::{seed_from_env, stream_rng};
+use common::seed::{Stream, stream_rng, with_seed};
 use env_logger::Env;
 use rand::Rng;
 use tempfile::tempdir;
@@ -86,6 +86,10 @@ fn b_plus_tree_single_thread() {
 
 #[test]
 fn b_plus_tree_soak_concurrent() {
+    with_seed(run_b_plus_tree_soak);
+}
+
+fn run_b_plus_tree_soak(seed: u64) {
     let num_frames = 50;
     let key_len = 128;
     let threads = 20;
@@ -93,8 +97,6 @@ fn b_plus_tree_soak_concurrent() {
     let key_space = 256;
     let max_pages = 100;
 
-    let report = seed_from_env();
-    let seed = report.seed();
     let (bpm, _tmp) = make_bpm(num_frames);
     let tree = Arc::new(BPlusTree::new("idx".to_string(), key_len as u32, bpm.clone()).unwrap());
     assert_eq!(tree.header_page_id, 0);
@@ -106,7 +108,7 @@ fn b_plus_tree_soak_concurrent() {
         let tree = tree.clone();
         let barrier = barrier.clone();
         handles.push(thread::spawn(move || {
-            let mut rng = stream_rng(seed, t as u64);
+            let mut rng = stream_rng(seed, Stream::Worker(t));
             barrier.wait();
 
             for op_i in 0..ops_per_thread {

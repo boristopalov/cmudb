@@ -21,15 +21,9 @@ pub fn parse_seed(value: Option<&str>) -> Result<u64, String> {
     }
 }
 
-/// Prints the seed to stderr when the test panics while this guard is alive.
-pub struct SeedReport {
+/// Prints the seed to stderr when dropped during a panic.
+struct SeedReport {
     seed: u64,
-}
-
-impl SeedReport {
-    pub fn seed(&self) -> u64 {
-        self.seed
-    }
 }
 
 impl Drop for SeedReport {
@@ -43,20 +37,38 @@ impl Drop for SeedReport {
     }
 }
 
-/// Reads the run's seed from `CMUDB_SEED` and returns a guard that prints it on failure.
+/// Reads the run's seed from `CMUDB_SEED` (or `DEFAULT_SEED`), runs `test` with it,
+/// and prints the seed to stderr if `test` panics.
 /// Panics when the variable is set to something other than a `u64`.
-pub fn seed_from_env() -> SeedReport {
+pub fn with_seed<R>(test: impl FnOnce(u64) -> R) -> R {
     let value = match std::env::var(SEED_ENV) {
         Ok(text) => Some(text),
         Err(VarError::NotPresent) => None,
         Err(VarError::NotUnicode(raw)) => panic!("{SEED_ENV}={raw:?} is not valid UTF-8"),
     };
     let seed = parse_seed(value.as_deref()).unwrap_or_else(|e| panic!("{e}"));
-    SeedReport { seed }
+    let _report = SeedReport { seed };
+    test(seed)
 }
 
-/// Returns an RNG for one numbered stream of the run, such as one worker thread.
-/// Equal seeds and stream numbers give equal sequences.
-pub fn stream_rng(seed: u64, stream: u64) -> StdRng {
-    StdRng::seed_from_u64(seed ^ stream.wrapping_add(1).wrapping_mul(STREAM_MIX))
+/// One independent random sequence within a seeded run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stream {
+    Setup,
+    Worker(usize),
+}
+
+impl Stream {
+    fn index(self) -> u64 {
+        match self {
+            Stream::Setup => 0,
+            Stream::Worker(worker) => worker as u64 + 1,
+        }
+    }
+}
+
+/// Returns the RNG for one stream of the run. Equal seeds and streams give equal sequences,
+/// and distinct streams of one seed give distinct sequences.
+pub fn stream_rng(seed: u64, stream: Stream) -> StdRng {
+    StdRng::seed_from_u64(seed ^ stream.index().wrapping_add(1).wrapping_mul(STREAM_MIX))
 }
