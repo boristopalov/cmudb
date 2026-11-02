@@ -19,35 +19,137 @@ use crate::table_heap::{FreeError, RecordId, TableHeap, TableHeapError, TableHea
 use log::warn;
 use std::collections::hash_map::IntoIter;
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Bound;
 use std::sync::Arc;
 use std::vec::IntoIter as VecIter;
 
+/// Why an executor failed.
 #[derive(Debug)]
-pub struct ExecutorError(pub String);
+pub enum ExecutorError {
+    /// A catalog lookup, or encoding or decoding a tuple, failed.
+    Catalog(CatalogError),
+    /// Reading or writing a table heap failed.
+    TableHeap(TableHeapError),
+    /// Reading or writing an index failed.
+    Index(IndexError),
+    /// A versioned read or write was rejected, such as by a write-write conflict.
+    Mvcc(MvccError),
+    /// A column of an input row could not be decoded.
+    ColumnRead { col: u32, source: CatalogError },
+    /// `next_batch` ran before `open`.
+    NotOpened { executor: &'static str },
+    /// AND, OR or a filter got an operand other than a BOOLEAN or NULL.
+    NotBoolean { value: Value },
+    /// A comparison between values of types that do not compare.
+    Incomparable { left: Value, right: Value },
+    /// Arithmetic on a value that is not an INT or a FLOAT.
+    ArithmeticOperands {
+        op: Arithmetic,
+        left: Value,
+        right: Value,
+    },
+    /// INT division by zero.
+    DivisionByZero { dividend: i32 },
+    /// INT arithmetic whose result does not fit an INT.
+    IntegerOverflow {
+        op: Arithmetic,
+        left: i32,
+        right: i32,
+    },
+    /// An INSERT wrote more rows than its INT count column holds.
+    CountOverflow { count: u64 },
+    /// An INSERT executor yielded other than one count row.
+    CountRows { rows: usize },
+    /// An INSERT's count row holds something other than a non-negative INT.
+    BadCount { value: Option<Value> },
+    /// `rows_affected` was given a plan that is not INSERT, UPDATE or DELETE.
+    NotDml,
+    /// An external sort ended with no sorted run.
+    NoSortRuns,
+    /// DROP TABLE without IF EXISTS named a table that does not exist, by oid when the plan
+    /// had one.
+    TableNotFound { oid: Option<u32> },
+    /// DROP INDEX without IF EXISTS named an index that does not exist, by oid when the plan
+    /// had one.
+    IndexNotFound { oid: Option<u32> },
+}
+
+impl fmt::Display for ExecutorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExecutorError::Catalog(e) => write!(f, "catalog error: {e}"),
+            ExecutorError::TableHeap(e) => write!(f, "table heap error: {e}"),
+            ExecutorError::Index(e) => write!(f, "index error: {e}"),
+            ExecutorError::Mvcc(e) => write!(f, "{e}"),
+            ExecutorError::ColumnRead { col, source } => {
+                write!(f, "cannot read column {col}: {source}")
+            }
+            ExecutorError::NotOpened { executor } => {
+                write!(f, "{executor}::next_batch called before open")
+            }
+            ExecutorError::NotBoolean { value } => {
+                write!(f, "expected a BOOLEAN operand, got {value:?}")
+            }
+            ExecutorError::Incomparable { left, right } => {
+                write!(f, "cannot compare {left:?} with {right:?}")
+            }
+            ExecutorError::ArithmeticOperands { op, left, right } => {
+                write!(f, "cannot apply {op:?} to {left:?} and {right:?}")
+            }
+            ExecutorError::DivisionByZero { dividend } => {
+                write!(f, "division by zero: {dividend} / 0")
+            }
+            ExecutorError::IntegerOverflow { op, left, right } => {
+                write!(f, "integer overflow: {op:?} of {left} and {right}")
+            }
+            ExecutorError::CountOverflow { count } => {
+                write!(
+                    f,
+                    "inserted {count} rows, more than the count column can hold"
+                )
+            }
+            ExecutorError::CountRows { rows } => {
+                write!(f, "INSERT yielded {rows} rows instead of one count row")
+            }
+            ExecutorError::BadCount { value } => write!(
+                f,
+                "INSERT count row holds {value:?} instead of a non-negative INT"
+            ),
+            ExecutorError::NotDml => {
+                f.write_str("rows_affected called on a plan that is not INSERT, UPDATE or DELETE")
+            }
+            ExecutorError::NoSortRuns => f.write_str("external sort produced no runs"),
+            ExecutorError::TableNotFound { oid } => missing_drop_target(f, "table", *oid),
+            ExecutorError::IndexNotFound { oid } => missing_drop_target(f, "index", *oid),
+        }
+    }
+}
+
+impl std::error::Error for ExecutorError {}
 
 impl From<CatalogError> for ExecutorError {
     fn from(e: CatalogError) -> Self {
-        ExecutorError(format!("catalog error: {e}"))
+        ExecutorError::Catalog(e)
     }
 }
 
 impl From<TableHeapError> for ExecutorError {
     fn from(e: TableHeapError) -> Self {
-        ExecutorError(format!("table heap error: {e}"))
+        ExecutorError::TableHeap(e)
     }
 }
 
 impl From<IndexError> for ExecutorError {
     fn from(e: IndexError) -> Self {
-        ExecutorError(format!("index error: {e}"))
+        ExecutorError::Index(e)
     }
 }
 
 impl From<MvccError> for ExecutorError {
     fn from(e: MvccError) -> Self {
-        ExecutorError(e.to_string())
+        ExecutorError::Mvcc(e)
     }
 }
 
@@ -230,8 +332,8 @@ fn single_row(tuple: Tuple) -> Option<Batch> {
     Batch::from_rows(vec![(tuple, RecordId::RESERVED)])
 }
 
-fn not_opened(executor: &str) -> ExecutorError {
-    ExecutorError(format!("{executor}::next_batch called before open"))
+fn not_opened(executor: &'static str) -> ExecutorError {
+    ExecutorError::NotOpened { executor }
 }
 
 fn is_true(predicate_result: Option<Value>) -> bool {
@@ -384,11 +486,7 @@ impl<'a> Executor for InsertExecutor<'a> {
         }
 
         self.done = true;
-        let count = i32::try_from(count).map_err(|_| {
-            ExecutorError(format!(
-                "inserted {count} rows, more than the count column can hold"
-            ))
-        })?;
+        let count = i32::try_from(count).map_err(|_| ExecutorError::CountOverflow { count })?;
         let count_row = self.count_schema.encode_tuple(&[Some(Value::INT(count))])?;
         Ok(single_row(count_row))
     }
@@ -417,17 +515,14 @@ pub fn rows_affected(plan: &Plan, exec: &mut dyn Executor) -> Result<u64, Execut
         Plan::Insert(_) => {
             let rows = collect_rows(exec)?;
             let [(count_row, _)] = rows.as_slice() else {
-                return Err(ExecutorError(format!(
-                    "INSERT yielded {} rows instead of one count row",
-                    rows.len()
-                )));
+                return Err(ExecutorError::CountRows { rows: rows.len() });
             };
-            match exec.schema().get_value(count_row, 0)? {
-                Some(Value::INT(n)) => u64::try_from(n)
-                    .map_err(|_| ExecutorError(format!("INSERT reported a negative count {n}"))),
-                other => Err(ExecutorError(format!(
-                    "INSERT count row holds {other:?} instead of an INT"
-                ))),
+            let value = exec.schema().get_value(count_row, 0)?;
+            match value {
+                Some(Value::INT(n)) => {
+                    u64::try_from(n).map_err(|_| ExecutorError::BadCount { value })
+                }
+                _ => Err(ExecutorError::BadCount { value }),
             }
         }
         Plan::Update(_) | Plan::Delete(_) => {
@@ -437,9 +532,7 @@ pub fn rows_affected(plan: &Plan, exec: &mut dyn Executor) -> Result<u64, Execut
             }
             Ok(n)
         }
-        _ => Err(ExecutorError(
-            "rows_affected called on a plan that is not INSERT, UPDATE or DELETE".to_string(),
-        )),
+        _ => Err(ExecutorError::NotDml),
     }
 }
 
@@ -678,9 +771,10 @@ impl<'a> Executor for IndexScanExecutor<'a> {
             .as_ref()
             .ok_or_else(|| not_opened("IndexScanExecutor"))?;
 
-        let index = self.index.as_ref().ok_or_else(|| {
-            ExecutorError("IndexScanExecutor::next_batch called before open".to_string())
-        })?;
+        let index = self
+            .index
+            .as_ref()
+            .ok_or_else(|| not_opened("IndexScanExecutor"))?;
 
         let mut rows = Vec::with_capacity(self.batch_size);
         while rows.len() < self.batch_size {
@@ -1636,8 +1730,7 @@ impl<'a> ExternalMergeSortExecutor<'a> {
             }
             runs = next_runs;
         }
-        runs.pop()
-            .ok_or_else(|| ExecutorError("external sort produced no runs".to_string()))
+        runs.pop().ok_or(ExecutorError::NoSortRuns)
     }
 
     /// Reads the child to the end, spilling a sorted run each time the buffered tuple bytes
@@ -2061,10 +2154,9 @@ impl<'a> Executor for DropTableExecutor<'a> {
             None => false,
         };
         if !dropped && !self.plan.if_exists {
-            return Err(ExecutorError(missing_drop_target(
-                "table",
-                self.plan.table_oid,
-            )));
+            return Err(ExecutorError::TableNotFound {
+                oid: self.plan.table_oid,
+            });
         }
         let tup = self
             .status_schema
@@ -2185,10 +2277,9 @@ impl<'a> Executor for DropIndexExecutor<'a> {
             None => false,
         };
         if !dropped && !self.plan.if_exists {
-            return Err(ExecutorError(missing_drop_target(
-                "index",
-                self.plan.index_oid,
-            )));
+            return Err(ExecutorError::IndexNotFound {
+                oid: self.plan.index_oid,
+            });
         }
         let tup = self
             .status_schema
@@ -2205,11 +2296,11 @@ impl<'a> Executor for DropIndexExecutor<'a> {
     }
 }
 
-/// The error message for a DROP whose `kind` of object (table or index) does not exist.
-fn missing_drop_target(kind: &str, oid: Option<u32>) -> String {
+/// Writes the message for a DROP whose `kind` of object (table or index) does not exist.
+fn missing_drop_target(f: &mut fmt::Formatter<'_>, kind: &str, oid: Option<u32>) -> fmt::Result {
     match oid {
-        Some(oid) => format!("{kind} with oid {oid} does not exist"),
-        None => format!("{kind} does not exist"),
+        Some(oid) => write!(f, "{kind} with oid {oid} does not exist"),
+        None => write!(f, "{kind} does not exist"),
     }
 }
 
@@ -2248,11 +2339,72 @@ mod tests {
     use crate::processor::plan::{ColIdx, Plan};
 
     #[test]
-    fn wrapped_storage_errors_read_as_their_display_text() {
-        let index = ExecutorError::from(IndexError::Insert(InsertError::DuplicateKey));
-        assert_eq!(index.0, "index error: insert failed: key already exists");
-        let heap = ExecutorError::from(TableHeapError::NewPageWithoutId);
-        assert_eq!(heap.0, "table heap error: new page has no page_id");
+    fn executor_errors_display_readable_messages() {
+        let cases = [
+            (
+                ExecutorError::from(IndexError::Insert(InsertError::DuplicateKey)),
+                "index error: insert failed: key already exists",
+            ),
+            (
+                ExecutorError::from(TableHeapError::NewPageWithoutId),
+                "table heap error: new page has no page_id",
+            ),
+            (
+                ExecutorError::from(CatalogError::ColumnOutOfBounds),
+                "catalog error: the column index is past the schema's last column",
+            ),
+            (
+                ExecutorError::ColumnRead {
+                    col: 3,
+                    source: CatalogError::TupleSchemaMismatch,
+                },
+                "cannot read column 3: the tuple does not match the table's schema",
+            ),
+            (
+                ExecutorError::NotOpened {
+                    executor: "SeqScanExecutor",
+                },
+                "SeqScanExecutor::next_batch called before open",
+            ),
+            (
+                ExecutorError::IntegerOverflow {
+                    op: Arithmetic::Mul,
+                    left: i32::MAX,
+                    right: 2,
+                },
+                "integer overflow: Mul of 2147483647 and 2",
+            ),
+            (
+                ExecutorError::CountOverflow { count: 1 << 40 },
+                "inserted 1099511627776 rows, more than the count column can hold",
+            ),
+            (
+                ExecutorError::CountRows { rows: 2 },
+                "INSERT yielded 2 rows instead of one count row",
+            ),
+            (
+                ExecutorError::BadCount {
+                    value: Some(Value::INT(-1)),
+                },
+                "INSERT count row holds Some(INT(-1)) instead of a non-negative INT",
+            ),
+            (ExecutorError::NoSortRuns, "external sort produced no runs"),
+            (
+                ExecutorError::TableNotFound { oid: Some(7) },
+                "table with oid 7 does not exist",
+            ),
+            (
+                ExecutorError::IndexNotFound { oid: Some(8) },
+                "index with oid 8 does not exist",
+            ),
+            (
+                ExecutorError::IndexNotFound { oid: None },
+                "index does not exist",
+            ),
+        ];
+        for (err, message) in cases {
+            assert_eq!(err.to_string(), message, "{err:?}");
+        }
     }
 
     fn int_schema(names: &[&str]) -> Schema {
@@ -2334,7 +2486,7 @@ mod tests {
 
         let err = rows_affected(&plan, &mut *exec).unwrap_err();
 
-        assert!(err.0.contains("not INSERT, UPDATE or DELETE"), "{}", err.0);
+        assert!(matches!(err, ExecutorError::NotDml), "{err:?}");
     }
 
     #[test]
@@ -2619,7 +2771,10 @@ mod tests {
             SPILL_EVERY_ROW,
         );
         let err = exec.open().unwrap_err();
-        assert!(err.0.contains("division by zero"), "{}", err.0);
+        assert!(
+            matches!(err, ExecutorError::DivisionByZero { dividend: 6 }),
+            "{err}"
+        );
         assert!(
             bpm.allocated_page_count() >= 2,
             "the rows before the zero were not spilled"
@@ -2650,7 +2805,10 @@ mod tests {
         };
         let mut sort = SortExecutor::new(&plan, values_child(&rows), DEFAULT_BATCH_SIZE);
         let err = sort.open().unwrap_err();
-        assert!(err.0.contains("division by zero"), "{}", err.0);
+        assert!(
+            matches!(err, ExecutorError::DivisionByZero { .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -2665,7 +2823,10 @@ mod tests {
         };
         let mut agg = AggregationExecutor::new(&plan, values_child(&rows), DEFAULT_BATCH_SIZE);
         let err = agg.open().unwrap_err();
-        assert!(err.0.contains("division by zero"), "{}", err.0);
+        assert!(
+            matches!(err, ExecutorError::DivisionByZero { .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -2744,7 +2905,14 @@ mod tests {
     fn sum_that_overflows_int_is_an_error() {
         let mut sum = AggState::new(&AggType::SUM);
         sum.update(Some(Value::INT(i32::MAX))).unwrap();
-        assert!(sum.update(Some(Value::INT(1))).is_err());
+        assert!(matches!(
+            sum.update(Some(Value::INT(1))).unwrap_err(),
+            ExecutorError::IntegerOverflow {
+                op: Arithmetic::Add,
+                left: i32::MAX,
+                right: 1
+            }
+        ));
     }
 
     #[test]
@@ -2786,7 +2954,15 @@ mod tests {
         };
         let mut agg = AggregationExecutor::new(&agg_plan, values_child(&rows), DEFAULT_BATCH_SIZE);
         let err = agg.next_batch().unwrap_err();
-        assert!(err.0.contains("before open"), "{}", err.0);
+        assert!(
+            matches!(
+                err,
+                ExecutorError::NotOpened {
+                    executor: "AggregationExecutor"
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     fn values_hash_join(left: &[&[i32]], right: &[&[i32]]) -> HashJoinPlanNode {
@@ -2884,7 +3060,15 @@ mod tests {
         let pin = bpm.read_page(first_page).unwrap();
 
         let err = exec.close().unwrap_err();
-        assert!(err.0.contains("pinned"), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                ExecutorError::TableHeap(TableHeapError::Bpm(
+                    crate::buffer_pool::BpmError::PagePinned { page_id }
+                )) if page_id == first_page
+            ),
+            "{err:?}"
+        );
         assert_eq!(
             bpm.live_page_count(),
             1,

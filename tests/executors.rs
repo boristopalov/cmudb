@@ -4,8 +4,11 @@
 //! of tables created through SQL.
 mod common;
 
+use cmudb::QueryError;
+use cmudb::catalog::CatalogError;
 use cmudb::catalog::{DataType, Schema, Value};
 use cmudb::parser::BinderError;
+use cmudb::processor::executor::ExecutorError;
 use cmudb::processor::plan::{
     AggType, ColIdx, CreateIndexPlanNode, DropIndexPlanNode, DropTablePlanNode, Expression,
     ExternalMergeSortPlanNode, HashJoinPlanNode, JoinColumn, JoinType, LimitPlanNode, NullOrdering,
@@ -492,16 +495,17 @@ fn create_index_keys_on_the_columns_its_col_idxs_name() {
         "the index keys on column v"
     );
 
-    let out_of_range = db
-        .run_plan(&Plan::CreateIndex(CreateIndexPlanNode {
-            index_name: "t_bad".to_string(),
-            table_oid,
-            key_columns: vec![ColIdx(2)],
-        }))
-        .unwrap_err();
+    let out_of_range = db.plan_error(&Plan::CreateIndex(CreateIndexPlanNode {
+        index_name: "t_bad".to_string(),
+        table_oid,
+        key_columns: vec![ColIdx(2)],
+    }));
     assert!(
-        out_of_range.contains("the column index is past the schema's last column"),
-        "a key column past the table's last column fails: {out_of_range}"
+        matches!(
+            out_of_range,
+            QueryError::Execute(ExecutorError::Catalog(CatalogError::ColumnOutOfBounds))
+        ),
+        "a key column past the table's last column fails: {out_of_range:?}"
     );
     assert!(db.catalog().index_oid("t", "t_bad").is_err());
 }
@@ -536,7 +540,10 @@ fn drop_index_then_drop_table() {
         index_oid: Some(index_oid),
         if_exists: false,
     });
-    assert!(db.run_plan(&again).is_err());
+    assert!(matches!(
+        db.plan_error(&again),
+        QueryError::Execute(ExecutorError::IndexNotFound { oid }) if oid == Some(index_oid)
+    ));
     let again = Plan::DropIndex(DropIndexPlanNode {
         index_oid: Some(index_oid),
         if_exists: true,
@@ -556,7 +563,10 @@ fn drop_index_then_drop_table() {
         table_oid: Some(table_oid),
         if_exists: false,
     });
-    assert!(db.run_plan(&again).is_err());
+    assert!(matches!(
+        db.plan_error(&again),
+        QueryError::Execute(ExecutorError::TableNotFound { oid }) if oid == Some(table_oid)
+    ));
     let again = Plan::DropTable(DropTablePlanNode {
         table_oid: Some(table_oid),
         if_exists: true,
@@ -580,10 +590,14 @@ fn drop_plans_without_a_target_fail_unless_if_exists() {
             if_exists,
         })
     };
-    let err = db.run_plan(&missing_table(false)).unwrap_err();
-    assert!(err.contains("table does not exist"), "{err}");
-    let err = db.run_plan(&missing_index(false)).unwrap_err();
-    assert!(err.contains("index does not exist"), "{err}");
+    assert!(matches!(
+        db.plan_error(&missing_table(false)),
+        QueryError::Execute(ExecutorError::TableNotFound { oid: None })
+    ));
+    assert!(matches!(
+        db.plan_error(&missing_index(false)),
+        QueryError::Execute(ExecutorError::IndexNotFound { oid: None })
+    ));
     db.run_plan(&missing_table(true)).unwrap();
     db.run_plan(&missing_index(true)).unwrap();
 }
