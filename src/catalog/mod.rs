@@ -264,9 +264,6 @@ pub struct Schema {
     pub data_len: usize,
     /// Size in bytes of the null bitmap that starts every encoded tuple.
     pub bitmap_len: usize,
-    /// For the output schema of a join, the number of leading columns that come from the left
-    /// input; a column reference with `tuple_idx == 1` is offset by it. `None` for other schemas.
-    pub join_offset: Option<usize>,
 }
 
 impl Schema {
@@ -289,7 +286,6 @@ impl Schema {
             cols,
             data_len: offset,
             bitmap_len,
-            join_offset: None,
         }
     }
 
@@ -300,10 +296,14 @@ impl Schema {
             .cols
             .get(col_idx)
             .ok_or(CatalogError::ColumnOutOfBounds)?;
-        if is_null(&tuple.data, col_idx) {
+        if is_null(&tuple.data, col_idx)? {
             return Ok(None);
         }
-        let bytes = &tuple.data[self.bitmap_len..][col.payload_range()];
+        let bytes = tuple
+            .data
+            .get(self.bitmap_len..)
+            .and_then(|payload| payload.get(col.payload_range()))
+            .ok_or(CatalogError::TupleSchemaMismatch)?;
         Ok(Some(Value::decode(bytes, &col.dtype)))
     }
 
@@ -335,9 +335,13 @@ impl Schema {
     }
 }
 
-/// Reads the null bit for `col_idx` from a tuple's bitmap prefix.
-pub fn is_null(data: &[u8], col_idx: usize) -> bool {
-    (data[col_idx / 8] >> (col_idx % 8)) & 1 == 1
+/// Reads the null bit for `col_idx` from a tuple's bitmap prefix. Fails with
+/// [`CatalogError::TupleSchemaMismatch`] when the tuple is too short to hold that bit.
+pub fn is_null(data: &[u8], col_idx: usize) -> Result<bool, CatalogError> {
+    let byte = data
+        .get(col_idx / 8)
+        .ok_or(CatalogError::TupleSchemaMismatch)?;
+    Ok((byte >> (col_idx % 8)) & 1 == 1)
 }
 
 #[derive(Debug, Clone)]
@@ -554,6 +558,23 @@ mod tests {
         assert_eq!(Some(Value::INT(7)), schema.get_value(&tuple, 0).unwrap());
         assert_eq!(None, schema.get_value(&tuple, 1).unwrap());
         assert_eq!(Some(Value::INT(9)), schema.get_value(&tuple, 2).unwrap());
+    }
+
+    #[test]
+    fn get_value_of_a_tuple_shorter_than_its_schema_is_an_error() {
+        let schema = Schema::new(vec![(DataType::INT, "a".to_string())]);
+        assert!(matches!(
+            schema.get_value(&Tuple { data: vec![] }, 0),
+            Err(CatalogError::TupleSchemaMismatch)
+        ));
+        assert!(matches!(
+            schema.get_value(&Tuple { data: vec![0] }, 0),
+            Err(CatalogError::TupleSchemaMismatch)
+        ));
+        assert!(matches!(
+            is_null(&[], 0),
+            Err(CatalogError::TupleSchemaMismatch)
+        ));
     }
 
     #[test]

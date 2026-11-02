@@ -5,7 +5,7 @@ mod common;
 
 use cmudb::catalog::{DataType, Schema, Value};
 use cmudb::processor::plan::{
-    AggType, DropIndexPlanNode, DropTablePlanNode, Expression, ExternalMergeSortPlanNode,
+    AggType, ColIdx, DropIndexPlanNode, DropTablePlanNode, Expression, ExternalMergeSortPlanNode,
     HashJoinPlanNode, JoinType, LimitPlanNode, NullOrdering, Plan, SeqScanPlanNode, SortDirection,
     SortExpr, SortPlanNode, WindowFunctionPlanNode,
 };
@@ -13,8 +13,7 @@ use common::*;
 
 fn col(col_idx: u32) -> Expression {
     Expression::Column {
-        tuple_idx: 0,
-        col_idx,
+        col: ColIdx(col_idx),
         dtype: DataType::INT,
     }
 }
@@ -36,9 +35,7 @@ fn scan(db: &Db, table: &str, names: &[&str]) -> Plan {
 }
 
 fn join_schema(left: &[&str], right: &[&str]) -> Schema {
-    let mut s = int_schema(&[left, right].concat());
-    s.join_offset = Some(left.len());
-    s
+    int_schema(&[left, right].concat())
 }
 
 fn two_tables() -> Db {

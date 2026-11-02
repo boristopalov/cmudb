@@ -10,10 +10,10 @@ use crate::index::IndexError;
 use crate::processor::plan::{
     AggType, AggregationPlanNode, Arithmetic, CreateIndexPlanNode, CreateTablePlanNode,
     DeletePlanNode, DropIndexPlanNode, DropTablePlanNode, Expression, ExternalMergeSortPlanNode,
-    FilterPlanNode, HashJoinPlanNode, IndexScanPlanNode, InsertPlanNode, JoinType, LimitPlanNode,
-    NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, NullOrdering, ProjectionPlanNode,
-    SeqScanPlanNode, SortDirection, SortExpr, SortPlanNode, UpdatePlanNode, ValuesPlanNode,
-    WindowFunctionPlanNode,
+    FilterPlanNode, HashJoinPlanNode, IndexScanPlanNode, InputRow, InsertPlanNode, JoinRow,
+    JoinType, LimitPlanNode, NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, NullOrdering,
+    ProjectionPlanNode, SeqScanPlanNode, SortDirection, SortExpr, SortPlanNode, UpdatePlanNode,
+    ValuesPlanNode, WindowFunctionPlanNode,
 };
 use crate::table_heap::{RecordId, TableHeap, TableHeapError, TableHeapIterator, Tuple};
 use std::collections::hash_map::IntoIter;
@@ -408,11 +408,12 @@ impl<'a> Executor for ValuesExecutor<'a> {
             .saturating_add(self.batch_size)
             .min(self.plan.rows.len());
         let no_input_row = Tuple { data: vec![] };
+        let no_input_columns = Schema::new(vec![]);
         let mut rows = Vec::with_capacity(end - start);
         for exprs in &self.plan.rows[start..end] {
             let vals: Vec<Option<Value>> = exprs
                 .iter()
-                .map(|e| e.evaluate(&no_input_row, &self.plan.schema))
+                .map(|e| e.evaluate(&no_input_row, &no_input_columns))
                 .collect::<Result<Vec<Option<Value>>, ExecutorError>>()?;
             rows.push((self.plan.schema.encode_tuple(&vals)?, RecordId::RESERVED));
         }
@@ -909,10 +910,16 @@ impl<'a> Executor for NestedLoopJoinExecutor<'a> {
             while self.right_cursor < self.right_tuples.len() && out.len() < self.batch_size {
                 let rt = &self.right_tuples[self.right_cursor];
                 self.right_cursor += 1;
-                let predicate_result =
-                    self.plan
-                        .predicate
-                        .evaluate_join(lt, left_schema, rt, right_schema)?;
+                let predicate_result = self.plan.predicate.evaluate_on(&JoinRow {
+                    left: InputRow {
+                        tuple: lt,
+                        schema: left_schema,
+                    },
+                    right: InputRow {
+                        tuple: rt,
+                        schema: right_schema,
+                    },
+                })?;
                 if is_true(predicate_result) {
                     self.left_matched = true;
                     let row = joined_row(left_schema, lt, right_schema, Some(rt))?;
@@ -2017,7 +2024,7 @@ mod tests {
     use super::*;
     use crate::create_buffer_pool_manager;
     use crate::disk::{DiskManager, DiskScheduler};
-    use crate::processor::plan::{LEFT_TUPLE, Plan};
+    use crate::processor::plan::{ColIdx, Plan};
     use crate::replacer::ArcReplacer;
     use tempfile::TempDir;
 
@@ -2045,8 +2052,7 @@ mod tests {
 
     fn col(col_idx: u32) -> Expression {
         Expression::Column {
-            tuple_idx: LEFT_TUPLE,
-            col_idx,
+            col: ColIdx(col_idx),
             dtype: DataType::INT,
         }
     }

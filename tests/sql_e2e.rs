@@ -546,6 +546,19 @@ fn other_column_types_parse() {
 }
 
 #[test]
+fn insert_values_naming_a_column_is_a_bind_error_and_inserts_nothing() {
+    let db = Db::new(8);
+    db.exec("CREATE TABLE t (a INTEGER)");
+    let err = db
+        .try_exec("INSERT INTO t VALUES (a)")
+        .expect_err("a VALUES row has no input columns to read");
+    assert!(err.contains("column not found: a"), "{err}");
+    assert!(db.exec("SELECT * FROM t").is_empty());
+    db.exec("INSERT INTO t VALUES (1 + 2)");
+    assert_eq!(ints(&db.exec("SELECT a FROM t")), vec![vec![3]]);
+}
+
+#[test]
 fn binder_and_planner_errors_are_reported() {
     let db = emp_db();
     db.exec("CREATE TABLE dept (id INTEGER, name INTEGER)");

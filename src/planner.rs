@@ -7,10 +7,11 @@ use crate::parser::{
     BoundStatement, BoundUpdate, BoundValues, Scope, TableScope,
 };
 use crate::processor::plan::{
-    AggType, AggregationPlanNode, ColumnAssignment, CreateIndexPlanNode, CreateTablePlanNode,
-    DeletePlanNode, Expression, FilterPlanNode, IndexScanPlanNode, InsertPlanNode, JoinType,
-    LEFT_TUPLE, LimitPlanNode, NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, Op, Plan,
-    ProjectionPlanNode, RIGHT_TUPLE, SeqScanPlanNode, SortPlanNode, UpdatePlanNode, ValuesPlanNode,
+    AggType, AggregationPlanNode, ColIdx, ColumnAssignment, CreateIndexPlanNode,
+    CreateTablePlanNode, DeletePlanNode, Expression, FilterPlanNode, IndexScanPlanNode,
+    InsertPlanNode, JoinColumn, JoinPredicate, JoinType, LimitPlanNode, NestedIndexJoinPlanNode,
+    NestedLoopJoinPlanNode, Op, Plan, ProjectionPlanNode, SeqScanPlanNode, Side, SortPlanNode,
+    UpdatePlanNode, ValuesPlanNode,
 };
 
 /// Turns bound statements into plans, without statistics or a cost model.
@@ -58,14 +59,7 @@ impl<'a> Planner<'a> {
 
         let (mut plan, mut source_schema, remaining_filter) = match join {
             Some(j) => {
-                let mut sides: Vec<&TableScope> = scope.values().collect();
-                sides.sort_by_key(|ts| ts.idx);
-                let [left, right] = sides[..] else {
-                    return Err(PlannerError(format!(
-                        "a join needs exactly two tables, got {}",
-                        sides.len()
-                    )));
-                };
+                let (left, right) = join_sides(&scope)?;
 
                 let cols: Vec<(DataType, String)> = left
                     .schema
@@ -74,8 +68,7 @@ impl<'a> Planner<'a> {
                     .chain(right.schema.cols.iter())
                     .map(|c| (c.dtype, c.name.clone()))
                     .collect();
-                let mut s = Schema::new(cols);
-                s.join_offset = Some(left.schema.cols.len());
+                let s = Schema::new(cols);
                 let plan = self.build_join(left, right, j, s.clone());
                 (plan, s, filter_expr)
             }
@@ -211,13 +204,11 @@ impl<'a> Planner<'a> {
         }
 
         let mut assignments = Vec::with_capacity(upd.cols.len());
-        for (col_expr, value) in upd.cols.into_iter().zip(upd.new_cols) {
-            let Expression::Column { col_idx, .. } = col_expr else {
-                return Err(PlannerError(
-                    "UPDATE target must be a column reference".into(),
-                ));
-            };
-            assignments.push(ColumnAssignment { col_idx, value });
+        for (col, value) in upd.cols.into_iter().zip(upd.new_cols) {
+            assignments.push(ColumnAssignment {
+                col_idx: col.0,
+                value,
+            });
         }
 
         Ok(Plan::Update(UpdatePlanNode {
@@ -320,8 +311,7 @@ impl<'a> Planner<'a> {
                 schema: out_schema,
                 child: Box::new(left),
                 key_predicate: Expression::Column {
-                    tuple_idx: LEFT_TUPLE,
-                    col_idx: outer_col,
+                    col: ColIdx(outer_col),
                     dtype: left_ts.schema.cols[outer_col as usize].dtype,
                 },
                 table_oid: right_ts.oid,
@@ -372,6 +362,19 @@ fn conjunction(filters: Option<Vec<Expression>>) -> Option<Expression> {
         })
 }
 
+/// The left and right tables of a two-way join.
+fn join_sides(scope: &Scope) -> Result<(&TableScope, &TableScope), PlannerError> {
+    let on =
+        |side: Side| -> Vec<&TableScope> { scope.values().filter(|ts| ts.side == side).collect() };
+    match (on(Side::Left).as_slice(), on(Side::Right).as_slice()) {
+        ([left], [right]) => Ok((left, right)),
+        _ => Err(PlannerError(format!(
+            "a join needs exactly one left and one right table, got {} tables",
+            scope.len()
+        ))),
+    }
+}
+
 fn only_table<'s>(scope: &'s Scope, statement: &str) -> Result<&'s TableScope, PlannerError> {
     let mut tables = scope.values();
     match (tables.next(), tables.next()) {
@@ -389,19 +392,12 @@ fn output_column_name(
     source_schema: &Schema,
     fallback: impl FnOnce() -> String,
 ) -> String {
-    let Expression::Column {
-        tuple_idx, col_idx, ..
-    } = expr
-    else {
+    let Expression::Column { col, .. } = expr else {
         return fallback();
-    };
-    let offset = match *tuple_idx {
-        RIGHT_TUPLE => source_schema.join_offset.unwrap_or(0),
-        _ => 0,
     };
     source_schema
         .cols
-        .get(offset + *col_idx as usize)
+        .get(col.index())
         .map(|c| c.name.clone())
         .unwrap_or_else(fallback)
 }
@@ -442,29 +438,15 @@ fn column_equals_constant(filter: &Expression) -> Option<(u32, Value)> {
         return None;
     };
     match (left.as_ref(), right.as_ref()) {
-        (
-            Expression::Column {
-                tuple_idx: LEFT_TUPLE,
-                col_idx,
-                ..
-            },
-            Expression::Constant(Some(v)),
-        )
-        | (
-            Expression::Constant(Some(v)),
-            Expression::Column {
-                tuple_idx: LEFT_TUPLE,
-                col_idx,
-                ..
-            },
-        ) => Some((*col_idx, *v)),
+        (Expression::Column { col, .. }, Expression::Constant(Some(v)))
+        | (Expression::Constant(Some(v)), Expression::Column { col, .. }) => Some((col.0, *v)),
         _ => None,
     }
 }
 
 /// `(left_col, right_col)` when `predicate` is an equality between a left-input column
 /// and a right-input column, in either order.
-fn left_right_equi_join(predicate: &Expression) -> Option<(u32, u32)> {
+fn left_right_equi_join(predicate: &JoinPredicate) -> Option<(u32, u32)> {
     let Expression::Binary {
         left,
         right,
@@ -473,31 +455,31 @@ fn left_right_equi_join(predicate: &Expression) -> Option<(u32, u32)> {
     else {
         return None;
     };
-    match (left.as_ref(), right.as_ref()) {
+    let side_col = |e: &JoinPredicate| match e {
+        Expression::Column { col, .. } => Some(*col),
+        _ => None,
+    };
+    match (side_col(left)?, side_col(right)?) {
         (
-            Expression::Column {
-                tuple_idx: LEFT_TUPLE,
-                col_idx: outer,
-                ..
+            JoinColumn {
+                side: Side::Left,
+                col: outer,
             },
-            Expression::Column {
-                tuple_idx: RIGHT_TUPLE,
-                col_idx: inner,
-                ..
+            JoinColumn {
+                side: Side::Right,
+                col: inner,
             },
         )
         | (
-            Expression::Column {
-                tuple_idx: RIGHT_TUPLE,
-                col_idx: inner,
-                ..
+            JoinColumn {
+                side: Side::Right,
+                col: inner,
             },
-            Expression::Column {
-                tuple_idx: LEFT_TUPLE,
-                col_idx: outer,
-                ..
+            JoinColumn {
+                side: Side::Left,
+                col: outer,
             },
-        ) => Some((*outer, *inner)),
+        ) => Some((outer.0, inner.0)),
         _ => None,
     }
 }
@@ -506,10 +488,19 @@ fn left_right_equi_join(predicate: &Expression) -> Option<(u32, u32)> {
 mod tests {
     use super::*;
 
-    fn column(tuple_idx: u8, col_idx: u32) -> Expression {
+    fn column(col: u32) -> Expression {
         Expression::Column {
-            tuple_idx,
-            col_idx,
+            col: ColIdx(col),
+            dtype: DataType::INT,
+        }
+    }
+
+    fn join_column(side: Side, col: u32) -> JoinPredicate {
+        Expression::Column {
+            col: JoinColumn {
+                side,
+                col: ColIdx(col),
+            },
             dtype: DataType::INT,
         }
     }
@@ -521,12 +512,11 @@ mod tests {
             (DataType::FLOAT, "bonus".to_string()),
         ]);
         let bonus = Expression::Column {
-            tuple_idx: LEFT_TUPLE,
-            col_idx: 1,
+            col: ColIdx(1),
             dtype: DataType::FLOAT,
         };
         let schema = aggregation_output_schema(
-            &[column(LEFT_TUPLE, 0)],
+            &[column(0)],
             &[(bonus.clone(), AggType::SUM), (bonus, AggType::COUNT)],
             &source,
         );
@@ -546,23 +536,16 @@ mod tests {
     }
 
     #[test]
-    fn output_column_name_offsets_right_input_columns_by_the_join_offset() {
-        let mut joined = Schema::new(vec![
+    fn output_column_name_reads_the_source_column_at_the_flat_index() {
+        let joined = Schema::new(vec![
             (DataType::INT, "l".to_string()),
             (DataType::INT, "r".to_string()),
         ]);
-        joined.join_offset = Some(1);
         let fallback = || "fallback".to_string();
+        assert_eq!(output_column_name(&column(0), &joined, fallback), "l");
+        assert_eq!(output_column_name(&column(1), &joined, fallback), "r");
         assert_eq!(
-            output_column_name(&column(LEFT_TUPLE, 0), &joined, fallback),
-            "l"
-        );
-        assert_eq!(
-            output_column_name(&column(RIGHT_TUPLE, 0), &joined, fallback),
-            "r"
-        );
-        assert_eq!(
-            output_column_name(&column(RIGHT_TUPLE, 1), &joined, fallback),
+            output_column_name(&column(2), &joined, fallback),
             "fallback"
         );
     }
@@ -571,7 +554,7 @@ mod tests {
     fn multiple_filters_are_combined_with_and() {
         assert!(conjunction(None).is_none());
         assert!(conjunction(Some(vec![])).is_none());
-        let combined = conjunction(Some(vec![column(LEFT_TUPLE, 0), column(LEFT_TUPLE, 1)]));
+        let combined = conjunction(Some(vec![column(0), column(1)]));
         assert!(matches!(
             combined,
             Some(Expression::Binary { op: Op::And, .. })
@@ -580,31 +563,33 @@ mod tests {
 
     #[test]
     fn index_lookups_match_column_equals_constant_in_either_order() {
-        let eq = |l: Expression, r: Expression| Expression::Binary {
-            left: Box::new(l),
-            right: Box::new(r),
-            op: Op::Eq,
-        };
+        fn eq<C>(l: Expression<C>, r: Expression<C>) -> Expression<C> {
+            Expression::Binary {
+                left: Box::new(l),
+                right: Box::new(r),
+                op: Op::Eq,
+            }
+        }
         let three = || Expression::Constant(Some(Value::INT(3)));
         assert_eq!(
-            column_equals_constant(&eq(column(LEFT_TUPLE, 2), three())),
+            column_equals_constant(&eq(column(2), three())),
             Some((2, Value::INT(3)))
         );
         assert_eq!(
-            column_equals_constant(&eq(three(), column(LEFT_TUPLE, 2))),
+            column_equals_constant(&eq(three(), column(2))),
             Some((2, Value::INT(3)))
         );
         assert_eq!(
-            column_equals_constant(&eq(column(LEFT_TUPLE, 2), Expression::Constant(None))),
+            column_equals_constant(&eq(column(2), Expression::Constant(None))),
             None,
             "NULL is never looked up in an index"
         );
         assert_eq!(
-            left_right_equi_join(&eq(column(RIGHT_TUPLE, 4), column(LEFT_TUPLE, 1))),
+            left_right_equi_join(&eq(join_column(Side::Right, 4), join_column(Side::Left, 1))),
             Some((1, 4))
         );
         assert_eq!(
-            left_right_equi_join(&eq(column(LEFT_TUPLE, 4), column(LEFT_TUPLE, 1))),
+            left_right_equi_join(&eq(join_column(Side::Left, 4), join_column(Side::Left, 1))),
             None
         );
     }
