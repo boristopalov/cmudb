@@ -13,8 +13,8 @@ use crate::processor::plan::{
     CreateTablePlanNode, DeletePlanNode, DropIndexPlanNode, DropTablePlanNode, Expression,
     ExternalMergeSortPlanNode, FilterPlanNode, HashJoinPlanNode, IndexScanPlanNode, InsertPlanNode,
     JoinColumn, JoinPredicate, JoinType, LimitPlanNode, NestedIndexJoinPlanNode,
-    NestedLoopJoinPlanNode, Op, Plan, ProjectionPlanNode, SeqScanPlanNode, Side, UpdatePlanNode,
-    ValuesPlanNode, WindowFunctionPlanNode,
+    NestedLoopJoinPlanNode, Op, Plan, ProjectionPlanNode, SeqScanPlanNode, Side, SortExpr,
+    UpdatePlanNode, ValuesPlanNode, WindowFunctionPlanNode,
 };
 
 /// Turns bound statements into plans, without statistics or a cost model.
@@ -26,6 +26,8 @@ use crate::processor::plan::{
 /// equalities, with the rest of the condition as its residual. Everything else is a `SeqScan`
 /// or a `NestedLoopJoin`. `ORDER BY` is an `ExternalMergeSort`, which sorts in memory until
 /// its input passes the executor's sort memory budget and spills sorted runs after that.
+/// `SELECT DISTINCT` is an `Aggregation` grouping on every projected column, placed above the
+/// projection and below the sort.
 /// Window functions run in one `WindowFunction` node per distinct OVER clause, stacked over the
 /// filtered FROM output, each passing its input's columns through and appending its calls.
 pub struct Planner<'a> {
@@ -97,6 +99,7 @@ impl<'a> Planner<'a> {
             scope,
             join,
             projections,
+            distinct,
             filters,
             group_bys,
             aggregates,
@@ -166,30 +169,15 @@ impl<'a> Planner<'a> {
             source_schema = agg_schema;
         }
 
-        if let Some(order_by_exprs) = sort {
-            plan = Plan::ExternalMergeSort(ExternalMergeSortPlanNode {
-                schema: source_schema.clone(),
-                child: Box::new(plan),
-                order_by_exprs,
-            });
+        let proj_schema = projection_schema(&projections, &source_schema);
+        if distinct {
+            plan = project(plan, projections, &proj_schema);
+            plan = distinct_rows(plan, &proj_schema);
+            plan = sort_rows(plan, &proj_schema, sort);
+        } else {
+            plan = sort_rows(plan, &source_schema, sort);
+            plan = project(plan, projections, &proj_schema);
         }
-
-        let proj_cols: Vec<(DataType, String)> = projections
-            .iter()
-            .enumerate()
-            .map(|(i, e)| {
-                (
-                    e.dtype().unwrap_or(DataType::INT),
-                    output_column_name(e, &source_schema, || format!("col{i}")),
-                )
-            })
-            .collect();
-        let proj_schema = Schema::new(proj_cols);
-        plan = Plan::Projection(ProjectionPlanNode {
-            schema: proj_schema.clone(),
-            expressions: projections,
-            child: Box::new(plan),
-        });
 
         if let Some(n) = limit {
             plan = Plan::Limit(LimitPlanNode {
@@ -536,6 +524,62 @@ fn only_table<'s>(
     }
 }
 
+/// Sorts `plan`'s rows, laid out as `schema`, by `sort`; no sort without keys.
+fn sort_rows(plan: Plan, schema: &Schema, sort: Option<Vec<SortExpr>>) -> Plan {
+    match sort {
+        Some(order_by_exprs) => Plan::ExternalMergeSort(ExternalMergeSortPlanNode {
+            schema: schema.clone(),
+            child: Box::new(plan),
+            order_by_exprs,
+        }),
+        None => plan,
+    }
+}
+
+/// The output layout of `projections` evaluated over rows laid out as `source_schema`.
+fn projection_schema(projections: &[Expression], source_schema: &Schema) -> Schema {
+    Schema::new(
+        projections
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                (
+                    e.dtype().unwrap_or(DataType::INT),
+                    output_column_name(e, source_schema, || format!("col{i}")),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn project(plan: Plan, expressions: Vec<Expression>, schema: &Schema) -> Plan {
+    Plan::Projection(ProjectionPlanNode {
+        schema: schema.clone(),
+        expressions,
+        child: Box::new(plan),
+    })
+}
+
+/// Removes duplicate rows from `plan`, laid out as `schema`, by grouping on every column with
+/// no aggregates. Grouping treats NULLs as equal, so duplicate rows holding NULL collapse too.
+fn distinct_rows(plan: Plan, schema: &Schema) -> Plan {
+    let group_bys = schema
+        .cols
+        .iter()
+        .enumerate()
+        .map(|(i, c)| Expression::Column {
+            col: ColIdx(i as u32),
+            dtype: c.dtype,
+        })
+        .collect();
+    Plan::Aggregation(AggregationPlanNode {
+        schema: schema.clone(),
+        child: Box::new(plan),
+        group_bys,
+        aggregates: vec![],
+    })
+}
+
 /// The name of the source column a plain column reference reads, else `fallback()`.
 fn output_column_name(
     expr: &Expression,
@@ -875,6 +919,7 @@ mod tests {
                 predicate: Expression::Constant(Some(Value::BOOLEAN(true))),
             }),
             projections: vec![],
+            distinct: false,
             filters: None,
             group_bys: vec![],
             aggregates: vec![],
