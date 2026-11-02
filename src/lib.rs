@@ -3,6 +3,7 @@ pub mod buffer_pool;
 pub mod catalog;
 pub mod concurrency;
 pub mod database;
+pub mod database_file;
 pub mod disk;
 pub mod index;
 pub mod parser;

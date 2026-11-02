@@ -5,6 +5,10 @@ use crate::buffer_pool::BufferPoolManager;
 use crate::catalog::{Catalog, CatalogError, Schema, Value};
 use crate::concurrency::{IsolationLevel, Transaction, TransactionManager, TxnError};
 use crate::create_buffer_pool_manager;
+use crate::database_file::{
+    DatabaseMeta, HEADER_PAGE_ID, PersistError, chain_pages_for, read_chain, read_header,
+    write_chain, write_header,
+};
 use crate::disk::{DiskManager, DiskScheduler};
 use crate::index::IndexError;
 use crate::parser::{Binder, BinderError};
@@ -22,6 +26,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::{Parser, ParserError};
 use std::fmt;
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -126,6 +131,9 @@ pub enum QueryError {
     },
     /// Retrying the abort of an earlier transaction failed again.
     RetryAbortFailed(TxnError),
+    /// The transaction committed, but writing the database to disk afterwards failed. The
+    /// next commit or [`Database::close`] writes it again.
+    Persist(PersistError),
 }
 
 impl fmt::Display for QueryError {
@@ -166,6 +174,9 @@ impl fmt::Display for QueryError {
             }
             QueryError::RetryAbortFailed(e) => {
                 write!(f, "rollback of the earlier transaction failed again: {e}")
+            }
+            QueryError::Persist(e) => {
+                write!(f, "committed, but writing the database to disk failed: {e}")
             }
         }
     }
@@ -247,12 +258,22 @@ pub struct Database {
     txn_mgr: Arc<TransactionManager>,
     session: Mutex<Session>,
     sort_memory_budget_bytes: usize,
+    /// Set for a database from [`Database::open`], whose metadata is written to its data file.
+    persisted: Option<Mutex<Persisted>>,
+    /// The data file of a database from [`Database::open`], locked for as long as it is open.
+    _lock: Option<std::fs::File>,
     _dir: Option<TempDir>,
 }
 
-/// Database file names inside the directory [`Database::scratch`] creates.
-const DATA_FILE: &str = "cmudb.data";
-const LOG_FILE: &str = "cmudb.log";
+/// The metadata chain of a database from [`Database::open`], and what was last written to it.
+struct Persisted {
+    chain: Vec<usize>,
+    written: Vec<u8>,
+}
+
+/// Database file names inside the directory [`Database::scratch`] or [`Database::open`] uses.
+pub const DATA_FILE: &str = "cmudb.data";
+pub const LOG_FILE: &str = "cmudb.log";
 
 /// A buffer pool of `frames` frames over files in a new scratch directory, which is
 /// deleted when the returned `TempDir` drops.
@@ -272,6 +293,8 @@ impl Database {
             bpm,
             session: Mutex::new(None),
             sort_memory_budget_bytes: DEFAULT_SORT_MEMORY_BUDGET_BYTES,
+            persisted: None,
+            _lock: None,
             _dir: None,
         }
     }
@@ -279,21 +302,161 @@ impl Database {
     /// The same database with `ORDER BY` sorting up to `bytes` of tuple data in memory and
     /// spilling sorted runs to scratch pages past that. Defaults to
     /// [`DEFAULT_SORT_MEMORY_BUDGET_BYTES`].
-    pub fn with_sort_memory_budget(self, bytes: usize) -> Self {
-        Self {
-            sort_memory_budget_bytes: bytes,
-            ..self
-        }
+    pub fn with_sort_memory_budget(mut self, bytes: usize) -> Self {
+        self.sort_memory_budget_bytes = bytes;
+        self
     }
 
     /// An empty database with a `frames`-frame buffer pool, stored in a new scratch directory
     /// that is deleted when the database drops.
     pub fn scratch(frames: usize) -> io::Result<Self> {
         let (bpm, dir) = scratch_pool(frames)?;
-        Ok(Self {
-            _dir: Some(dir),
-            ..Self::new(bpm)
-        })
+        let mut db = Self::new(bpm);
+        db._dir = Some(dir);
+        Ok(db)
+    }
+
+    /// Opens the database stored in directory `dir` with a `frames`-frame buffer pool, or
+    /// creates an empty one there, creating the directory too, if it holds no data file.
+    ///
+    /// The data file is written after every commit made through [`Database::execute`] (or
+    /// [`Database::execute_plan`]) and when the database closes, by [`Database::close`] or
+    /// by being dropped. A transaction committed directly on [`Database::txn_mgr`] is written
+    /// at the next of those. Pages evicted from the buffer pool are written in between, and
+    /// there is no log to undo them, so a crash or kill can leave the data file unopenable or
+    /// inconsistent. The data file is locked while the database is open, so a second open of
+    /// the same directory fails with [`PersistError::InUse`].
+    pub fn open(dir: impl AsRef<Path>, frames: usize) -> Result<Self, PersistError> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)?;
+        let data_path = dir.join(DATA_FILE);
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&data_path)?;
+        lock.try_lock().map_err(|e| match e {
+            std::fs::TryLockError::WouldBlock => PersistError::InUse,
+            std::fs::TryLockError::Error(e) => PersistError::Io(e),
+        })?;
+        let is_new = lock.metadata()?.len() == 0;
+        let dm = DiskManager::new(data_path, dir.join(LOG_FILE))?;
+        let bpm = Arc::new(create_buffer_pool_manager(
+            frames,
+            ArcReplacer::new(frames),
+            DiskScheduler::new(dm),
+        ));
+        let mut db = if is_new {
+            Self::create_persisted(bpm)?
+        } else {
+            Self::load_persisted(bpm)?
+        };
+        db._lock = Some(lock);
+        Ok(db)
+    }
+
+    fn create_persisted(bpm: Arc<BufferPoolManager>) -> Result<Self, PersistError> {
+        let header = allocate_page(&bpm)?;
+        assert_eq!(
+            header, HEADER_PAGE_ID,
+            "a new database allocates its header page first"
+        );
+        let first_chain_page = allocate_page(&bpm)?;
+        write_header(&bpm, first_chain_page)?;
+        let mut db = Self::new(bpm);
+        db.persisted = Some(Mutex::new(Persisted {
+            chain: vec![first_chain_page],
+            written: Vec::new(),
+        }));
+        db.checkpoint()?;
+        Ok(db)
+    }
+
+    fn load_persisted(bpm: Arc<BufferPoolManager>) -> Result<Self, PersistError> {
+        let (chain, payload) = read_chain(&bpm, read_header(&bpm)?)?;
+        let meta = DatabaseMeta::decode(&payload)?;
+        bpm.resume_allocation(&meta.allocation)?;
+        let mut db = Self::new(bpm.clone());
+        db.catalog = Catalog::restore(bpm.clone(), &meta.catalog)?;
+        db.txn_mgr = Arc::new(TransactionManager::resume(
+            bpm,
+            meta.last_commit_ts,
+            meta.next_txn_id,
+        ));
+        db.persisted = Some(Mutex::new(Persisted {
+            chain,
+            written: payload,
+        }));
+        Ok(db)
+    }
+
+    /// Rolls back the transaction `BEGIN` left open, if any, writes the database to its data
+    /// file and closes it. A database from [`Database::scratch`] or [`Database::new`] is only
+    /// closed. Dropping a database does the same, but can only log a failure.
+    pub fn close(mut self) -> Result<(), PersistError> {
+        let result = self.shut_down();
+        self.persisted = None;
+        result
+    }
+
+    /// Lets go of the database the way a killed process does: nothing is rolled back or
+    /// written, and the lock on the data file is released. For crash tests.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn abandon(mut self) {
+        drop(self._lock.take());
+        std::mem::forget(self);
+    }
+
+    fn shut_down(&self) -> Result<(), PersistError> {
+        if self.persisted.is_none() {
+            return Ok(());
+        }
+        let open_txn = match self.session.lock().take() {
+            Some(ExplicitTxn::Open(txn) | ExplicitTxn::AbortPending { txn, .. }) => Some(txn),
+            Some(ExplicitTxn::Failed) | None => None,
+        };
+        if let Some(txn) = open_txn {
+            self.txn_mgr
+                .abort(&txn)
+                .map_err(|e| PersistError::AbortOpenTransaction(e.to_string()))?;
+        }
+        self.checkpoint()
+    }
+
+    /// Writes the catalog, the page allocation and the transaction clocks to the metadata
+    /// chain, then every dirty page to the data file. Does nothing for a database that was
+    /// not opened with [`Database::open`].
+    pub fn checkpoint(&self) -> Result<(), PersistError> {
+        let Some(persisted) = &self.persisted else {
+            return Ok(());
+        };
+        let mut persisted = persisted.lock();
+        let payload = loop {
+            let payload = self.meta().encode();
+            let needed = chain_pages_for(payload.len());
+            if needed <= persisted.chain.len() {
+                break payload;
+            }
+            while persisted.chain.len() < needed {
+                persisted.chain.push(allocate_page(&self.bpm)?);
+            }
+        };
+        if payload != persisted.written {
+            write_chain(&self.bpm, &persisted.chain, &payload)?;
+            persisted.written = payload;
+        }
+        self.bpm.flush_all()?;
+        Ok(())
+    }
+
+    fn meta(&self) -> DatabaseMeta {
+        DatabaseMeta {
+            allocation: self.bpm.allocation(),
+            last_commit_ts: self.txn_mgr.last_commit_ts(),
+            next_txn_id: self.txn_mgr.next_txn_id(),
+            catalog: self.catalog.snapshot(),
+        }
     }
 
     pub fn catalog(&self) -> &Catalog {
@@ -579,8 +742,26 @@ impl Database {
         if let Err(e) = self.txn_mgr.garbage_collect() {
             log::warn!("garbage collection failed: {e}");
         }
+        if commit {
+            self.checkpoint().map_err(QueryError::Persist)?;
+        }
         Ok(())
     }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        if let Err(e) = self.shut_down() {
+            log::warn!("writing the database to disk on drop failed: {e}");
+        }
+    }
+}
+
+/// Allocates a new page and returns its id, without keeping it pinned.
+fn allocate_page(bpm: &Arc<BufferPoolManager>) -> Result<usize, PersistError> {
+    let page = bpm.new_page()?;
+    page.page_id()
+        .ok_or(PersistError::CorruptMeta("a new page came without an id"))
 }
 
 fn parse(sql: &str) -> Result<Vec<Statement>, QueryError> {
@@ -922,5 +1103,61 @@ mod tests {
     #[test]
     fn failed_autocommit_keeps_the_transaction_until_its_abort_succeeds() {
         commit_and_abort_fail_then_retry(false);
+    }
+
+    #[test]
+    fn a_failed_write_after_a_commit_is_reported_and_retried_by_the_next_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path(), 16).unwrap();
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db.bpm().fail_next_disk_writes(1);
+
+        let err = db.execute("INSERT INTO t VALUES (1);").unwrap_err();
+        assert!(matches!(err, QueryError::Persist(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .starts_with("committed, but writing the database to disk failed: "),
+            "{err}"
+        );
+        assert_eq!(
+            ints(&db.execute("SELECT * FROM t;").unwrap()[0]),
+            vec![vec![1]],
+            "the insert committed"
+        );
+        db.execute("INSERT INTO t VALUES (2);").unwrap();
+        db.abandon();
+
+        let db = Database::open(dir.path(), 16).unwrap();
+        assert_eq!(
+            ints(&db.execute("SELECT * FROM t;").unwrap()[0]),
+            vec![vec![1], vec![2]]
+        );
+    }
+
+    #[test]
+    fn closing_a_scratch_database_writes_nothing_and_succeeds() {
+        let db = Database::scratch(16).unwrap();
+        db.execute("CREATE TABLE t (a INTEGER); BEGIN;").unwrap();
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn close_reports_a_failed_rollback_of_the_open_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path(), 4).unwrap();
+        db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+        db.execute("BEGIN; UPDATE t SET a = 2;").unwrap();
+        let bpm = db.bpm().clone();
+        let pins: Vec<_> = std::iter::from_fn(|| bpm.new_page().ok()).collect();
+
+        let err = db.close().unwrap_err();
+
+        assert!(
+            matches!(err, PersistError::AbortOpenTransaction(_)),
+            "{err:?}"
+        );
+        drop(pins);
     }
 }

@@ -7,6 +7,8 @@ This is a Rust implementation of a relational DBMS. It takes heavy inspiration f
 ```sh
 cargo build
 cargo run      # SQL shell on a fresh temporary database; end statements with `;`, quit with \q
+cargo run -- mydb   # the same shell on the database in directory mydb/, kept across runs
+                    # that exit cleanly; a crash or kill can damage it (no WAL yet)
 cargo test
 ```
 

@@ -1,5 +1,5 @@
 use super::transaction::{
-    IsolationLevel, TXN_START_ID, Timestamp, Transaction, TransactionState, is_txn_id,
+    IsolationLevel, TXN_START_ID, Timestamp, Transaction, TransactionState, TxnId, is_txn_id,
 };
 use crate::buffer_pool::BufferPoolManager;
 use crate::table_heap::{RecordId, SlotWrite, TableHeap, TableHeapError};
@@ -127,6 +127,30 @@ impl TransactionManager {
             running: Mutex::new(BTreeMap::new()),
             versions: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// A manager whose clocks pick up where an earlier one over the same data file stopped:
+    /// the next commit is stamped after `last_commit_ts`, and transaction ids continue from
+    /// `next_txn_id`, so no new transaction mistakes a version an earlier run left
+    /// uncommitted for its own write.
+    pub fn resume(
+        bpm: Arc<BufferPoolManager>,
+        last_commit_ts: Timestamp,
+        next_txn_id: TxnId,
+    ) -> Self {
+        let manager = Self::new(bpm);
+        manager
+            .last_commit_ts
+            .store(last_commit_ts, Ordering::Release);
+        manager
+            .next_txn_id
+            .store(next_txn_id.max(TXN_START_ID), Ordering::Release);
+        manager
+    }
+
+    /// The id the next transaction will get.
+    pub fn next_txn_id(&self) -> TxnId {
+        self.next_txn_id.load(Ordering::Acquire)
     }
 
     /// Starts a transaction reading as of the newest commit. It registers under the same lock
