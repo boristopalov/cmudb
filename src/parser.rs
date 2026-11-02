@@ -318,6 +318,8 @@ pub enum Unsupported {
     WindowFunctionClauses,
     /// A window function call in a SELECT with GROUP BY or aggregate functions.
     WindowInAggregatingSelect,
+    /// A `QUALIFY` filter on window function results.
+    Qualify,
     /// An INSERT target that is not a table name, such as a table function.
     InsertTarget,
     /// An INSERT with no source rows.
@@ -395,6 +397,7 @@ impl fmt::Display for Unsupported {
             Unsupported::WindowInAggregatingSelect => {
                 "window functions in a SELECT with GROUP BY or aggregate functions are not supported"
             }
+            Unsupported::Qualify => "QUALIFY is not supported",
             Unsupported::InsertTarget => "unsupported INSERT target",
             Unsupported::InsertWithoutSource => "INSERT without source",
             Unsupported::InsertSource => "INSERT requires VALUES",
@@ -769,6 +772,9 @@ impl<'a> Binder<'a> {
             SetExpr::Select(s) => {
                 if !s.named_window.is_empty() {
                     return Err(Unsupported::NamedWindow.into());
+                }
+                if s.qualify.is_some() {
+                    return Err(Unsupported::Qualify.into());
                 }
                 let (scope, join) = self.build_select_scope(&s.from)?;
                 let filters = s

@@ -306,6 +306,11 @@ fn unsupported_window_function_forms_are_rejected() {
             BinderError::Unsupported(Unsupported::WindowFunctionClauses),
         ),
         (
+            "SELECT amount, RANK() OVER (ORDER BY amount) FROM sales \
+             QUALIFY RANK() OVER (ORDER BY amount) = 1",
+            BinderError::Unsupported(Unsupported::Qualify),
+        ),
+        (
             "SELECT ROW_NUMBER() OVER () FROM sales",
             BinderError::UnknownWindowFunction {
                 function: "ROW_NUMBER".into(),
@@ -349,5 +354,18 @@ fn rows_frame_computes_a_moving_sum() {
              FROM sales WHERE dept = 1 ORDER BY amount"
         )),
         vec![[10, 10], [20, 30], [30, 50]]
+    );
+}
+
+#[test]
+#[ignore = "known gap: QUALIFY is rejected"]
+fn qualify_filters_on_a_window_result() {
+    let db = sales_db();
+    assert_eq!(
+        ints(&db.exec(
+            "SELECT dept, amount FROM sales \
+             QUALIFY RANK() OVER (PARTITION BY dept ORDER BY amount DESC) = 1 ORDER BY dept"
+        )),
+        vec![[1, 30], [2, 7]]
     );
 }

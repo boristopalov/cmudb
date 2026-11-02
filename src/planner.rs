@@ -45,6 +45,9 @@ pub enum PlannerError {
     JoinSides { tables: usize },
     /// A CREATE INDEX key column is not a column of the indexed table.
     UnknownIndexColumn { column: String },
+    /// The planned FROM output has `planned` columns, but the binder placed the SELECT's window
+    /// call results after `bound` FROM columns.
+    WindowInputWidth { bound: usize, planned: usize },
 }
 
 impl fmt::Display for PlannerError {
@@ -60,6 +63,10 @@ impl fmt::Display for PlannerError {
             PlannerError::UnknownIndexColumn { column } => {
                 write!(f, "CREATE INDEX references unknown column: {column}")
             }
+            PlannerError::WindowInputWidth { bound, planned } => write!(
+                f,
+                "window calls were bound after {bound} FROM columns, but the planned FROM output has {planned}"
+            ),
         }
     }
 }
@@ -137,6 +144,9 @@ impl<'a> Planner<'a> {
             });
         }
 
+        if !windows.is_empty() {
+            check_window_input_width(&scope, &source_schema)?;
+        }
         let mut window_calls = 0;
         for window in windows {
             let window_schema = window_output_schema(&window, &source_schema, window_calls);
@@ -542,6 +552,18 @@ fn output_column_name(
         .unwrap_or_else(fallback)
 }
 
+/// Checks that `input`, the planned FROM output, is as wide as the FROM output the binder placed
+/// window call results after: every column of every table in `scope`.
+fn check_window_input_width(scope: &Scope, input: &Schema) -> Result<(), PlannerError> {
+    let bound = scope.values().map(|ts| ts.schema.cols.len()).sum();
+    let planned = input.cols.len();
+    if bound == planned {
+        Ok(())
+    } else {
+        Err(PlannerError::WindowInputWidth { bound, planned })
+    }
+}
+
 /// The input's columns followed by one column per call of `window`, named after the call's
 /// function and its position `first_call..` among the SELECT's window calls.
 fn window_output_schema(window: &BoundWindow, input: &Schema, first_call: usize) -> Schema {
@@ -819,6 +841,24 @@ mod tests {
                 statement: "DELETE",
                 tables: 2
             }
+        );
+    }
+
+    #[test]
+    fn window_input_narrower_than_the_bound_from_output_is_rejected() {
+        let scope = Scope::from([("a".to_string(), table_scope(Side::Left, &["x", "y"]))]);
+        let one_column = Schema::new(vec![(DataType::INT, "x".to_string())]);
+        let err = super::check_window_input_width(&scope, &one_column).unwrap_err();
+        assert_eq!(
+            err,
+            PlannerError::WindowInputWidth {
+                bound: 2,
+                planned: 1
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "window calls were bound after 2 FROM columns, but the planned FROM output has 1"
         );
     }
 
