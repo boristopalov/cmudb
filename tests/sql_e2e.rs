@@ -3,8 +3,9 @@
 mod common;
 
 use cmudb::QueryError;
-use cmudb::catalog::Value;
+use cmudb::catalog::{CatalogError, Value};
 use cmudb::parser::{BinderError, Unsupported};
+use cmudb::processor::executor::ExecutorError;
 use cmudb::processor::plan::Plan;
 use common::*;
 
@@ -371,11 +372,20 @@ fn order_by_desc_applies_after_group_by() {
 fn order_by_options_that_are_not_supported_are_rejected() {
     let db = emp_db();
     for (sql, expected) in [
-        ("SELECT id FROM emp ORDER BY id WITH FILL", "WITH FILL"),
-        ("SELECT id FROM emp ORDER BY id INTERPOLATE", "INTERPOLATE"),
+        (
+            "SELECT id FROM emp ORDER BY id WITH FILL",
+            Unsupported::OrderByWithFill,
+        ),
+        (
+            "SELECT id FROM emp ORDER BY id INTERPOLATE",
+            Unsupported::OrderByInterpolate,
+        ),
     ] {
-        let err = db.try_exec(sql).unwrap_err();
-        assert!(err.contains(expected), "{sql}: {err}");
+        assert_eq!(
+            db.bind_error(sql),
+            BinderError::Unsupported(expected),
+            "{sql}"
+        );
     }
 }
 
@@ -617,8 +627,8 @@ fn unique_index_rejects_duplicate_key() {
     db.exec("CREATE TABLE t (id INTEGER, v INTEGER)");
     db.exec("CREATE INDEX t_id ON t (id)");
     db.exec("INSERT INTO t VALUES (1, 1)");
-    let err = db.try_exec("INSERT INTO t VALUES (1, 2)").unwrap_err();
-    assert!(err.contains("DuplicateKey"), "{err}");
+    let err = db.query_error("INSERT INTO t VALUES (1, 2)");
+    assert!(is_duplicate_key(&err, "t_id"), "{err:?}");
     assert_eq!(ints(&db.exec("SELECT v FROM t WHERE id = 1")), vec![[1]]);
     assert_eq!(
         ints(&db.exec("SELECT id, v FROM t WHERE v > 0")),
@@ -635,10 +645,8 @@ fn update_rejected_by_a_unique_index_leaves_the_table_and_every_index_unchanged(
     db.exec("CREATE INDEX t_v ON t (v)");
     db.exec("INSERT INTO t VALUES (1, 10), (2, 20)");
 
-    let err = db
-        .try_exec("UPDATE t SET v = 99, id = 2 WHERE id = 1")
-        .unwrap_err();
-    assert!(err.contains("DuplicateKey"), "{err}");
+    let err = db.query_error("UPDATE t SET v = 99, id = 2 WHERE id = 1");
+    assert!(is_duplicate_key(&err, "t_id"), "{err:?}");
 
     assert_eq!(
         sorted(ints(&db.exec("SELECT id, v FROM t WHERE id > id - 1"))),
@@ -993,12 +1001,17 @@ fn select_over_a_stored_tuple_shorter_than_its_schema_is_an_error_not_a_panic() 
         )
         .expect("the heap stores any bytes");
         db.txn_mgr().commit(&txn).expect("commit");
-        let err = db
-            .try_exec("SELECT * FROM t")
-            .expect_err("decoding a short tuple fails the query");
+        let err = db.exec_error("SELECT * FROM t");
         assert!(
-            err.contains("the tuple does not match the table's schema"),
-            "tuple {short:?} gave {err}"
+            matches!(
+                err,
+                ExecutorError::Catalog(CatalogError::TupleSchemaMismatch)
+                    | ExecutorError::ColumnRead {
+                        source: CatalogError::TupleSchemaMismatch,
+                        ..
+                    }
+            ),
+            "decoding the short tuple {short:?} fails the query: {err:?}"
         );
     }
 }

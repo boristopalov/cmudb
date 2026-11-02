@@ -1,8 +1,11 @@
 //! Snapshot isolation behaviour of the MVCC layer, driven through SQL.
 
+mod common;
+
 use cmudb::catalog::{Catalog, Value};
 use cmudb::concurrency::{IsolationLevel, Transaction, TransactionManager, TransactionState};
-use cmudb::{Database, DmlOp, StatementResult};
+use cmudb::{Database, DmlOp, QueryError, StatementResult};
+use common::{is_duplicate_key, is_write_conflict};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -33,8 +36,8 @@ impl Db {
     }
 
     /// Runs `sql` in `txn`. Returns the rows it produced (for INSERT, the count).
-    fn exec(&self, txn: &Arc<Transaction>, sql: &str) -> Result<Rows, String> {
-        let results = self.db.execute_in(txn, sql).map_err(|e| e.to_string())?;
+    fn exec(&self, txn: &Arc<Transaction>, sql: &str) -> Result<Rows, QueryError> {
+        let results = self.db.execute_in(txn, sql)?;
         let mut out = Vec::new();
         for result in results {
             match result {
@@ -190,7 +193,7 @@ fn second_writer_of_a_row_is_aborted() {
         .exec(&t2, "UPDATE accounts SET balance = 2 WHERE id = 1")
         .unwrap_err();
     assert!(
-        err.contains("write-write conflict"),
+        is_write_conflict(&err),
         "the row holds t1's uncommitted write, so t2 fails right away instead of waiting: {err}"
     );
     assert_eq!(t2.state(), TransactionState::Tainted);
@@ -219,7 +222,7 @@ fn lost_update_is_prevented() {
         .exec(&t2, "UPDATE accounts SET balance = balance + 20")
         .unwrap_err();
     assert!(
-        err.contains("write-write conflict"),
+        is_write_conflict(&err),
         "t1 committed after t2's snapshot, so t2's update would overwrite it blindly: {err}"
     );
     db.abort(&t2);
@@ -319,7 +322,7 @@ fn failed_statement_taints_and_rolls_back_cleanly() {
         .unwrap();
     let second_row_collides_halfway = "INSERT INTO accounts VALUES (5, 5), (2, 2)";
     let err = db.exec(&t, second_row_collides_halfway).unwrap_err();
-    assert!(err.contains("duplicate key"), "{err}");
+    assert!(is_duplicate_key(&err, "accounts_id"), "{err:?}");
     assert_eq!(t.state(), TransactionState::Tainted);
     db.abort(&t);
 
@@ -347,7 +350,7 @@ fn unique_index_across_versions_and_transactions() {
         .exec(&b, "INSERT INTO accounts VALUES (7, 2)")
         .unwrap_err();
     assert!(
-        err.contains("write-write conflict"),
+        is_write_conflict(&err),
         "of two transactions racing for the same new key, the second conflicts: {err}"
     );
     db.abort(&b);
@@ -404,7 +407,7 @@ fn old_key_of_a_moved_row_is_free_once_the_move_commits() {
         .exec(&early, "INSERT INTO accounts VALUES (5, 1)")
         .unwrap_err();
     assert!(
-        err.contains("write-write conflict"),
+        is_write_conflict(&err),
         "the move could still roll back and reclaim the key: {err}"
     );
     db.abort(&early);
@@ -496,7 +499,7 @@ fn concurrent_increments_never_lose_an_update() {
                             committed.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(e) => {
-                            assert!(e.contains("write-write conflict"), "{e}");
+                            assert!(is_write_conflict(&e), "{e:?}");
                             db.abort(&t);
                         }
                     }

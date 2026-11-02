@@ -313,7 +313,7 @@ impl ColumnSource<ColIdx> for InputRow<'_> {
     fn column_value(&self, col: ColIdx) -> Result<Option<Value>, ExecutorError> {
         self.schema
             .get_value(self.tuple, col.index())
-            .map_err(|e| ExecutorError(format!("cannot read column {}: {e}", col.0)))
+            .map_err(|source| ExecutorError::ColumnRead { col: col.0, source })
     }
 }
 
@@ -439,9 +439,7 @@ fn as_bool(v: Option<Value>) -> Result<Option<bool>, ExecutorError> {
     match v {
         None => Ok(None),
         Some(Value::BOOLEAN(b)) => Ok(Some(b)),
-        Some(other) => Err(ExecutorError(format!(
-            "expected a BOOLEAN operand, got {other:?}"
-        ))),
+        Some(value) => Err(ExecutorError::NotBoolean { value }),
     }
 }
 
@@ -456,7 +454,7 @@ fn compare(l: Option<Value>, r: Option<Value>) -> Result<Option<Ordering>, Execu
         (Value::FLOAT(a), Value::INT(b)) => a.cmp(&OrderedFloat(b as f32)),
         (a, b) if a.data_type() == b.data_type() => a.cmp(&b),
         (a, b) => {
-            return Err(ExecutorError(format!("cannot compare {a:?} with {b:?}")));
+            return Err(ExecutorError::Incomparable { left: a, right: b });
         }
     };
     Ok(Some(ord))
@@ -464,8 +462,8 @@ fn compare(l: Option<Value>, r: Option<Value>) -> Result<Option<Ordering>, Execu
 
 /// Arithmetic on INT and FLOAT values. INT with INT stays INT and errors on overflow or
 /// division by zero; any FLOAT operand makes the result FLOAT.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Arithmetic {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arithmetic {
     Add,
     Sub,
     Mul,
@@ -483,9 +481,11 @@ impl Arithmetic {
                 Ok(Value::FLOAT(self.apply_float(*a, b as f32).into()))
             }
             (Value::FLOAT(a), Value::FLOAT(b)) => Ok(Value::FLOAT(self.apply_float(*a, *b).into())),
-            (a, b) => Err(ExecutorError(format!(
-                "cannot apply {self:?} to {a:?} and {b:?}"
-            ))),
+            (left, right) => Err(ExecutorError::ArithmeticOperands {
+                op: self,
+                left,
+                right,
+            }),
         }
     }
 
@@ -495,11 +495,15 @@ impl Arithmetic {
             Arithmetic::Sub => a.checked_sub(b),
             Arithmetic::Mul => a.checked_mul(b),
             Arithmetic::Div if b == 0 => {
-                return Err(ExecutorError(format!("division by zero: {a} / 0")));
+                return Err(ExecutorError::DivisionByZero { dividend: a });
             }
             Arithmetic::Div => a.checked_div(b),
         };
-        result.ok_or_else(|| ExecutorError(format!("integer overflow: {self:?} of {a} and {b}")))
+        result.ok_or(ExecutorError::IntegerOverflow {
+            op: self,
+            left: a,
+            right: b,
+        })
     }
 
     fn apply_float(self, a: f32, b: f32) -> f32 {
@@ -659,30 +663,63 @@ mod tests {
 
     #[test]
     fn operands_of_incompatible_types_are_an_error() {
-        assert!(eval(int(1), Op::Add, boolean(true)).is_err());
-        assert!(eval(int(1), Op::Lt, boolean(true)).is_err());
-        assert!(eval(boolean(true), Op::And, int(1)).is_err());
-        assert!(eval(boolean(false), Op::And, int(1)).is_err());
-        assert!(eval(int(1), Op::Or, null()).is_err());
-        assert!(eval(boolean(true), Op::Mul, boolean(true)).is_err());
+        let arithmetic = |e: ExecutorError| matches!(e, ExecutorError::ArithmeticOperands { .. });
+        let incomparable = |e: ExecutorError| matches!(e, ExecutorError::Incomparable { .. });
+        let not_boolean = |e: ExecutorError| {
+            matches!(
+                e,
+                ExecutorError::NotBoolean {
+                    value: Value::INT(1)
+                }
+            )
+        };
+        assert!(arithmetic(
+            eval(int(1), Op::Add, boolean(true)).unwrap_err()
+        ));
+        assert!(incomparable(
+            eval(int(1), Op::Lt, boolean(true)).unwrap_err()
+        ));
+        assert!(not_boolean(
+            eval(boolean(true), Op::And, int(1)).unwrap_err()
+        ));
+        assert!(not_boolean(
+            eval(boolean(false), Op::And, int(1)).unwrap_err()
+        ));
+        assert!(not_boolean(eval(int(1), Op::Or, null()).unwrap_err()));
+        assert!(arithmetic(
+            eval(boolean(true), Op::Mul, boolean(true)).unwrap_err()
+        ));
         let ts = || constant(Some(Value::TIMESTAMP(5)));
-        assert!(eval(ts(), Op::Add, ts()).is_err());
-        assert!(eval(ts(), Op::Eq, int(5)).is_err());
+        assert!(arithmetic(eval(ts(), Op::Add, ts()).unwrap_err()));
+        assert!(incomparable(eval(ts(), Op::Eq, int(5)).unwrap_err()));
         assert_eq!(eval_ok(ts(), Op::Lte, ts()), Some(Value::BOOLEAN(true)));
     }
 
     #[test]
     fn integer_division_by_zero_is_an_error() {
         let err = eval(int(1), Op::Div, int(0)).unwrap_err();
-        assert!(err.0.contains("division by zero"), "{}", err.0);
+        assert!(
+            matches!(err, ExecutorError::DivisionByZero { dividend: 1 }),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), "division by zero: 1 / 0");
     }
 
     #[test]
     fn integer_overflow_is_an_error() {
-        assert!(eval(int(i32::MAX), Op::Add, int(1)).is_err());
-        assert!(eval(int(i32::MIN), Op::Sub, int(1)).is_err());
-        assert!(eval(int(i32::MAX), Op::Mul, int(2)).is_err());
-        assert!(eval(int(i32::MIN), Op::Div, int(-1)).is_err());
+        for (l, op, r, arith) in [
+            (i32::MAX, Op::Add, 1, Arithmetic::Add),
+            (i32::MIN, Op::Sub, 1, Arithmetic::Sub),
+            (i32::MAX, Op::Mul, 2, Arithmetic::Mul),
+            (i32::MIN, Op::Div, -1, Arithmetic::Div),
+        ] {
+            let err = eval(int(l), op, int(r)).unwrap_err();
+            assert!(
+                matches!(err, ExecutorError::IntegerOverflow { op, left, right }
+                    if op == arith && left == l && right == r),
+                "{err:?}"
+            );
+        }
     }
 
     fn int_column(col: u32) -> Expression {
@@ -735,11 +772,17 @@ mod tests {
     fn column_past_the_end_of_the_input_is_an_error() {
         let schema = Schema::new(vec![(DataType::INT, "a".to_string())]);
         let tuple = schema.encode_tuple(&[Some(Value::INT(1))]).unwrap();
-        assert!(int_column(1).evaluate(&tuple, &schema).is_err());
+        assert!(matches!(
+            int_column(1).evaluate(&tuple, &schema).unwrap_err(),
+            ExecutorError::ColumnRead { col: 1, .. }
+        ));
         assert!(
-            int_column(0)
-                .evaluate(&Tuple { data: vec![] }, &schema)
-                .is_err(),
+            matches!(
+                int_column(0)
+                    .evaluate(&Tuple { data: vec![] }, &schema)
+                    .unwrap_err(),
+                ExecutorError::ColumnRead { col: 0, .. }
+            ),
             "a column read from an empty input row is an error"
         );
     }

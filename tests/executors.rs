@@ -4,8 +4,11 @@
 //! of tables created through SQL.
 mod common;
 
+use cmudb::QueryError;
+use cmudb::catalog::CatalogError;
 use cmudb::catalog::{DataType, Schema, Value};
 use cmudb::parser::BinderError;
+use cmudb::processor::executor::ExecutorError;
 use cmudb::processor::plan::{
     AggType, ColIdx, CreateIndexPlanNode, DropIndexPlanNode, DropTablePlanNode, Expression,
     ExternalMergeSortPlanNode, HashJoinPlanNode, JoinColumn, JoinType, LimitPlanNode, NullOrdering,
@@ -492,16 +495,17 @@ fn create_index_keys_on_the_columns_its_col_idxs_name() {
         "the index keys on column v"
     );
 
-    let out_of_range = db
-        .run_plan(&Plan::CreateIndex(CreateIndexPlanNode {
-            index_name: "t_bad".to_string(),
-            table_oid,
-            key_columns: vec![ColIdx(2)],
-        }))
-        .unwrap_err();
+    let out_of_range = db.plan_error(&Plan::CreateIndex(CreateIndexPlanNode {
+        index_name: "t_bad".to_string(),
+        table_oid,
+        key_columns: vec![ColIdx(2)],
+    }));
     assert!(
-        out_of_range.contains("the column index is past the schema's last column"),
-        "a key column past the table's last column fails: {out_of_range}"
+        matches!(
+            out_of_range,
+            QueryError::Execute(ExecutorError::Catalog(CatalogError::ColumnOutOfBounds))
+        ),
+        "a key column past the table's last column fails: {out_of_range:?}"
     );
     assert!(db.catalog().index_oid("t", "t_bad").is_err());
 }

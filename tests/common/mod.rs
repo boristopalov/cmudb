@@ -5,7 +5,10 @@
 pub mod seed;
 
 use cmudb::catalog::Value;
+use cmudb::concurrency::TxnError;
+use cmudb::concurrency::mvcc::MvccError;
 use cmudb::parser::BinderError;
+use cmudb::processor::executor::ExecutorError;
 use cmudb::processor::plan::{
     ColIdx, Expression, HashJoinPlanNode, JoinColumn, JoinPredicate, NestedLoopJoinPlanNode, Op,
     Plan, Side,
@@ -60,8 +63,23 @@ impl Db {
     pub fn query_error(&self, sql: &str) -> QueryError {
         match self.db.execute(sql) {
             Ok(results) => panic!("{sql}: expected an error, got {} results", results.len()),
-            Err(QueryError::RolledBack { cause, .. }) => *cause,
-            Err(e) => e,
+            Err(e) => rollback_cause(e),
+        }
+    }
+
+    /// The executor error `sql` fails with; panics if it fails any other way.
+    pub fn exec_error(&self, sql: &str) -> ExecutorError {
+        match self.query_error(sql) {
+            QueryError::Execute(e) => e,
+            other => panic!("{sql}: expected an executor error, got {other:?}"),
+        }
+    }
+
+    /// The error `plan` fails with, unwrapped from the rollback of its transaction.
+    pub fn plan_error(&self, plan: &Plan) -> QueryError {
+        match self.db.execute_plan(plan) {
+            Ok(_) => panic!("expected the plan to fail"),
+            Err(e) => rollback_cause(e),
         }
     }
 
@@ -174,6 +192,32 @@ fn hash_join_condition(p: &HashJoinPlanNode) -> JoinPredicate {
         .chain(p.residual.clone())
         .reduce(|l, r| binary(l, r, Op::And))
         .expect("a hash join has at least one key")
+}
+
+/// The error that made a statement roll back, or `err` itself if it is not a rollback.
+pub fn rollback_cause(err: QueryError) -> QueryError {
+    match err {
+        QueryError::RolledBack { cause, .. } => *cause,
+        e => e,
+    }
+}
+
+/// Whether `err` is a write-write conflict reported by an executor.
+pub fn is_write_conflict(err: &QueryError) -> bool {
+    matches!(
+        err,
+        QueryError::Execute(ExecutorError::Mvcc(MvccError::Txn(
+            TxnError::WriteConflict(_)
+        )))
+    )
+}
+
+/// Whether `err` is a unique index rejecting a key already taken in index `index`.
+pub fn is_duplicate_key(err: &QueryError, index: &str) -> bool {
+    matches!(
+        err,
+        QueryError::Execute(ExecutorError::Mvcc(MvccError::DuplicateKey(name))) if name == index
+    )
 }
 
 /// A statement's result as rows: a query's rows, one row holding a DML count, or none.

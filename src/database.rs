@@ -2,10 +2,11 @@
 //! inside the transaction `BEGIN` opened, or else in a transaction of its own (autocommit).
 
 use crate::buffer_pool::BufferPoolManager;
-use crate::catalog::{Catalog, Schema, Value};
+use crate::catalog::{Catalog, CatalogError, Schema, Value};
 use crate::concurrency::{IsolationLevel, Transaction, TransactionManager, TxnError};
 use crate::create_buffer_pool_manager;
 use crate::disk::{DiskManager, DiskScheduler};
+use crate::index::IndexError;
 use crate::parser::{Binder, BinderError};
 use crate::planner::{Planner, PlannerError};
 use crate::processor::executor::{
@@ -14,6 +15,7 @@ use crate::processor::executor::{
 use crate::processor::executor_factory::create_executor;
 use crate::processor::plan::Plan;
 use crate::replacer::ArcReplacer;
+use crate::table_heap::TableHeapError;
 use parking_lot::Mutex;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
@@ -132,7 +134,7 @@ impl fmt::Display for QueryError {
             QueryError::Parse(e) => write!(f, "parse: {e}"),
             QueryError::Bind(e) => write!(f, "bind: {e}"),
             QueryError::Plan(e) => write!(f, "plan: {e}"),
-            QueryError::Execute(e) => write!(f, "exec: {}", e.0),
+            QueryError::Execute(e) => write!(f, "exec: {e}"),
             QueryError::AlreadyInTransaction => f.write_str("a transaction is already in progress"),
             QueryError::NoTransaction => f.write_str("no transaction in progress"),
             QueryError::TransactionAborted => {
@@ -170,6 +172,48 @@ impl fmt::Display for QueryError {
 }
 
 impl std::error::Error for QueryError {}
+
+impl From<ParserError> for QueryError {
+    fn from(e: ParserError) -> Self {
+        QueryError::Parse(e)
+    }
+}
+
+impl From<BinderError> for QueryError {
+    fn from(e: BinderError) -> Self {
+        QueryError::Bind(e)
+    }
+}
+
+impl From<PlannerError> for QueryError {
+    fn from(e: PlannerError) -> Self {
+        QueryError::Plan(e)
+    }
+}
+
+impl From<ExecutorError> for QueryError {
+    fn from(e: ExecutorError) -> Self {
+        QueryError::Execute(e)
+    }
+}
+
+impl From<CatalogError> for QueryError {
+    fn from(e: CatalogError) -> Self {
+        QueryError::Execute(e.into())
+    }
+}
+
+impl From<TableHeapError> for QueryError {
+    fn from(e: TableHeapError) -> Self {
+        QueryError::Execute(e.into())
+    }
+}
+
+impl From<IndexError> for QueryError {
+    fn from(e: IndexError) -> Self {
+        QueryError::Execute(e.into())
+    }
+}
 
 /// The transaction block `BEGIN` opened, or a transaction whose rollback has yet to succeed.
 enum ExplicitTxn {
@@ -306,9 +350,7 @@ impl Database {
     pub fn execute_plan(&self, plan: &Plan) -> Result<StatementResult, QueryError> {
         let mut session = self.session.lock();
         self.retry_pending_abort(&mut session)?;
-        self.run_in_session(&mut session, |txn| {
-            self.run_plan(txn, plan).map_err(QueryError::Execute)
-        })
+        self.run_in_session(&mut session, |txn| Ok(self.run_plan(txn, plan)?))
     }
 
     /// Runs every statement in `sql` inside `txn`, which the caller commits or aborts. The
@@ -340,12 +382,8 @@ impl Database {
     }
 
     fn plan_statement(&self, stmt: &Statement) -> Result<Plan, QueryError> {
-        let bound = Binder::new(&self.catalog)
-            .bind_statement(stmt)
-            .map_err(QueryError::Bind)?;
-        Planner::new(&self.catalog)
-            .plan(bound)
-            .map_err(QueryError::Plan)
+        let bound = Binder::new(&self.catalog).bind_statement(stmt)?;
+        Ok(Planner::new(&self.catalog).plan(bound)?)
     }
 
     fn run_statement(
@@ -354,7 +392,7 @@ impl Database {
         stmt: &Statement,
     ) -> Result<StatementResult, QueryError> {
         let plan = self.plan_statement(stmt)?;
-        self.run_plan(txn, &plan).map_err(QueryError::Execute)
+        Ok(self.run_plan(txn, &plan)?)
     }
 
     fn run_plan(
@@ -546,7 +584,7 @@ impl Database {
 }
 
 fn parse(sql: &str) -> Result<Vec<Statement>, QueryError> {
-    Parser::parse_sql(&GenericDialect, sql).map_err(QueryError::Parse)
+    Ok(Parser::parse_sql(&GenericDialect, sql)?)
 }
 
 fn is_transaction_statement(stmt: &Statement) -> bool {
@@ -561,6 +599,27 @@ mod tests {
     use super::*;
     use crate::concurrency::{TransactionState, mvcc};
     use crate::testing;
+
+    #[test]
+    fn storage_errors_convert_into_execute_errors() {
+        assert!(matches!(
+            QueryError::from(TableHeapError::NewPageWithoutId),
+            QueryError::Execute(ExecutorError::TableHeap(TableHeapError::NewPageWithoutId))
+        ));
+        assert!(matches!(
+            QueryError::from(CatalogError::TableDoesNotExist),
+            QueryError::Execute(ExecutorError::Catalog(CatalogError::TableDoesNotExist))
+        ));
+        assert!(matches!(
+            QueryError::from(IndexError::UnsupportedKeyLength(9000)),
+            QueryError::Execute(ExecutorError::Index(IndexError::UnsupportedKeyLength(9000)))
+        ));
+        let exec = QueryError::from(ExecutorError::NotDml);
+        assert_eq!(
+            exec.to_string(),
+            "exec: rows_affected called on a plan that is not INSERT, UPDATE or DELETE"
+        );
+    }
 
     fn ints(result: &StatementResult) -> Vec<Vec<i32>> {
         let StatementResult::Rows { rows, .. } = result else {
