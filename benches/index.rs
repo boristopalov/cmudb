@@ -37,11 +37,21 @@ fn key(k: u64) -> IndexKey {
     IndexKey(k.to_be_bytes().to_vec())
 }
 
-fn value(k: u64) -> IndexValue {
-    IndexValue::IndexValue(RecordId {
+fn rid(k: u64) -> RecordId {
+    RecordId {
         page_id: (k / 32) as u32,
         slot_id: (k % 32) as u32,
-    })
+    }
+}
+
+fn value(k: u64) -> IndexValue {
+    IndexValue::IndexValue(rid(k))
+}
+
+fn rid_of(found: IndexValue) -> RecordId {
+    match found {
+        IndexValue::IndexValue(rid) => rid,
+    }
 }
 
 fn insert_all(tree: &BPlusTree, keys: &[u64]) {
@@ -58,15 +68,22 @@ fn count_entries(tree: &BPlusTree, range: (Bound<IndexKey>, Bound<IndexKey>)) ->
 }
 
 fn assert_tree_holds(tree: &BPlusTree, n: u64) {
-    assert_eq!(
-        count_entries(tree, (Bound::Unbounded, Bound::Unbounded)),
-        n as usize,
-        "a full scan sees every inserted key"
+    let entries: Vec<(IndexKey, RecordId)> = tree
+        .scan((Bound::Unbounded, Bound::Unbounded))
+        .expect("scan")
+        .map(|r| r.map(|(k, v)| (k, rid_of(v))))
+        .collect::<Result<_, _>>()
+        .expect("entry");
+    let want: Vec<(IndexKey, RecordId)> = (0..n).map(|k| (key(k), rid(k))).collect();
+    assert!(
+        entries == want,
+        "a full scan returns every inserted key, in order, with its record id"
     );
     for k in (0..n).step_by(97) {
-        assert!(
-            tree.search(&key(k)).expect("search").is_some(),
-            "key {k} is found"
+        assert_eq!(
+            tree.search(&key(k)).expect("search").map(rid_of),
+            Some(rid(k)),
+            "key {k} maps to its record id"
         );
     }
 }
