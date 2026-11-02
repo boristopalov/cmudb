@@ -17,7 +17,24 @@ pub enum TxnError {
     WriteConflict(RecordId),
     /// The transaction is not in a state that allows the requested operation.
     InvalidState(TransactionState),
-    Storage(String),
+    /// Reading or writing the table heap failed.
+    Storage(TableHeapError),
+    /// A slot in the write set carries `found` where commit or abort expected `expected`, so
+    /// another writer changed it.
+    UnexpectedStamp {
+        rid: RecordId,
+        expected: Timestamp,
+        found: Timestamp,
+    },
+    /// The undo chain of a slot this transaction updated is gone before abort restored it.
+    MissingUndoChain { rid: RecordId },
+    /// Stamping a write failed with `cause`, and putting the already stamped slot `rid` back
+    /// failed with `undo`, so the commit is partly applied.
+    CommitNotUndone {
+        cause: Box<TxnError>,
+        rid: RecordId,
+        undo: Box<TxnError>,
+    },
 }
 
 impl fmt::Display for TxnError {
@@ -26,13 +43,25 @@ impl fmt::Display for TxnError {
             TxnError::WriteConflict(rid) => write!(f, "write-write conflict on record ({rid})"),
             TxnError::InvalidState(s) => write!(f, "transaction is {s:?}"),
             TxnError::Storage(e) => write!(f, "storage error: {e}"),
+            TxnError::UnexpectedStamp {
+                rid,
+                expected,
+                found,
+            } => write!(f, "slot ({rid}) is stamped {found} rather than {expected}"),
+            TxnError::MissingUndoChain { rid } => {
+                write!(f, "undo chain of ({rid}) vanished before abort")
+            }
+            TxnError::CommitNotUndone { cause, rid, undo } => write!(
+                f,
+                "commit failed ({cause}) and could not be undone on ({rid}): {undo}"
+            ),
         }
     }
 }
 
 impl From<TableHeapError> for TxnError {
     fn from(e: TableHeapError) -> Self {
-        TxnError::Storage(e.to_string())
+        TxnError::Storage(e)
     }
 }
 
@@ -173,9 +202,11 @@ impl TransactionManager {
                 for done in &rids[..i] {
                     if let Err(undo) = self.stamp(*done, commit_ts, txn.id()) {
                         txn.set_tainted();
-                        return Err(TxnError::Storage(format!(
-                            "commit failed ({e}) and could not be undone on ({done}): {undo}"
-                        )));
+                        return Err(TxnError::CommitNotUndone {
+                            cause: Box::new(e),
+                            rid: *done,
+                            undo: Box::new(undo),
+                        });
                     }
                 }
                 txn.set_tainted();
@@ -192,10 +223,11 @@ impl TransactionManager {
     fn stamp(&self, rid: RecordId, from: Timestamp, to: Timestamp) -> Result<(), TxnError> {
         TableHeap::write_slot(&self.bpm, rid, |meta, _| {
             if meta.ts != from {
-                return Err(TxnError::Storage(format!(
-                    "slot ({rid}) is stamped {} rather than {from}",
-                    meta.ts
-                )));
+                return Err(TxnError::UnexpectedStamp {
+                    rid,
+                    expected: from,
+                    found: meta.ts,
+                });
             }
             Ok(SlotWrite {
                 meta: TupleMeta { ts: to, ..meta },
@@ -228,10 +260,11 @@ impl TransactionManager {
                 rid,
                 |meta, _| {
                     if meta.ts != txn.id() {
-                        return Err(TxnError::Storage(format!(
-                            "aborting slot ({rid}) stamped {} rather than this txn",
-                            meta.ts
-                        )));
+                        return Err(TxnError::UnexpectedStamp {
+                            rid,
+                            expected: txn.id(),
+                            found: meta.ts,
+                        });
                     }
                     if !pushed_undo {
                         let write = SlotWrite {
@@ -243,9 +276,9 @@ impl TransactionManager {
                         };
                         return Ok::<_, TxnError>((write, None));
                     }
-                    let head = self.version_head(rid).ok_or_else(|| {
-                        TxnError::Storage(format!("undo chain of ({rid}) vanished before abort"))
-                    })?;
+                    let head = self
+                        .version_head(rid)
+                        .ok_or(TxnError::MissingUndoChain { rid })?;
                     let write = SlotWrite {
                         meta: TupleMeta {
                             ts: head.ts,
@@ -426,14 +459,20 @@ mod tests {
         };
         heap.update_meta(rids[1], stray).unwrap();
 
-        assert!(mgr.commit(&txn).is_err());
+        let stray_stamp = |e: &TxnError| {
+            matches!(e, TxnError::UnexpectedStamp { rid, expected, found: 7 }
+                if *rid == rids[1] && *expected == txn.id())
+        };
+        let err = mgr.commit(&txn).unwrap_err();
+        assert!(stray_stamp(&err), "{err:?}");
         assert_eq!(txn.state(), TransactionState::Tainted);
         assert_eq!(mgr.last_commit_ts(), 0);
         assert_eq!(slot(&heap, rids[0]).0, txn.id());
         assert_eq!(slot(&heap, rids[1]).0, 7);
         assert_eq!(slot(&heap, rids[2]).0, txn.id());
 
-        assert!(mgr.abort(&txn).is_err());
+        let err = mgr.abort(&txn).unwrap_err();
+        assert!(stray_stamp(&err), "{err:?}");
         assert_eq!(slot(&heap, rids[1]).0, 7);
         assert_eq!(mgr.version_chain_len(rids[1]), 1);
         assert!(txn.write_set().contains(&rids[1]));
@@ -469,7 +508,8 @@ mod tests {
         mgr.push_version(rid, TupleMeta::default(), vec![0; 3]);
         assert_eq!(mgr.version_chain_len(rid), 2);
 
-        assert!(mgr.abort(&txn).is_err());
+        let err = mgr.abort(&txn).unwrap_err();
+        assert!(matches!(err, TxnError::Storage(_)), "{err:?}");
         assert_eq!(mgr.version_chain_len(rid), 2);
         assert_eq!(slot(&heap, rid), (txn.id(), b"xxxx".to_vec()));
 
@@ -478,6 +518,60 @@ mod tests {
         mgr.abort(&txn).unwrap();
         assert_eq!(slot(&heap, rid), (0, b"abcd".to_vec()));
         assert_eq!(mgr.num_version_chains(), 0);
+    }
+
+    #[test]
+    fn abort_without_the_undo_chain_it_pushed_is_an_error() {
+        let (mgr, heap, _dir) = setup();
+        let rid = insert_committed(&heap, b"abcd");
+        let txn = mgr.begin(IsolationLevel::SnapshotIsolation);
+        overwrite(&mgr, &heap, &txn, rid);
+        mgr.versions.write().remove(&rid);
+
+        let err = mgr.abort(&txn).unwrap_err();
+        assert!(
+            matches!(err, TxnError::MissingUndoChain { rid: r } if r == rid),
+            "{err:?}"
+        );
+        assert_eq!(slot(&heap, rid), (txn.id(), b"xxxx".to_vec()));
+    }
+
+    #[test]
+    fn txn_errors_display_readable_messages() {
+        let rid = RecordId {
+            page_id: 1,
+            slot_id: 2,
+        };
+        let stamp = TxnError::UnexpectedStamp {
+            rid,
+            expected: 5,
+            found: 7,
+        };
+        assert_eq!(
+            stamp.to_string(),
+            format!("slot ({rid}) is stamped 7 rather than 5")
+        );
+        assert_eq!(
+            TxnError::MissingUndoChain { rid }.to_string(),
+            format!("undo chain of ({rid}) vanished before abort")
+        );
+        let storage = TxnError::Storage(TableHeapError::Deleted { rid });
+        assert_eq!(
+            storage.to_string(),
+            format!("storage error: record {rid} has been deleted")
+        );
+        let not_undone = TxnError::CommitNotUndone {
+            cause: Box::new(storage),
+            rid,
+            undo: Box::new(stamp),
+        };
+        assert_eq!(
+            not_undone.to_string(),
+            format!(
+                "commit failed (storage error: record {rid} has been deleted) and could not be \
+                 undone on ({rid}): slot ({rid}) is stamped 7 rather than 5"
+            )
+        );
     }
 
     #[test]
