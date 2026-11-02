@@ -39,9 +39,10 @@ one library entry point.
 - B+ tree latches go top down: header, root, then each child before its parent is
   released (`step_down`). Pessimistic inserts and removes write-latch the header and the
   path, releasing ancestors once a child is safe (`TreeContext::descend_into`). Searches,
-  scans and the optimistic write path read-crab from the root after copying its id out of
-  the header; an optimistic write trades the leaf's read latch for a write latch while it
-  still holds the parent. A sibling is latched only while its parent is held. Range scans
+  scans and the optimistic write path read-crab from the header, holding its read latch
+  until the root is latched (`get_root_page_from_header`), so a root split or collapse
+  cannot swap the root in between; an optimistic write trades the leaf's read latch for a
+  write latch while it still holds the parent. A sibling is latched only while its parent is held. Range scans
   hold one leaf at a time.
 - Across modules: an index's `unique_latch` (several indexes in ascending oid order), then
   page latches, then the transaction manager's version map. Commit takes `commit_latch`
