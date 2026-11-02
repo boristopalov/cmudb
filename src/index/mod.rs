@@ -2,6 +2,7 @@ pub mod b_plus_page;
 pub mod b_plus_tree;
 pub mod context;
 mod page_codec;
+pub mod page_view;
 use std::fmt;
 use std::ops::Bound;
 

@@ -17,10 +17,10 @@ pub type PageId = usize;
 pub const INVALID_PAGE_ID: PageId = usize::MAX;
 pub const NUM_TOMBSTONES: u32 = 256;
 
-const PAGE_ID_ENCODED_BYTES: usize = U64_BYTES;
-const RECORD_ID_ENCODED_BYTES: usize = 2 * U64_BYTES;
+pub(crate) const PAGE_ID_ENCODED_BYTES: usize = U64_BYTES;
+pub(crate) const RECORD_ID_ENCODED_BYTES: usize = 2 * U64_BYTES;
 const TOMBSTONE_COUNT_ENCODED_BYTES: usize = U32_BYTES;
-const TOMBSTONE_SLOT_ENCODED_BYTES: usize = U32_BYTES;
+pub(crate) const TOMBSTONE_SLOT_ENCODED_BYTES: usize = U32_BYTES;
 
 const SIZE_FIELD_BYTES: usize = U32_BYTES;
 const MAX_SIZE_FIELD_BYTES: usize = U32_BYTES;
@@ -28,14 +28,14 @@ const CHILD_COUNT_FIELD_BYTES: usize = U32_BYTES;
 const RESERVED_FIELD_BYTES: usize = U32_BYTES;
 const KEY_LEN_FIELD_BYTES: usize = U32_BYTES;
 
-const INTERNAL_FIXED_HEADER_BYTES: usize = COMMON_HEADER_BYTES
+pub(crate) const INTERNAL_FIXED_HEADER_BYTES: usize = COMMON_HEADER_BYTES
     + SIZE_FIELD_BYTES
     + MAX_SIZE_FIELD_BYTES
     + CHILD_COUNT_FIELD_BYTES
     + RESERVED_FIELD_BYTES;
-const LEAF_FIXED_HEADER_BYTES: usize =
+pub(crate) const LEAF_FIXED_HEADER_BYTES: usize =
     COMMON_HEADER_BYTES + SIZE_FIELD_BYTES + MAX_SIZE_FIELD_BYTES + PAGE_ID_ENCODED_BYTES;
-const HEADER_FIXED_HEADER_BYTES: usize = COMMON_HEADER_BYTES
+pub(crate) const HEADER_FIXED_HEADER_BYTES: usize = COMMON_HEADER_BYTES
     + KEY_LEN_FIELD_BYTES
     + RESERVED_FIELD_BYTES
     + PAGE_ID_ENCODED_BYTES
@@ -731,10 +731,16 @@ impl LeafPage {
             }));
         }
 
-        let mut keys = Vec::with_capacity(n);
+        if size > max_size.saturating_add(1) {
+            return Err(PageCodecError::Malformed("leaf size exceeds max size"));
+        }
+        let mut keys: Vec<IndexKey> = Vec::with_capacity(n);
         let mut record_ids = Vec::with_capacity(n);
         for _ in 0..n {
             let bytes = r.read_bytes(key_len)?;
+            if keys.last().is_some_and(|prev| prev.0.as_slice() > bytes) {
+                return Err(PageCodecError::Malformed("leaf keys out of order"));
+            }
             keys.push(IndexKey(bytes.to_vec()));
             let pid = r.read_u64_le()?;
             let sid = r.read_u64_le()?;
