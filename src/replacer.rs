@@ -1,4 +1,4 @@
-use log::{error, info, warn};
+use log::{info, warn};
 use std::collections::HashMap;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -208,13 +208,7 @@ impl ArcReplacer {
     }
 
     fn revive_ghost(&mut self, idx: usize, frame_id: usize) {
-        match self.frame_indices.get(&frame_id).copied() {
-            Some(previous_holder) => self.give_up_frame(previous_holder),
-            None => assert!(
-                !self.is_full(),
-                "ghost hit admits frame {frame_id} into a full replacer; evict a frame first"
-            ),
-        }
+        self.release_frame_for_admission(frame_id, "ghost hit");
         let node = &mut self.nodes[idx];
         node.frame_id = Some(frame_id);
         node.evictable = false;
@@ -222,17 +216,26 @@ impl ArcReplacer {
         self.move_to_front(idx, ArcList::Mfu);
     }
 
+    fn release_frame_for_admission(&mut self, frame_id: usize, admission: &str) {
+        match self.frame_indices.get(&frame_id).copied() {
+            Some(previous_holder) => self.give_up_frame(previous_holder),
+            None => assert!(
+                !self.is_full(),
+                "{admission} admits frame {frame_id} into a full replacer; evict a frame first"
+            ),
+        }
+    }
+
     fn record_first_access(&mut self, frame_id: usize, page_id: usize) {
         info!(
             "record_access new page_id={page_id} frame_id={frame_id} -> insert into MRU (ghost miss)"
         );
 
+        self.release_frame_for_admission(frame_id, "first access");
+
         let mru_side = self.mru_list.length + self.mru_ghost_list.length;
         if mru_side == self.capacity {
-            if !self.trim_ghost_tail(GhostList::Mru) {
-                error!("cannot insert new node: MRU ghost list unexpectedly empty");
-                return;
-            }
+            self.trim_ghost_tail(GhostList::Mru);
         } else {
             assert!(
                 mru_side < self.capacity,
@@ -242,9 +245,8 @@ impl ArcReplacer {
                 self.capacity
             );
             let tracked = mru_side + self.mfu_list.length + self.mfu_ghost_list.length;
-            if tracked == 2 * self.capacity && !self.trim_ghost_tail(GhostList::Mfu) {
-                error!("cannot insert new node: MFU ghost list unexpectedly empty");
-                return;
+            if tracked == 2 * self.capacity {
+                self.trim_ghost_tail(GhostList::Mfu);
             }
         }
 
@@ -379,15 +381,16 @@ impl ArcReplacer {
         self.move_to_front(idx, resident.ghost().list());
     }
 
-    fn trim_ghost_tail(&mut self, ghost: GhostList) -> bool {
+    fn trim_ghost_tail(&mut self, ghost: GhostList) {
         let ghost_list = ghost.list();
-        let Some(idx) = self.list(ghost_list).least_recent else {
-            warn!(
-                "trim_ghost_tail: ghost list empty list={:?} mru_ghost_len={} mfu_ghost_len={}",
-                ghost_list, self.mru_ghost_list.length, self.mfu_ghost_list.length
-            );
-            return false;
-        };
+        let idx = self.list(ghost_list).least_recent.unwrap_or_else(|| {
+            panic!(
+                "{ghost_list:?} is empty with {} resident and {} ghost pages tracked for capacity {}",
+                self.mru_list.length + self.mfu_list.length,
+                self.mru_ghost_list.length + self.mfu_ghost_list.length,
+                self.capacity
+            )
+        });
 
         let page_id = self.nodes[idx].page_id;
         debug_assert!(
@@ -398,7 +401,6 @@ impl ArcReplacer {
         self.detach(idx);
         self.page_indices.remove(&page_id);
         self.unused_node_indices.push(idx);
-        true
     }
 
     fn list(&self, list: ArcList) -> &ListHead {
@@ -637,6 +639,67 @@ mod tests {
     fn ghost_hit_on_a_full_replacer_with_an_untracked_frame_panics() {
         let mut arc_replacer = full_replacer_with_a_ghost_mru_page();
         arc_replacer.record_access(2, GHOST_PAGE);
+    }
+
+    const NEW_PAGE: usize = 12;
+
+    fn replacer_with_evictable_pages_in_frames_0_and_1(capacity: usize) -> ArcReplacer {
+        let mut arc_replacer = ArcReplacer::new(capacity);
+        arc_replacer.record_access(REUSED_FRAME, 10);
+        arc_replacer.set_evictable(REUSED_FRAME, true);
+        arc_replacer.record_access(OTHER_FRAME, 11);
+        arc_replacer.set_evictable(OTHER_FRAME, true);
+        arc_replacer
+    }
+
+    fn assert_first_access_took_the_reused_frame_from_page_10(arc_replacer: &mut ArcReplacer) {
+        let admitted = arc_replacer.frame_indices[&REUSED_FRAME];
+        assert_eq!(arc_replacer.nodes[admitted].page_id, NEW_PAGE);
+        assert_eq!(arc_replacer.nodes[admitted].list, ArcList::Mru);
+        assert_eq!(
+            arc_replacer.size(),
+            1,
+            "only the other frame should stay evictable"
+        );
+        assert_eq!(arc_replacer.evict(), Some(OTHER_FRAME));
+        assert_eq!(
+            arc_replacer.evict(),
+            None,
+            "the reused frame now holds the non-evictable new page"
+        );
+    }
+
+    #[test]
+    fn first_access_into_a_tracked_frame_moves_its_previous_page_to_its_ghost_list() {
+        let mut arc_replacer = replacer_with_evictable_pages_in_frames_0_and_1(3);
+
+        arc_replacer.record_access(REUSED_FRAME, NEW_PAGE);
+
+        let displaced = arc_replacer.page_indices[&10];
+        assert_eq!(arc_replacer.nodes[displaced].list, ArcList::GhostMru);
+        assert_eq!(arc_replacer.nodes[displaced].frame_id, None);
+        assert_first_access_took_the_reused_frame_from_page_10(&mut arc_replacer);
+    }
+
+    #[test]
+    fn first_access_into_a_tracked_frame_of_a_full_mru_list_admits_the_page() {
+        let mut arc_replacer = replacer_with_evictable_pages_in_frames_0_and_1(2);
+
+        arc_replacer.record_access(REUSED_FRAME, NEW_PAGE);
+
+        assert!(
+            !arc_replacer.page_indices.contains_key(&10),
+            "a full MRU side drops the displaced page's ghost to make room"
+        );
+        assert_eq!(arc_replacer.mru_ghost_list.length, 0);
+        assert_first_access_took_the_reused_frame_from_page_10(&mut arc_replacer);
+    }
+
+    #[test]
+    #[should_panic(expected = "first access admits frame 2 into a full replacer")]
+    fn first_access_into_a_full_replacer_with_an_untracked_frame_panics() {
+        let mut arc_replacer = replacer_with_evictable_pages_in_frames_0_and_1(2);
+        arc_replacer.record_access(2, NEW_PAGE);
     }
 
     #[test]
