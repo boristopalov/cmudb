@@ -9,7 +9,8 @@ just ci
 ```
 
 It runs `cargo fmt --all --check`, clippy on all targets and on the benches,
-`scripts/check_comments.py`, and `cargo test` with `RUST_LOG=warn`. CI calls
+`scripts/check_comments.py`, and `cargo test`. Tests install no logger, so
+`RUST_LOG` has no effect on them. CI calls
 the same `just lint` and `just test` recipes, so a green `just ci` means a
 green CI. Install `just` with `cargo install just` (or `pip install rust-just`).
 

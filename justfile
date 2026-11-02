@@ -1,8 +1,6 @@
 # Every check CI runs, so `just` or `just ci` before pushing matches CI.
 # CI calls the `lint`, `test` and `coverage` recipes below directly.
 
-export RUST_LOG := env("RUST_LOG", "warn")
-
 # Run fmt, clippy, the comment policy and the tests, as CI does.
 ci: lint test
 
@@ -13,7 +11,7 @@ lint:
     cargo clippy --benches --features bench -- -D warnings
     python3 scripts/check_comments.py
 
-# Unit, integration, end-to-end and doc tests at RUST_LOG=warn.
+# Unit, integration, end-to-end and doc tests.
 test:
     cargo test
 

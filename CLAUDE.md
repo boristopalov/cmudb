@@ -11,7 +11,7 @@ Run `just ci` before pushing: it runs every check CI runs (fmt, clippy, the
 comment policy and the tests), and CI calls the same recipes.
 
 ```sh
-just ci                                      # fmt, clippy, comment policy, tests (RUST_LOG=warn)
+just ci                                      # fmt, clippy, comment policy, tests
 cargo run                                    # SQL shell on a fresh temporary database
 cargo test --test sql_e2e                    # one integration test file
 CMUDB_SEED=<seed> cargo test --test buffer_pool_integration   # replay a failed soak run
