@@ -26,7 +26,7 @@ CONTRIBUTING.md lists the checks CI runs, and ARCHITECTURE.md maps the code.
 ## What's missing:
 - optimizer
 - serializable isolation
-- support for more types, only a few basic types are supported (int, booleans, floats, timestamps)
+- text and other variable-length types; columns are `INT` (32-bit), `BIGINT`, `FLOAT` (64-bit), `BOOLEAN` and `TIMESTAMP` (microseconds, no time zone, written as `'YYYY-MM-DD HH:MM:SS'`)
 - external merge sort, window functions and `DROP TABLE`/`DROP INDEX` have executors, but the binder and planner never produce them
 
 ## Benchmarks

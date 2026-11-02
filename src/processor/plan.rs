@@ -3,7 +3,6 @@ use crate::{
     processor::executor::ExecutorError,
     table_heap::Tuple,
 };
-use ordered_float::OrderedFloat;
 use std::cmp::Ordering;
 use std::convert::Infallible;
 use std::ops::Bound;
@@ -102,6 +101,24 @@ pub enum AggType {
     COUNT,
     /// Window-only: the 1-based position of the row's peer group within its partition.
     RANK,
+}
+
+impl AggType {
+    /// The type of the aggregate over arguments of type `arg`: INT for COUNT and RANK, BIGINT for
+    /// SUM of INTs or BIGINTs, FLOAT for AVG of any number and for SUM of FLOATs, and `arg` for
+    /// MIN and MAX. `None` when the aggregate does not take that type, such as SUM of BOOLEANs.
+    pub fn result_type(&self, arg: DataType) -> Option<DataType> {
+        match self {
+            AggType::COUNT | AggType::RANK => Some(DataType::INT),
+            AggType::MIN | AggType::MAX => Some(arg),
+            AggType::SUM => match arg {
+                DataType::INT | DataType::BIGINT => Some(DataType::BIGINT),
+                DataType::FLOAT => Some(DataType::FLOAT),
+                _ => None,
+            },
+            AggType::AVG => arg.is_numeric().then_some(DataType::FLOAT),
+        }
+    }
 }
 
 pub struct NestedLoopJoinPlanNode {
@@ -344,9 +361,7 @@ impl<C: Copy> Expression<C> {
             Expression::Constant(None) => None,
             Expression::Binary { left, right, op } => match op {
                 Op::Add | Op::Sub | Op::Mul | Op::Div => match (left.dtype(), right.dtype()) {
-                    (Some(DataType::FLOAT), _) | (_, Some(DataType::FLOAT)) => {
-                        Some(DataType::FLOAT)
-                    }
+                    (Some(l), Some(r)) => l.common_numeric(r).or(Some(l)),
                     (l, r) => l.or(r),
                 },
                 _ => Some(DataType::BOOLEAN),
@@ -445,25 +460,19 @@ fn as_bool(v: Option<Value>) -> Result<Option<bool>, ExecutorError> {
     }
 }
 
-/// Orders two values of the same type, comparing INT with FLOAT numerically.
-/// `None` when either side is NULL.
+/// Orders two values, comparing INT, BIGINT and FLOAT numerically. `None` when either side is
+/// NULL.
 fn compare(l: Option<Value>, r: Option<Value>) -> Result<Option<Ordering>, ExecutorError> {
     let (Some(l), Some(r)) = (l, r) else {
         return Ok(None);
     };
-    let ord = match (l, r) {
-        (Value::INT(a), Value::FLOAT(b)) => OrderedFloat(a as f32).cmp(&b),
-        (Value::FLOAT(a), Value::INT(b)) => a.cmp(&OrderedFloat(b as f32)),
-        (a, b) if a.data_type() == b.data_type() => a.cmp(&b),
-        (a, b) => {
-            return Err(ExecutorError::Incomparable { left: a, right: b });
-        }
-    };
-    Ok(Some(ord))
+    l.compare(&r)
+        .map(Some)
+        .ok_or(ExecutorError::Incomparable { left: l, right: r })
 }
 
-/// Arithmetic on INT and FLOAT values. INT with INT stays INT and errors on overflow or
-/// division by zero; any FLOAT operand makes the result FLOAT.
+/// Arithmetic on INT, BIGINT and FLOAT values, computed in the wider operand type (INT, then
+/// BIGINT, then FLOAT). Integer arithmetic errors on overflow and on division by zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Arithmetic {
     Add,
@@ -474,24 +483,39 @@ pub enum Arithmetic {
 
 impl Arithmetic {
     pub(crate) fn apply(self, l: Value, r: Value) -> Result<Value, ExecutorError> {
-        match (l, r) {
-            (Value::INT(a), Value::INT(b)) => self.apply_int(a, b).map(Value::INT),
-            (Value::INT(a), Value::FLOAT(b)) => {
-                Ok(Value::FLOAT(self.apply_float(a as f32, *b).into()))
+        let operands = ExecutorError::ArithmeticOperands {
+            op: self,
+            left: l,
+            right: r,
+        };
+        let Some(common) = l.data_type().common_numeric(r.data_type()) else {
+            return Err(operands);
+        };
+        match (common, l.coerce_to(common), r.coerce_to(common)) {
+            (DataType::INT, Ok(Value::INT(a)), Ok(Value::INT(b))) => self
+                .apply_integer(
+                    i64::from(a),
+                    i64::from(b),
+                    i32::MIN.into()..=i32::MAX.into(),
+                )
+                .map(Value::integer),
+            (DataType::BIGINT, Ok(Value::BIGINT(a)), Ok(Value::BIGINT(b))) => self
+                .apply_integer(a, b, i64::MIN..=i64::MAX)
+                .map(Value::BIGINT),
+            (DataType::FLOAT, Ok(Value::FLOAT(a)), Ok(Value::FLOAT(b))) => {
+                Ok(Value::float(self.apply_float(a.0, b.0)))
             }
-            (Value::FLOAT(a), Value::INT(b)) => {
-                Ok(Value::FLOAT(self.apply_float(*a, b as f32).into()))
-            }
-            (Value::FLOAT(a), Value::FLOAT(b)) => Ok(Value::FLOAT(self.apply_float(*a, *b).into())),
-            (left, right) => Err(ExecutorError::ArithmeticOperands {
-                op: self,
-                left,
-                right,
-            }),
+            _ => Err(operands),
         }
     }
 
-    fn apply_int(self, a: i32, b: i32) -> Result<i32, ExecutorError> {
+    /// Integer arithmetic whose result has to lie in `range`.
+    fn apply_integer(
+        self,
+        a: i64,
+        b: i64,
+        range: std::ops::RangeInclusive<i64>,
+    ) -> Result<i64, ExecutorError> {
         let result = match self {
             Arithmetic::Add => a.checked_add(b),
             Arithmetic::Sub => a.checked_sub(b),
@@ -501,14 +525,16 @@ impl Arithmetic {
             }
             Arithmetic::Div => a.checked_div(b),
         };
-        result.ok_or(ExecutorError::IntegerOverflow {
-            op: self,
-            left: a,
-            right: b,
-        })
+        result
+            .filter(|r| range.contains(r))
+            .ok_or(ExecutorError::IntegerOverflow {
+                op: self,
+                left: a,
+                right: b,
+            })
     }
 
-    fn apply_float(self, a: f32, b: f32) -> f32 {
+    fn apply_float(self, a: f64, b: f64) -> f64 {
         match self {
             Arithmetic::Add => a + b,
             Arithmetic::Sub => a - b,
@@ -623,7 +649,7 @@ mod tests {
         constant(Some(Value::INT(v)))
     }
 
-    fn float(v: f32) -> Expression {
+    fn float(v: f64) -> Expression {
         constant(Some(Value::FLOAT(v.into())))
     }
 
@@ -718,10 +744,31 @@ mod tests {
             let err = eval(int(l), op, int(r)).unwrap_err();
             assert!(
                 matches!(err, ExecutorError::IntegerOverflow { op, left, right }
-                    if op == arith && left == l && right == r),
+                    if op == arith && left == i64::from(l) && right == i64::from(r)),
                 "{err:?}"
             );
         }
+    }
+
+    #[test]
+    fn bigint_overflow_is_an_error_and_int_with_bigint_is_bigint() {
+        let big = |v: i64| constant(Some(Value::BIGINT(v)));
+        assert!(matches!(
+            eval(big(i64::MAX), Op::Add, int(1)).unwrap_err(),
+            ExecutorError::IntegerOverflow { .. }
+        ));
+        assert_eq!(
+            eval_ok(big(3_000_000_000), Op::Add, int(1)),
+            Some(Value::BIGINT(3_000_000_001))
+        );
+        assert_eq!(
+            eval_ok(int(i32::MAX), Op::Sub, big(1)),
+            Some(Value::BIGINT(i64::from(i32::MAX) - 1))
+        );
+        assert_eq!(
+            eval_ok(big(3), Op::Div, float(2.0)),
+            Some(Value::float(1.5))
+        );
     }
 
     fn int_column(col: u32) -> Expression {

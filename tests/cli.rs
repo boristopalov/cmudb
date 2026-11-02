@@ -81,3 +81,17 @@ fn shell_exits_cleanly_at_end_of_input() {
     let (out, _) = run_shell("");
     assert!(out.starts_with("cmudb"));
 }
+
+#[test]
+fn shell_prints_bigints_floats_and_timestamps_readably() {
+    let (out, err) = run_shell(
+        "CREATE TABLE ev (n BIGINT, x FLOAT, at TIMESTAMP);\n\
+         INSERT INTO ev VALUES (9000000000, 16777217, '2024-02-29 12:00:00.5');\n\
+         SELECT * FROM ev;\n",
+    );
+    assert_eq!(err, "", "unexpected stderr");
+    assert!(
+        out.contains("| 9000000000 | 16777217 | 2024-02-29 12:00:00.5 |"),
+        "row not printed readably in:\n{out}"
+    );
+}

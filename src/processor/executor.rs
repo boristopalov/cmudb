@@ -44,19 +44,19 @@ pub enum ExecutorError {
     NotBoolean { value: Value },
     /// A comparison between values of types that do not compare.
     Incomparable { left: Value, right: Value },
-    /// Arithmetic on a value that is not an INT or a FLOAT.
+    /// Arithmetic on a value that is not an INT, BIGINT or FLOAT.
     ArithmeticOperands {
         op: Arithmetic,
         left: Value,
         right: Value,
     },
-    /// INT division by zero.
-    DivisionByZero { dividend: i32 },
-    /// INT arithmetic whose result does not fit an INT.
+    /// INT or BIGINT division by zero.
+    DivisionByZero { dividend: i64 },
+    /// INT or BIGINT arithmetic whose result does not fit the operands' type.
     IntegerOverflow {
         op: Arithmetic,
-        left: i32,
-        right: i32,
+        left: i64,
+        right: i64,
     },
     /// An INSERT wrote more rows than its INT count column holds.
     CountOverflow { count: u64 },
@@ -894,7 +894,7 @@ enum AggState {
     Max(Option<Value>),
     Min(Option<Value>),
     Sum(Option<Value>),
-    Avg { sum: Option<Value>, count: i32 },
+    Avg { sum: Option<Value>, count: i64 },
     Count(i32),
     Rank(i32),
 }
@@ -924,15 +924,15 @@ impl AggState {
     }
 
     /// Folds one input value in. NULLs are skipped, so `COUNT(col)` counts non-NULL values;
-    /// RANK ignores values and moves through `update_rank`. Errors when a SUM or AVG
-    /// overflows INT.
+    /// RANK ignores values and moves through `update_rank`. SUM and AVG add INTs as BIGINTs
+    /// and error when the total overflows a BIGINT.
     fn update(&mut self, v: Option<Value>) -> Result<(), ExecutorError> {
         let Some(v) = v else { return Ok(()) };
         match self {
             Self::Count(count) => *count += 1,
-            Self::Sum(current) => *current = Some(add_to(*current, v)?),
+            Self::Sum(current) => *current = Some(add_to(*current, sum_operand(v))?),
             Self::Avg { sum, count } => {
-                *sum = Some(add_to(*sum, v)?);
+                *sum = Some(add_to(*sum, sum_operand(v))?);
                 *count += 1;
             }
             Self::Max(current) => *current = Some(current.map_or(v, |c| c.max(v))),
@@ -942,7 +942,7 @@ impl AggState {
         Ok(())
     }
 
-    /// The aggregate over the values folded in so far. AVG of INTs truncates toward zero.
+    /// The aggregate over the values folded in so far. AVG is a FLOAT for every input type.
     fn value(&self) -> Result<Option<Value>, ExecutorError> {
         Ok(match self {
             Self::Sum(v) | Self::Max(v) | Self::Min(v) => *v,
@@ -951,8 +951,19 @@ impl AggState {
             Self::Avg {
                 sum: Some(sum),
                 count,
-            } => Some(Arithmetic::Div.apply(*sum, Value::INT(*count))?),
+            } => Some(Arithmetic::Div.apply(
+                Value::float(sum.as_f64().unwrap_or(f64::NAN)),
+                Value::BIGINT(*count),
+            )?),
         })
+    }
+}
+
+/// The value SUM and AVG add: an INT widened to BIGINT, anything else as it is.
+fn sum_operand(v: Value) -> Value {
+    match v {
+        Value::INT(i) => Value::BIGINT(i64::from(i)),
+        other => other,
     }
 }
 
@@ -2370,7 +2381,7 @@ mod tests {
             (
                 ExecutorError::IntegerOverflow {
                     op: Arithmetic::Mul,
-                    left: i32::MAX,
+                    left: i32::MAX.into(),
                     right: 2,
                 },
                 "integer overflow: Mul of 2147483647 and 2",
@@ -2903,17 +2914,36 @@ mod tests {
     }
 
     #[test]
-    fn sum_that_overflows_int_is_an_error() {
+    fn sum_of_ints_is_a_bigint_past_the_int_range() {
         let mut sum = AggState::new(&AggType::SUM);
         sum.update(Some(Value::INT(i32::MAX))).unwrap();
+        sum.update(Some(Value::INT(1))).unwrap();
+        assert_eq!(
+            sum.value().unwrap(),
+            Some(Value::BIGINT(i64::from(i32::MAX) + 1))
+        );
+    }
+
+    #[test]
+    fn sum_that_overflows_bigint_is_an_error() {
+        let mut sum = AggState::new(&AggType::SUM);
+        sum.update(Some(Value::BIGINT(i64::MAX))).unwrap();
         assert!(matches!(
             sum.update(Some(Value::INT(1))).unwrap_err(),
             ExecutorError::IntegerOverflow {
                 op: Arithmetic::Add,
-                left: i32::MAX,
+                left: i64::MAX,
                 right: 1
             }
         ));
+    }
+
+    #[test]
+    fn avg_of_ints_is_a_float() {
+        let mut avg = AggState::new(&AggType::AVG);
+        avg.update(Some(Value::INT(1))).unwrap();
+        avg.update(Some(Value::INT(2))).unwrap();
+        assert_eq!(avg.value().unwrap(), Some(Value::float(1.5)));
     }
 
     #[test]

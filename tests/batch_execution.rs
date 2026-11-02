@@ -334,7 +334,7 @@ fn selective_filter_and_projection() {
     let expected: Rows = l_rows()
         .into_iter()
         .filter(|r| r[1] == int(2))
-        .map(|r| vec![r[0].map(|v| v * Value::INT(10))])
+        .map(|r| vec![r[0].map(|v| Value::INT(v.as_i64().unwrap() as i32 * 10))])
         .collect();
     assert_eq!(
         expected.len(),
@@ -548,7 +548,12 @@ fn update_and_delete_touch_every_row_once() {
 
         let expected: Rows = s_rows()
             .into_iter()
-            .map(|r| vec![r[0], r[1].map(|v| v + Value::INT(100))])
+            .map(|r| {
+                vec![
+                    r[0],
+                    r[1].map(|v| Value::INT(v.as_i64().unwrap() as i32 + 100)),
+                ]
+            })
             .collect();
         assert_eq!(
             sorted(run(&env, &scan(env.s_oid, s_schema()), bs)),

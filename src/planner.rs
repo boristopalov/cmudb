@@ -202,17 +202,22 @@ impl<'a> Planner<'a> {
         Ok(plan)
     }
 
+    /// Each VALUES column takes the first type its rows give it, widened to the common numeric
+    /// type of every row, so `VALUES (1), (2.5)` is a FLOAT column.
     fn plan_values(&self, v: BoundValues) -> Plan {
-        let schema = if let Some(first) = v.rows.first() {
-            let cols: Vec<(DataType, String)> = first
-                .iter()
-                .enumerate()
-                .map(|(i, e)| (e.dtype().unwrap_or(DataType::INT), format!("col{i}")))
-                .collect();
-            Schema::new(cols)
-        } else {
-            Schema::new(vec![])
-        };
+        let width = v.rows.first().map_or(0, Vec::len);
+        let cols: Vec<(DataType, String)> = (0..width)
+            .map(|i| {
+                let dtype = v
+                    .rows
+                    .iter()
+                    .filter_map(|row| row.get(i).and_then(Expression::dtype))
+                    .reduce(|acc, t| acc.common_numeric(t).unwrap_or(acc))
+                    .unwrap_or(DataType::INT);
+                (dtype, format!("col{i}"))
+            })
+            .collect();
+        let schema = Schema::new(cols);
         Plan::Values(ValuesPlanNode {
             schema,
             rows: v.rows,
@@ -617,10 +622,10 @@ fn aggregation_output_schema(
         )
     });
     let agg_cols = aggregates.iter().enumerate().map(|(i, (expr, agg_type))| {
-        let dtype = match agg_type {
-            AggType::COUNT => DataType::INT,
-            _ => expr.dtype().unwrap_or(DataType::INT),
-        };
+        let dtype = expr
+            .dtype()
+            .and_then(|arg| agg_type.result_type(arg))
+            .unwrap_or(DataType::INT);
         (dtype, format!("{}_{}", agg_type_name(agg_type), i))
     });
     Schema::new(group_cols.chain(agg_cols).collect())
@@ -628,7 +633,8 @@ fn aggregation_output_schema(
 
 /// `(col_idx, value)` when `filter` is `col = value` or `value = col` on the scanned table.
 /// An index lookup encodes `value` with its own type, so callers use the index only when
-/// `value` has the column's type; mixed INT and FLOAT equality goes through a filtered scan.
+/// `value` has the column's type. The binder converts a numeric constant to the column's type
+/// when it converts exactly, so `f = 1` on a FLOAT column has a FLOAT constant here.
 fn column_equals_constant(filter: &Expression) -> Option<(ColIdx, Value)> {
     let Expression::Binary {
         left,

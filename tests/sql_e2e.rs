@@ -125,8 +125,12 @@ fn aggregates_with_and_without_group_by() {
     let db = emp_db();
     assert_eq!(ints(&db.exec("SELECT COUNT(*) FROM emp")), vec![[4]]);
     assert_eq!(
-        ints(&db.exec("SELECT SUM(salary), MIN(salary), MAX(salary), AVG(salary) FROM emp")),
-        vec![[1000, 100, 400, 250]]
+        ints(&db.exec("SELECT SUM(salary), MIN(salary), MAX(salary) FROM emp")),
+        vec![[1000, 100, 400]]
+    );
+    assert_eq!(
+        db.exec("SELECT AVG(salary) FROM emp"),
+        vec![vec![Some(Value::float(250.0))]]
     );
     assert_eq!(
         ints(&db.exec("SELECT SUM(salary) + 1 FROM emp")),
@@ -134,13 +138,13 @@ fn aggregates_with_and_without_group_by() {
     );
     assert_eq!(
         sorted(ints(&db.exec(
-            "SELECT dept, COUNT(*), SUM(salary), AVG(salary), MIN(salary), MAX(salary) \
+            "SELECT dept, COUNT(*), SUM(salary), MIN(salary), MAX(salary) \
              FROM emp GROUP BY dept"
         ))),
         vec![
-            vec![10, 2, 300, 150, 100, 200],
-            vec![20, 1, 300, 300, 300, 300],
-            vec![30, 1, 400, 400, 400, 400],
+            vec![10, 2, 300, 100, 200],
+            vec![20, 1, 300, 300, 300],
+            vec![30, 1, 400, 400, 400],
         ]
     );
     assert_eq!(
@@ -1104,4 +1108,351 @@ fn drop_if_exists_skips_a_missing_table_or_index() {
     assert!(db.catalog().index_oid("emp", "emp_id").is_err());
     db.exec("DROP TABLE IF EXISTS emp");
     assert!(db.catalog().table_oid("emp").is_err());
+}
+
+/// One column type for the per-type matrix: its SQL name and distinct values in ascending order,
+/// each as SQL text and as the value it binds to.
+struct TypeCase {
+    sql_type: &'static str,
+    values: Vec<(&'static str, Value)>,
+}
+
+fn type_cases() -> Vec<TypeCase> {
+    let ts = |text: &str| Value::TIMESTAMP(cmudb::catalog::timestamp::parse(text).unwrap());
+    vec![
+        TypeCase {
+            sql_type: "INT",
+            values: vec![
+                ("-7", Value::INT(-7)),
+                ("0", Value::INT(0)),
+                ("2147483647", Value::INT(i32::MAX)),
+            ],
+        },
+        TypeCase {
+            sql_type: "BIGINT",
+            values: vec![
+                ("-5000000000", Value::BIGINT(-5_000_000_000)),
+                ("1", Value::BIGINT(1)),
+                ("9000000000", Value::BIGINT(9_000_000_000)),
+            ],
+        },
+        TypeCase {
+            sql_type: "FLOAT",
+            values: vec![
+                ("-1.5", Value::float(-1.5)),
+                ("2", Value::float(2.0)),
+                ("16777217.0", Value::float(16_777_217.0)),
+            ],
+        },
+        TypeCase {
+            sql_type: "BOOLEAN",
+            values: vec![
+                ("false", Value::BOOLEAN(false)),
+                ("true", Value::BOOLEAN(true)),
+            ],
+        },
+        TypeCase {
+            sql_type: "TIMESTAMP",
+            values: vec![
+                ("TIMESTAMP '1999-12-31 23:59:59'", ts("1999-12-31 23:59:59")),
+                ("'2024-01-01'", ts("2024-01-01")),
+                (
+                    "TIMESTAMP '2024-02-29 12:00:00.5'",
+                    ts("2024-02-29 12:00:00.5"),
+                ),
+            ],
+        },
+    ]
+}
+
+fn single_values(rows: Vec<Row>) -> Vec<Option<Value>> {
+    rows.into_iter().map(|r| r[0]).collect()
+}
+
+#[test]
+fn every_column_type_inserts_compares_sorts_groups_aggregates_and_updates() {
+    for case in type_cases() {
+        let ty = case.sql_type;
+        let values = &case.values;
+        let (lo_sql, lo) = values[0];
+        let (hi_sql, hi) = values[values.len() - 1];
+        let db = Db::new(64);
+        db.exec(&format!("CREATE TABLE t (k INT, v {ty})"));
+        for (k, (sql, _)) in values.iter().enumerate().rev() {
+            db.exec(&format!("INSERT INTO t VALUES ({k}, {sql})"));
+        }
+        db.exec(&format!("INSERT INTO t VALUES (10, {lo_sql}), (11, NULL)"));
+
+        assert_eq!(
+            sorted(ints(
+                &db.exec(&format!("SELECT k FROM t WHERE v = {lo_sql}"))
+            )),
+            vec![vec![0], vec![10]],
+            "{ty}: WHERE ="
+        );
+        assert_eq!(
+            ints(&db.exec(&format!("SELECT COUNT(*) FROM t WHERE v > {lo_sql}"))),
+            vec![[values.len() as i32 - 1]],
+            "{ty}: WHERE >"
+        );
+        let mut expected_order: Vec<Option<Value>> = vec![Some(lo)];
+        expected_order.extend(values.iter().map(|(_, v)| Some(*v)));
+        expected_order.push(None);
+        assert_eq!(
+            single_values(db.exec("SELECT v FROM t ORDER BY v")),
+            expected_order,
+            "{ty}: ORDER BY, NULLs last"
+        );
+        let mut groups = db.exec("SELECT v, COUNT(*) FROM t GROUP BY v");
+        groups.sort();
+        let mut expected_groups: Vec<Row> = values
+            .iter()
+            .map(|(_, v)| vec![Some(*v), int(if *v == lo { 2 } else { 1 })])
+            .collect();
+        expected_groups.push(vec![None, int(1)]);
+        expected_groups.sort();
+        assert_eq!(groups, expected_groups, "{ty}: GROUP BY");
+        assert_eq!(
+            db.exec("SELECT MIN(v), MAX(v), COUNT(v), COUNT(*) FROM t"),
+            vec![vec![
+                Some(lo),
+                Some(hi),
+                int(values.len() as i32 + 1),
+                int(values.len() as i32 + 2)
+            ]],
+            "{ty}: MIN, MAX and COUNT skip NULL"
+        );
+
+        db.exec(&format!("UPDATE t SET v = {hi_sql} WHERE v = {lo_sql}"));
+        assert_eq!(
+            ints(&db.exec(&format!("SELECT COUNT(*) FROM t WHERE v = {hi_sql}"))),
+            vec![[3]],
+            "{ty}: UPDATE"
+        );
+        db.exec("UPDATE t SET v = NULL WHERE k = 11");
+        assert_eq!(
+            ints(&db.exec("SELECT COUNT(v) FROM t")),
+            vec![[values.len() as i32 + 1]],
+            "{ty}: UPDATE to NULL"
+        );
+    }
+}
+
+#[test]
+fn every_column_type_can_be_indexed_and_looked_up() {
+    for case in type_cases() {
+        let ty = case.sql_type;
+        let values = &case.values;
+        let db = Db::new(64);
+        db.exec(&format!("CREATE TABLE t (k INT, v {ty})"));
+        for (k, (sql, _)) in values.iter().enumerate() {
+            db.exec(&format!("INSERT INTO t VALUES ({k}, {sql})"));
+        }
+        db.exec("INSERT INTO t VALUES (99, NULL)");
+        db.exec("CREATE INDEX t_v ON t (v)");
+        for (k, (sql, _)) in values.iter().enumerate() {
+            let query = format!("SELECT k FROM t WHERE v = {sql}");
+            assert!(
+                plan_contains(&db.plan_of(&query), |p| matches!(p, Plan::IndexScan(_))),
+                "{ty}: {query} uses the index"
+            );
+            assert_eq!(ints(&db.exec(&query)), vec![[k as i32]], "{ty}: {query}");
+        }
+        let (first_sql, _) = values[0];
+        assert!(
+            db.try_exec(&format!("INSERT INTO t VALUES (7, {first_sql})"))
+                .is_err(),
+            "{ty}: the index keeps keys unique"
+        );
+    }
+}
+
+#[test]
+fn integer_literals_widen_into_bigint_and_float_columns() {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE t (i INT, b BIGINT, f FLOAT)");
+    db.exec("INSERT INTO t VALUES (1, 1, 1), (2, 2147483648, 2.5), (-2147483648, -3, -4)");
+    db.exec("INSERT INTO t (f, i) VALUES (16777217, 5)");
+    assert_eq!(
+        db.exec("SELECT * FROM t WHERE i = 5"),
+        vec![vec![int(5), None, Some(Value::float(16_777_217.0))]]
+    );
+    assert_eq!(
+        sorted(ints(&db.exec("SELECT i FROM t WHERE f = 1 OR f = 2.5"))),
+        vec![vec![1], vec![2]]
+    );
+    assert_eq!(
+        ints(&db.exec("SELECT i FROM t WHERE b = 2147483648")),
+        vec![[2]]
+    );
+    assert_eq!(ints(&db.exec("SELECT i FROM t WHERE i = 1.0")), vec![[1]]);
+    assert!(db.exec("SELECT i FROM t WHERE i = 1.5").is_empty());
+
+    db.exec("UPDATE t SET f = i + 1, b = i WHERE i = 1");
+    assert_eq!(
+        db.exec("SELECT b, f FROM t WHERE i = 1"),
+        vec![vec![Some(Value::BIGINT(1)), Some(Value::float(2.0))]]
+    );
+    db.exec("UPDATE t SET i = b WHERE i = -2147483648");
+    assert_eq!(ints(&db.exec("SELECT i FROM t WHERE b = -3")), vec![[-3]]);
+    assert_eq!(
+        db.exec("SELECT i + b, b * 2, f / 2, -i, -f FROM t WHERE i = 2"),
+        vec![vec![
+            Some(Value::BIGINT(2_147_483_650)),
+            Some(Value::BIGINT(4_294_967_296)),
+            Some(Value::float(1.25)),
+            int(-2),
+            Some(Value::float(-2.5)),
+        ]]
+    );
+
+    db.exec("CREATE INDEX t_f ON t (f)");
+    let query = "SELECT i FROM t WHERE f = 2";
+    assert!(plan_contains(&db.plan_of(query), |p| matches!(
+        p,
+        Plan::IndexScan(_)
+    )));
+    assert_eq!(ints(&db.exec(query)), vec![[1]]);
+}
+
+#[test]
+fn sum_of_ints_is_a_bigint_and_avg_is_a_float() {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE t (i INT, b BIGINT)");
+    db.exec("INSERT INTO t VALUES (2147483647, 9223372036854775807), (2, 1)");
+    assert_eq!(
+        db.exec("SELECT SUM(i), AVG(i) FROM t"),
+        vec![vec![
+            Some(Value::BIGINT(2_147_483_649)),
+            Some(Value::float(1_073_741_824.5)),
+        ]]
+    );
+    assert!(matches!(
+        db.exec_error("SELECT SUM(b) FROM t"),
+        ExecutorError::IntegerOverflow { .. }
+    ));
+    assert!(matches!(
+        db.exec_error("SELECT i + 1 FROM t"),
+        ExecutorError::IntegerOverflow { .. }
+    ));
+}
+
+#[test]
+fn timestamps_compare_with_string_literals_and_print_readably() {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE ev (id INT, at TIMESTAMP)");
+    db.exec(
+        "INSERT INTO ev VALUES (1, '2024-01-01 09:30:00'), (2, TIMESTAMP '2024-06-15'), \
+         (3, '1970-01-01T00:00:00.000001')",
+    );
+    assert_eq!(
+        sorted(ints(&db.exec(
+            "SELECT id FROM ev WHERE at >= '2024-01-01' AND '2024-12-31' > at"
+        ))),
+        vec![vec![1], vec![2]]
+    );
+    let printed: Vec<String> = db
+        .exec("SELECT at FROM ev ORDER BY at")
+        .into_iter()
+        .map(|r| r[0].expect("not NULL").to_string())
+        .collect();
+    assert_eq!(
+        printed,
+        [
+            "1970-01-01 00:00:00.000001",
+            "2024-01-01 09:30:00",
+            "2024-06-15 00:00:00"
+        ]
+    );
+}
+
+#[test]
+fn type_errors_name_the_column_and_both_types() {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE t (i INT, f FLOAT, ok BOOLEAN, at TIMESTAMP)");
+    let cases = [
+        (
+            "INSERT INTO t VALUES (2147483648, 1, true, NULL)",
+            "2147483648 is out of range for INT column `i`",
+        ),
+        (
+            "INSERT INTO t VALUES (1, true, true, NULL)",
+            "column `f` is FLOAT, got BOOLEAN",
+        ),
+        (
+            "INSERT INTO t VALUES (1.5, 1, true, NULL)",
+            "column `i` is INT, got FLOAT",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 1, true, 1700000000)",
+            "column `at` is TIMESTAMP, got INT",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 1, true, '2024-13-01')",
+            "invalid TIMESTAMP '2024-13-01': expected YYYY-MM-DD[ HH:MM:SS[.ffffff]]",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 1, true)",
+            "INSERT into `t` has 3 values for 4 columns",
+        ),
+        (
+            "INSERT INTO t (i, i) VALUES (1, 2)",
+            "column `i` is listed more than once in INSERT",
+        ),
+        ("UPDATE t SET ok = 1", "column `ok` is BOOLEAN, got INT"),
+        ("UPDATE t SET i = f", "column `i` is INT, got FLOAT"),
+        (
+            "SELECT i FROM t WHERE at > 5",
+            "operator `>` does not take TIMESTAMP and INT",
+        ),
+        (
+            "SELECT i + ok FROM t",
+            "operator `+` does not take INT and BOOLEAN",
+        ),
+        (
+            "SELECT i FROM t WHERE i AND ok",
+            "operator `AND` does not take INT and BOOLEAN",
+        ),
+        ("SELECT -ok FROM t", "cannot negate a BOOLEAN"),
+        (
+            "SELECT SUM(ok) FROM t",
+            "aggregate `SUM` does not take a BOOLEAN argument",
+        ),
+        (
+            "SELECT AVG(at) FROM t",
+            "aggregate `AVG` does not take a TIMESTAMP argument",
+        ),
+        (
+            "SELECT i FROM t WHERE i = 'one'",
+            "unsupported literal: 'one'",
+        ),
+        (
+            "CREATE TABLE z (at TIMESTAMP WITH TIME ZONE)",
+            "unsupported type: TIMESTAMP WITH TIME ZONE",
+        ),
+    ];
+    let failures: Vec<String> = cases
+        .into_iter()
+        .filter_map(|(sql, expected)| match db.query_error(sql) {
+            QueryError::Bind(e) if e.to_string() == expected => None,
+            other => Some(format!("{sql}: expected {expected:?}, got {other}")),
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(
+        db.exec("SELECT * FROM t").is_empty(),
+        "nothing was inserted"
+    );
+}
+
+#[test]
+fn values_columns_widen_to_the_common_numeric_type() {
+    let db = Db::new(16);
+    assert_eq!(
+        db.exec("VALUES (1, 1), (2.5, 3000000000)"),
+        vec![
+            vec![Some(Value::float(1.0)), Some(Value::BIGINT(1))],
+            vec![Some(Value::float(2.5)), Some(Value::BIGINT(3_000_000_000))],
+        ]
+    );
 }

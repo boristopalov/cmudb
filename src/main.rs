@@ -131,10 +131,5 @@ fn print_rows(schema: &Schema, values: &[Row]) {
 }
 
 fn format_value(v: &Value) -> String {
-    match v {
-        Value::BOOLEAN(b) => b.to_string(),
-        Value::INT(i) => i.to_string(),
-        Value::FLOAT(f) => f.into_inner().to_string(),
-        Value::TIMESTAMP(t) => t.to_string(),
-    }
+    v.to_string()
 }
