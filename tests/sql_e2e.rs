@@ -659,3 +659,35 @@ fn insert_rejects_rows_of_the_wrong_width() {
     let db = emp_db();
     assert!(db.try_exec("INSERT INTO emp VALUES (1, 2)").is_err());
 }
+
+#[test]
+fn select_over_a_stored_tuple_shorter_than_its_schema_is_an_error_not_a_panic() {
+    use cmudb::concurrency::{IsolationLevel, mvcc};
+    use cmudb::table_heap::Tuple;
+
+    let without_bitmap = vec![];
+    let bitmap_without_payload = vec![0];
+    for short in [without_bitmap, bitmap_without_payload] {
+        let db = Db::new(16);
+        db.exec("CREATE TABLE t (a INTEGER)");
+        let table = db.catalog().get_table(db.table_oid("t")).expect("table");
+        let txn = db.txn_mgr().begin(IsolationLevel::SnapshotIsolation);
+        mvcc::insert_tuple(
+            &txn,
+            &table.heap,
+            &[],
+            &Tuple {
+                data: short.clone(),
+            },
+        )
+        .expect("the heap stores any bytes");
+        db.txn_mgr().commit(&txn).expect("commit");
+        let err = db
+            .try_exec("SELECT * FROM t")
+            .expect_err("decoding a short tuple fails the query");
+        assert!(
+            err.contains("TupleSchemaMismatch"),
+            "tuple {short:?} gave {err}"
+        );
+    }
+}
