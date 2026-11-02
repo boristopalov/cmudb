@@ -72,7 +72,8 @@ cargo bench --features bench --bench index -- search   # filter by name
 
 Criterion keeps the previous run in `target/criterion` and prints the change against it, so
 to compare a branch, run the same bench on the base branch first and then on the branch.
-The bracketed range is one run's confidence interval, and separate runs on the same machine
+Criterion's bracketed range is one run's 95% confidence interval (the baseline table below
+instead brackets the spread of three runs' medians), and separate runs on the same machine
 differ by more than that: `sort_10k` ranged from 7.77 to 8.37 ms across three runs on one machine.
 Run each side two or three times and only treat a change as real when it is clearly larger
 than the gap between those runs, roughly 10% or more.
