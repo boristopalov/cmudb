@@ -19,8 +19,9 @@ use crate::index::b_plus_page::{
     TOMBSTONE_SLOT_ENCODED_BYTES,
 };
 use crate::index::page_codec::{
-    COMMON_HEADER_BYTES, KIND_HEADER, KIND_INTERNAL, KIND_LEAF, PageCodecError, decode_page_id,
-    decode_record_id, encode_page_id, expect_common_header, peek_common_header, put_common_header,
+    COMMON_HEADER_BYTES, KIND_HEADER, KIND_INTERNAL, KIND_LEAF, PageCodecError,
+    decode_child_page_id, decode_page_id, decode_record_id, encode_page_id, expect_common_header,
+    peek_common_header, put_common_header,
 };
 use std::cmp::Ordering;
 
@@ -207,13 +208,14 @@ impl<B: AsRef<[u8]>> InternalPageView<B> {
         get_u32_le(self.bytes(), INTERNAL_CHILD_COUNT_OFF) as usize
     }
 
-    /// Child `idx`, or `None` past the last child or for a child that names no page.
-    pub fn child(&self, idx: usize) -> Option<PageId> {
+    /// Child `idx`, or `None` past the last child. Fails like `InternalPage::decode` for a
+    /// child slot that names no page or a page id out of range.
+    pub fn child(&self, idx: usize) -> Result<Option<PageId>, PageCodecError> {
         if idx >= self.child_count() {
-            return None;
+            return Ok(None);
         }
         let off = INTERNAL_FIXED_HEADER_BYTES + idx * PAGE_ID_ENCODED_BYTES;
-        decode_page_id(get_u64_le(self.bytes(), off)).ok().flatten()
+        decode_child_page_id(get_u64_le(self.bytes(), off)).map(Some)
     }
 
     /// Raw bytes of key `idx`. Panics if `idx >= size()`.
@@ -233,7 +235,7 @@ impl<B: AsRef<[u8]>> InternalPageView<B> {
     }
 
     /// The child page to descend into when looking for `key`.
-    pub fn child_for(&self, key: &[u8]) -> Option<PageId> {
+    pub fn child_for(&self, key: &[u8]) -> Result<Option<PageId>, PageCodecError> {
         self.child(self.find_child_index(key))
     }
 
@@ -670,6 +672,35 @@ mod tests {
     }
 
     #[test]
+    fn a_corrupt_child_slot_is_a_codec_error_not_a_missing_child() {
+        let key_len = 1u32;
+        let mut internal = InternalPage::new(10);
+        internal.children = vec![pid(11), pid(22)];
+        internal.insert_key(0, IndexKey(vec![5]));
+        let mut buf = [0u8; PAGE_SIZE];
+        internal.encode(&mut buf, key_len).unwrap();
+        let second_child = INTERNAL_FIXED_HEADER_BYTES + PAGE_ID_ENCODED_BYTES;
+
+        put_u64_le(&mut buf, second_child, u64::MAX);
+        let view = InternalPageView::new(&buf[..], key_len).unwrap();
+        assert_eq!(view.child(0), Ok(Some(pid(11))));
+        assert_eq!(
+            view.child_for(&[9]),
+            Err(PageCodecError::Malformed(
+                "an internal page child names no page"
+            ))
+        );
+        assert_eq!(
+            InternalPage::decode(&buf, key_len).err(),
+            view.child_for(&[9]).err()
+        );
+
+        put_u64_le(&mut buf, second_child, u64::from(u32::MAX));
+        let view = InternalPageView::new(&buf[..], key_len).unwrap();
+        assert!(matches!(view.child(1), Err(PageCodecError::BufferError(_))));
+    }
+
+    #[test]
     fn internal_view_matches_owned_page() {
         let key_len = 2u32;
         let mut internal = InternalPage::new(10);
@@ -689,9 +720,9 @@ mod tests {
         assert_eq!(view.max_size(), 10);
         assert_eq!(view.child_count(), 4);
         for (i, c) in internal.children.iter().enumerate() {
-            assert_eq!(view.child(i), Some(*c));
+            assert_eq!(view.child(i), Ok(Some(*c)));
         }
-        assert_eq!(view.child(4), None);
+        assert_eq!(view.child(4), Ok(None));
         for (i, k) in internal.keys.iter().enumerate() {
             assert_eq!(view.key(i), &k.0[..]);
         }

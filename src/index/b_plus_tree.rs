@@ -72,7 +72,7 @@ fn child_for_key(buf: &[u8], key_len: u32, key: &IndexKey) -> Result<Option<Page
         return Ok(None);
     }
     InternalPageView::new(buf, key_len)?
-        .child_for(&key.0)
+        .child_for(&key.0)?
         .ok_or(NO_CHILD_FOR_KEY)
         .map(Some)
 }
