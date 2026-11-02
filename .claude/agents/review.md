@@ -13,7 +13,7 @@ Report real problems, most severe first:
 1. Correctness: wrong results, edge cases, error paths that leave partial state.
 2. Concurrency: lock ordering, leaked resources, races, deadlocks.
 3. Hidden knowledge: comments or unstated rules a reader must remember that should be code (types, asserts, errors, constants, tests).
-4. Scope: changes the linked issue doesn't ask for. Each one is blocking; suggest moving it to a follow-up issue. A fix for a follow-up that an earlier review on this PR marked small is in scope, not scope creep; a fix for one it marked as its own issue is still scope creep.
+4. Scope: changes the linked issue doesn't ask for. Each one is blocking; suggest moving it to a follow-up issue. A fix for a follow-up that an earlier review on this PR marked small is in scope, not scope creep. A fix for one it marked as its own issue, or one that goes past the small limits below, is still scope creep.
 5. Tests: whether the change and its failure paths are covered, and whether tests check what their names claim.
 
 Before writing findings, read the PR's earlier reviews and the author's replies (`gh pr view --comments`). Don't raise a finding again that the author answered with a reason or listed as a follow-up, unless this push changed the code it's about; if you still disagree, say so once in the summary and leave it to Boris.
