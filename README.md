@@ -27,8 +27,9 @@ CONTRIBUTING.md lists the checks CI runs, and ARCHITECTURE.md maps the code.
 - MVCC with snapshot isolation (`BEGIN`/`COMMIT`/`ROLLBACK` in the shell; see docs/mvcc.md)
 - parser (using sqlparser crate), binder and a rule-based planner, each failing with its own
   typed error, and a clear "not supported" error for SQL they do not handle
-- planner choices: an `IndexScan` for `col = constant` on an indexed column, a nested index join
-  when the inner table has an index on its join column, a hash join for other equi-joins, and an
+- planner choices: an `IndexScan` for `col = constant` on a column with a single-column index, a
+  nested index join for an inner join whose right table has a single-column index on its join
+  column, a hash join for other equi-joins, and an
   external merge sort for `ORDER BY` that spills sorted runs to disk once its input passes a
   memory budget
 - scratch pages from sorts and hash joins are freed and their page ids reused
