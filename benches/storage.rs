@@ -84,6 +84,10 @@ fn buffer_pool(c: &mut Criterion) {
 
     let (bpm, _dir) = make_bpm(POOL_FRAMES);
     let hot = allocate_pages(&bpm, HOT_PAGES);
+    assert!(
+        hot.iter().all(|&p| bpm.is_resident(p)),
+        "read_hit and write_hit only measure hits if every hot page is resident"
+    );
     let mut i = 0;
     group.bench_function("read_hit", |b| {
         b.iter(|| {
