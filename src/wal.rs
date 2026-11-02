@@ -110,6 +110,11 @@ pub struct Wal {
     /// checkpoint can carry them into the fresh log.
     open_txns: BTreeMap<TxnId, Vec<u8>>,
     checkpoint_bytes: u64,
+    /// The log was renamed into place and its directory not synced since.
+    rename_unsynced: bool,
+    /// Directory syncs left to fail, for tests.
+    #[cfg(test)]
+    failing_dir_syncs: u32,
 }
 
 /// A record read back from the log, with the page image left in the file.
@@ -172,6 +177,9 @@ impl Wal {
             dirty: false,
             open_txns,
             checkpoint_bytes: CHECKPOINT_LOG_BYTES,
+            rename_unsynced: false,
+            #[cfg(test)]
+            failing_dir_syncs: 0,
         };
         let pages_replayed = wal.pages.len();
         wal.checkpoint(data)?;
@@ -274,6 +282,9 @@ impl Wal {
         }
         self.write_out_with(KIND_DURABLE, &[])?;
         self.file.sync_data()?;
+        if self.rename_unsynced {
+            self.sync_dir()?;
+        }
         self.dirty = false;
         if self.end > self.checkpoint_bytes {
             self.checkpoint(data)?;
@@ -301,20 +312,36 @@ impl Wal {
         }
         encode_record(&mut fresh, KIND_DURABLE, &[]);
         let aside = self.path.with_extension("log-new");
-        {
-            let file = File::create(&aside)?;
-            file.write_all_at(&fresh, 0)?;
-            file.sync_data()?;
-        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&aside)?;
+        file.write_all_at(&fresh, 0)?;
+        file.sync_data()?;
         std::fs::rename(&aside, &self.path)?;
-        if let Some(dir) = self.path.parent() {
-            File::open(dir)?.sync_all()?;
-        }
-        self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        self.file = file;
         self.end = fresh.len() as u64;
         self.buffered.clear();
         self.pages.clear();
         self.dirty = false;
+        self.rename_unsynced = true;
+        self.sync_dir()
+    }
+
+    /// Syncs the log's directory, so the last rename of the log survives a crash. Until it
+    /// succeeds, every durable point retries it before reporting success.
+    fn sync_dir(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.failing_dir_syncs > 0 {
+            self.failing_dir_syncs -= 1;
+            return Err(io::Error::other("injected directory sync failure"));
+        }
+        if let Some(dir) = self.path.parent() {
+            File::open(dir)?.sync_all()?;
+        }
+        self.rename_unsynced = false;
         Ok(())
     }
 
@@ -719,6 +746,37 @@ mod tests {
         assert_eq!(recovery.unfinished.len(), 1);
         assert_eq!(recovery.unfinished[0].id, 7);
         assert_eq!(recovery.unfinished[0].undo.len(), 1);
+    }
+
+    #[test]
+    fn after_a_failed_directory_sync_the_log_keeps_writing_to_the_renamed_file() {
+        let files = Files::new();
+        {
+            let (mut wal, _) = files.open();
+            wal.set_checkpoint_bytes(0);
+            wal.failing_dir_syncs = 2;
+            wal.log_page(0, &page(1)).unwrap();
+            wal.durable_point(&files.data).unwrap_err();
+            assert_eq!(
+                files.data_page(0),
+                page(1),
+                "the checkpoint copied the page"
+            );
+            wal.set_checkpoint_bytes(u64::MAX);
+            wal.log_page(0, &page(2)).unwrap();
+            wal.durable_point(&files.data)
+                .expect_err("the durable point waits for the directory sync");
+            wal.log_page(1, &page(3)).unwrap();
+            wal.durable_point(&files.data).unwrap();
+            assert!(!wal.rename_unsynced);
+        }
+        let (_, recovery) = files.open();
+        assert_eq!(
+            recovery.pages_replayed, 2,
+            "the pages logged after the rename"
+        );
+        assert_eq!(files.data_page(0), page(2));
+        assert_eq!(files.data_page(1), page(3));
     }
 
     #[test]
