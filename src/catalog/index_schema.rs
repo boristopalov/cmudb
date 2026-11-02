@@ -99,7 +99,13 @@ impl TableIndex {
         let tree = match index_type {
             IndexType::BPlusTree => BPlusTree::new(index_name, entry_key_len(&schema), bpm)?,
         };
-        Ok(Self::over(tree, index_type, table_schema, indexed_col_idxs, schema))
+        Ok(Self::over(
+            tree,
+            index_type,
+            table_schema,
+            indexed_col_idxs,
+            schema,
+        ))
     }
 
     /// The index whose tree starts at `header_page_id`, as an earlier [`TableIndex::new`]
@@ -120,7 +126,13 @@ impl TableIndex {
                 BPlusTree::open(index_name, entry_key_len(&schema), header_page_id, bpm)?
             }
         };
-        Ok(Self::over(tree, index_type, table_schema, indexed_col_idxs, schema))
+        Ok(Self::over(
+            tree,
+            index_type,
+            table_schema,
+            indexed_col_idxs,
+            schema,
+        ))
     }
 
     fn over(
