@@ -7,18 +7,16 @@ CI runs these on every pull request; run them locally before pushing:
 ```sh
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
+cargo clippy --benches --features bench -- -D warnings
 python3 scripts/check_comments.py
 cargo test
 cargo llvm-cov --fail-under-lines 80   # needs cargo-llvm-cov
 ```
 
-Benchmarks in `benches/` stay out of CI on purpose: they sit behind the `bench` feature, so
-none of the commands above builds them (the comment policy check still covers them). When you change an API they use, or the benches
-themselves, check them locally. The second command runs each bench once without timing it,
-including the checks it makes on its results:
+CI type-checks the benchmarks in `benches/` but never runs them. To run each bench once
+without timing it, including the checks it makes on its results:
 
 ```sh
-cargo clippy --all-targets --features bench -- -D warnings
 cargo bench --features bench -- --test
 ```
 

@@ -24,9 +24,8 @@ This is a Rust implementation of a relational DBMS. It takes heavy inspiration f
 
 ## Benchmarks
 
-Benchmarks use [criterion](https://docs.rs/criterion) and sit behind the `bench` feature, so
-CI (`cargo clippy --all-targets`, `cargo test`, `cargo llvm-cov`) neither builds nor runs them.
-Run them by hand on a quiet machine:
+Benchmarks use [criterion](https://docs.rs/criterion) and sit behind the `bench` feature. CI
+type-checks them on every pull request but never runs them. Run them by hand on a quiet machine:
 
 ```sh
 cargo bench --features bench                  # everything, about 4 minutes
@@ -44,7 +43,8 @@ row and key, and each query returns the expected rows. The join and index query 
 check that the planner still picks the plan they are named after, so a change fails loudly
 instead of showing up as a speedup.
 The query benches run SQL through the same harness as `tests/common`, so they measure whichever
-executor model the branch has.
+executor model the branch has. Their timings include parsing, binding and planning each
+statement, not just execution, which matters most for small queries like `index_point_lookup`.
 
 Baseline, one run on a 4 vCPU Xeon @ 2.80GHz cloud VM, rustc 1.97, release build, on the
 code as of the CI pull request, before batched execution, page views and MVCC (median, with
