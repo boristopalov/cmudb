@@ -139,13 +139,42 @@ pub struct HashJoinPlanNode {
 pub struct ExternalMergeSortPlanNode {
     pub schema: Schema,
     pub child: Box<Plan>,
-    pub order_by_exprs: Vec<Expression>,
+    pub order_by_exprs: Vec<SortExpr>,
 }
 
 pub struct SortPlanNode {
     pub schema: Schema,
     pub child: Box<Plan>,
-    pub order_by_exprs: Vec<Expression>,
+    pub order_by_exprs: Vec<SortExpr>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+/// One `ORDER BY` key: the expression to sort on and which way to sort it.
+#[derive(Clone)]
+pub struct SortExpr {
+    pub expr: Expression,
+    pub direction: SortDirection,
+}
+
+impl SortExpr {
+    pub fn ascending(expr: Expression) -> Self {
+        Self {
+            expr,
+            direction: SortDirection::Ascending,
+        }
+    }
+
+    pub fn descending(expr: Expression) -> Self {
+        Self {
+            expr,
+            direction: SortDirection::Descending,
+        }
+    }
 }
 
 /// Computes window aggregates without collapsing rows. For

@@ -6,7 +6,7 @@ justifications directly above an `unsafe` block. Doc comments may not hold
 hidden knowledge such as TODOs, workarounds or invariants; that belongs in
 code (types, asserts, errors, tests).
 
-Usage: scripts/check_comments.py [paths...]   (defaults to src/ and tests/)
+Usage: scripts/check_comments.py [paths...]   (defaults to src/, tests/ and benches/)
 """
 
 import pathlib
@@ -84,7 +84,7 @@ def check(path: pathlib.Path):
 
 
 def main(argv):
-    roots = [pathlib.Path(p) for p in (argv or ["src", "tests"])]
+    roots = [pathlib.Path(p) for p in (argv or ["src", "tests", "benches"])]
     files = sorted(f for r in roots for f in ([r] if r.is_file() else r.rglob("*.rs")))
     problems = [(f, line, msg) for f in files for line, msg in check(f)]
     for f, line, msg in problems:

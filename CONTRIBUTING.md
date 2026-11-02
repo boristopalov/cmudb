@@ -7,9 +7,17 @@ CI runs these on every pull request; run them locally before pushing:
 ```sh
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
+cargo clippy --benches --features bench -- -D warnings
 python3 scripts/check_comments.py
 cargo test
 cargo llvm-cov --fail-under-lines 80   # needs cargo-llvm-cov
+```
+
+CI type-checks the benchmarks in `benches/` but never runs them. To run each bench once
+without timing it, including the checks it makes on its results:
+
+```sh
+cargo bench --features bench -- --test
 ```
 
 Unit tests live next to the code in `#[cfg(test)] mod tests`. Integration and
@@ -33,7 +41,7 @@ it:
 
 `scripts/check_comments.py` enforces this in CI:
 
-- No `//` line comments and no `/* */` block comments in `src/` or `tests/`.
+- No `//` line comments and no `/* */` block comments in `src/`, `tests/` or `benches/`.
 - Doc comments (`///`, `//!`) are allowed to say what an item does, returns or
   fails with. They may not carry hidden knowledge, so words such as TODO,
   FIXME, hack, workaround, "for now", temporary, invariant, assume, must,

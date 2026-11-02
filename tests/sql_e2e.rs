@@ -180,13 +180,75 @@ fn order_by_and_limit() {
 }
 
 #[test]
-#[ignore = "known gap: ORDER BY ... DESC is parsed but sorts ascending"]
 fn order_by_desc() {
     let db = emp_db();
     assert_eq!(
         ints(&db.exec("SELECT id FROM emp ORDER BY salary DESC")),
         vec![[4], [3], [2], [1]]
     );
+    assert_eq!(
+        ints(&db.exec("SELECT id FROM emp ORDER BY salary ASC")),
+        vec![[1], [2], [3], [4]]
+    );
+}
+
+#[test]
+fn order_by_mixes_directions_per_key() {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE t (a INTEGER, b INTEGER)");
+    db.exec("INSERT INTO t VALUES (3, 1), (1, 2), (2, 3), (1, 1)");
+    assert_eq!(
+        ints(&db.exec("SELECT a, b FROM t ORDER BY a DESC, b")),
+        vec![[3, 1], [2, 3], [1, 1], [1, 2]]
+    );
+    assert_eq!(
+        ints(&db.exec("SELECT a, b FROM t ORDER BY a, b DESC")),
+        vec![[1, 2], [1, 1], [2, 3], [3, 1]]
+    );
+    assert_eq!(
+        ints(&db.exec("SELECT a FROM t ORDER BY b DESC, a DESC LIMIT 2")),
+        vec![[2], [1]]
+    );
+}
+
+#[test]
+fn order_by_desc_puts_nulls_last() {
+    let db = emp_db();
+    let rows = db.exec("SELECT id FROM emp ORDER BY bonus DESC");
+    assert_eq!(
+        rows,
+        vec![vec![int(4)], vec![int(2)], vec![int(1)], vec![int(3)]],
+        "NULL sorts below every value, so it comes last when descending"
+    );
+}
+
+#[test]
+fn order_by_desc_applies_after_group_by() {
+    let db = emp_db();
+    assert_eq!(
+        ints(&db.exec("SELECT dept, COUNT(*) FROM emp GROUP BY dept ORDER BY dept DESC")),
+        vec![[30, 1], [20, 1], [10, 2]]
+    );
+}
+
+#[test]
+fn order_by_options_that_are_not_supported_are_rejected() {
+    let db = emp_db();
+    for (sql, expected) in [
+        (
+            "SELECT id FROM emp ORDER BY bonus NULLS FIRST",
+            "NULLS FIRST/LAST",
+        ),
+        (
+            "SELECT id FROM emp ORDER BY bonus DESC NULLS LAST",
+            "NULLS FIRST/LAST",
+        ),
+        ("SELECT id FROM emp ORDER BY id WITH FILL", "WITH FILL"),
+        ("SELECT id FROM emp ORDER BY id INTERPOLATE", "INTERPOLATE"),
+    ] {
+        let err = db.try_exec(sql).unwrap_err();
+        assert!(err.contains(expected), "{sql}: {err}");
+    }
 }
 
 #[test]
