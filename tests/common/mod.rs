@@ -2,6 +2,8 @@
 //! that returns each statement's rows as decoded values.
 #![allow(dead_code)]
 
+pub mod seed;
+
 use cmudb::catalog::Value;
 use cmudb::processor::plan::Plan;
 use cmudb::{Database, StatementResult};

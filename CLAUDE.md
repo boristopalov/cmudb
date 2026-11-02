@@ -7,15 +7,16 @@ executor and where each kind of test goes. MVCC is described in docs/mvcc.md.
 
 ## Commands
 
+Run `just ci` before pushing: it runs CI's lint and test jobs (fmt, clippy, the
+comment policy and the tests) through the same recipes CI calls. CI's coverage
+job also runs `just coverage`.
+
 ```sh
+just ci                                      # fmt, clippy, comment policy, tests
 cargo run                                    # SQL shell on a fresh temporary database
-cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings
-cargo clippy --benches --features bench -- -D warnings
-python3 scripts/check_comments.py
-RUST_LOG=warn cargo test                     # CI's log level; debug logging is much slower
 cargo test --test sql_e2e                    # one integration test file
-cargo llvm-cov --fail-under-lines 80         # CI's coverage gate; needs cargo-llvm-cov
+CMUDB_SEED=<seed> cargo test --test buffer_pool_integration   # replay a failed soak run
+just coverage                                # CI's 80% coverage gate; needs cargo-llvm-cov
 ```
 
 ## Invariants

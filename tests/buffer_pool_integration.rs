@@ -1,19 +1,14 @@
+mod common;
+
 use std::sync::{Arc, Barrier};
 use std::thread;
 
 use cmudb::buffer_pool::{BpmError, BufferPoolManager};
-use env_logger::Env;
+use common::seed::{Stream, stream_rng, with_seed};
 use parking_lot::RwLock;
-
-fn init_logger() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        let _ = env_logger::Builder::from_env(Env::default().default_filter_or("debug")).try_init();
-    });
-}
+use rand::Rng;
 
 fn make_bpm(num_frames: usize) -> (Arc<BufferPoolManager>, tempfile::TempDir) {
-    init_logger();
     cmudb::testing::bpm(num_frames)
 }
 
@@ -289,6 +284,10 @@ fn test_eviction() {
 
 #[test]
 fn soak_randomized_workload_with_more_pages_than_frames() {
+    with_seed(run_buffer_pool_soak);
+}
+
+fn run_buffer_pool_soak(seed: u64) {
     const NUM_FRAMES: usize = 66;
     const NUM_PAGES: usize = 100;
     const THREADS: usize = 20;
@@ -296,9 +295,10 @@ fn soak_randomized_workload_with_more_pages_than_frames() {
 
     let (bpm, _tmp) = make_bpm(NUM_FRAMES);
 
+    let mut setup_rng = stream_rng(seed, Stream::Setup);
     let mut expected = Vec::with_capacity(NUM_PAGES);
     for _ in 0..NUM_PAGES {
-        let val = rand::random::<u8>();
+        let val = setup_rng.random::<u8>();
         {
             let mut page = bpm.new_page().unwrap();
             page.data_mut()[0] = val;
@@ -315,10 +315,11 @@ fn soak_randomized_workload_with_more_pages_than_frames() {
         let expected = expected.clone();
         let barrier = start_barrier.clone();
         let handle = thread::spawn(move || {
+            let mut rng = stream_rng(seed, Stream::Worker(t));
             barrier.wait();
             for _ in 0..OPS_PER_THREAD {
-                let page_id = rand::random_range(0..NUM_PAGES);
-                let should_read = rand::random_bool(0.5);
+                let page_id = rng.random_range(0..NUM_PAGES);
+                let should_read = rng.random_bool(0.5);
                 if should_read {
                     match bpm.read_page(page_id) {
                         Ok(page) => {

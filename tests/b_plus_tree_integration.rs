@@ -1,3 +1,5 @@
+mod common;
+
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -6,18 +8,10 @@ use cmudb::catalog::index_schema::{IndexKey, IndexValue};
 use cmudb::index::BPlusTree;
 use cmudb::index::Index;
 use cmudb::table_heap::RecordId;
-use env_logger::Env;
+use common::seed::{Stream, stream_rng, with_seed};
 use rand::Rng;
 
-fn init_logger() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        let _ = env_logger::Builder::from_env(Env::default().default_filter_or("debug")).try_init();
-    });
-}
-
 fn make_bpm(num_frames: usize) -> (Arc<BufferPoolManager>, tempfile::TempDir) {
-    init_logger();
     cmudb::testing::bpm(num_frames)
 }
 
@@ -70,6 +64,10 @@ fn b_plus_tree_single_thread() {
 
 #[test]
 fn b_plus_tree_soak_concurrent() {
+    with_seed(run_b_plus_tree_soak);
+}
+
+fn run_b_plus_tree_soak(seed: u64) {
     let num_frames = 50;
     let key_len = 128;
     let threads = 20;
@@ -88,7 +86,7 @@ fn b_plus_tree_soak_concurrent() {
         let tree = tree.clone();
         let barrier = barrier.clone();
         handles.push(thread::spawn(move || {
-            let mut rng = rand::rng();
+            let mut rng = stream_rng(seed, Stream::Worker(t));
             barrier.wait();
 
             for op_i in 0..ops_per_thread {
