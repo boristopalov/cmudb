@@ -22,7 +22,8 @@ A SQL statement flows top to bottom:
 The catalog is in memory. `cmudb::Database` (`src/database.rs`) runs the whole pipeline and
 owns the session's transaction block (`BEGIN`, `COMMIT`, `ROLLBACK`, autocommit). It returns a
 typed `StatementResult` per statement. The shell (`src/main.rs`) only prints those results, and
-`tests/common` is a thin wrapper over `Database`.
+`tests/common` is a thin wrapper over `Database`. One `Database` is one session: callers of
+`execute` share its `BEGIN` block, and `execute_in` runs SQL in a transaction the caller owns.
 
 ## Pins and latches
 

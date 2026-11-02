@@ -103,6 +103,9 @@ pub enum QueryError {
     TransactionAborted,
     /// `COMMIT` or `ROLLBACK` while the abort of a failed transaction is still to be retried.
     RollbackPending,
+    /// `BEGIN`, `COMMIT` or `ROLLBACK` passed to [`Database::execute_in`], whose caller owns
+    /// the transaction.
+    TransactionStatementInExecuteIn,
     /// Committing failed, so the transaction was rolled back instead.
     Commit(TxnError),
     /// A statement failed and its transaction was rolled back. `in_block` says whether the
@@ -135,6 +138,9 @@ impl fmt::Display for QueryError {
             }
             QueryError::RollbackPending => {
                 f.write_str("rollback of the transaction is still pending")
+            }
+            QueryError::TransactionStatementInExecuteIn => {
+                f.write_str("BEGIN, COMMIT and ROLLBACK cannot run inside a caller's transaction")
             }
             QueryError::Commit(e) => write!(f, "commit: {e} (transaction rolled back)"),
             QueryError::RolledBack {
@@ -185,6 +191,10 @@ type Session = Option<ExplicitTxn>;
 
 /// A database: its buffer pool, catalog and transaction manager, plus the transaction block
 /// that `BEGIN` opened, if any.
+///
+/// A `Database` is one session. Every caller of [`Database::execute`] shares that block, so
+/// two threads that both call it run inside the same `BEGIN`. To give a caller a transaction
+/// of its own, begin one on [`Database::txn_mgr`] and run SQL with [`Database::execute_in`].
 pub struct Database {
     catalog: Catalog,
     bpm: Arc<BufferPoolManager>,
@@ -249,26 +259,32 @@ impl Database {
     }
 
     /// Like [`Database::execute`], but hands each statement's result to `on_result` as soon
-    /// as that statement finishes. Calling back into this database from `on_result`
-    /// deadlocks.
+    /// as that statement finishes. `on_result` runs with the session unlocked, so it can run
+    /// more SQL on this database.
     pub fn execute_with(
         &self,
         sql: &str,
         mut on_result: impl FnMut(StatementResult),
     ) -> Result<(), QueryError> {
-        let statements = parse(sql)?;
-        let mut session = self.session.lock();
-        for stmt in statements {
-            self.retry_pending_abort(&mut session)?;
-            let result = match stmt {
-                Statement::StartTransaction { .. } => self.begin_block(&mut session)?,
-                Statement::Commit { .. } => self.end_block(&mut session, true)?,
-                Statement::Rollback { .. } => self.end_block(&mut session, false)?,
-                stmt => self.run_in_session(&mut session, |txn| self.run_statement(txn, &stmt))?,
-            };
+        for stmt in parse(sql)? {
+            let result = self.execute_statement(&mut self.session.lock(), stmt)?;
             on_result(result);
         }
         Ok(())
+    }
+
+    fn execute_statement(
+        &self,
+        session: &mut Session,
+        stmt: Statement,
+    ) -> Result<StatementResult, QueryError> {
+        self.retry_pending_abort(session)?;
+        match stmt {
+            Statement::StartTransaction { .. } => self.begin_block(session),
+            Statement::Commit { .. } => self.end_block(session, true),
+            Statement::Rollback { .. } => self.end_block(session, false),
+            stmt => self.run_in_session(session, |txn| self.run_statement(txn, &stmt)),
+        }
     }
 
     /// Runs `plan` the way [`Database::execute`] runs a statement: in the open transaction
@@ -282,14 +298,20 @@ impl Database {
     }
 
     /// Runs every statement in `sql` inside `txn`, which the caller commits or aborts. The
-    /// session's transaction block is left alone, and `BEGIN`, `COMMIT` and `ROLLBACK` are
-    /// rejected.
+    /// session's transaction block is left alone.
+    ///
+    /// Fails with [`QueryError::TransactionStatementInExecuteIn`], before running anything,
+    /// if `sql` holds a `BEGIN`, `COMMIT` or `ROLLBACK`.
     pub fn execute_in(
         &self,
         txn: &Arc<Transaction>,
         sql: &str,
     ) -> Result<Vec<StatementResult>, QueryError> {
-        parse(sql)?
+        let statements = parse(sql)?;
+        if statements.iter().any(is_transaction_statement) {
+            return Err(QueryError::TransactionStatementInExecuteIn);
+        }
+        statements
             .iter()
             .map(|stmt| self.run_statement(txn, stmt))
             .collect()
@@ -512,10 +534,17 @@ fn parse(sql: &str) -> Result<Vec<Statement>, QueryError> {
     Parser::parse_sql(&GenericDialect, sql).map_err(QueryError::Parse)
 }
 
+fn is_transaction_statement(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::StartTransaction { .. } | Statement::Commit { .. } | Statement::Rollback { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::concurrency::mvcc;
+    use crate::concurrency::{TransactionState, mvcc};
     use crate::testing;
 
     fn ints(result: &StatementResult) -> Vec<Vec<i32>> {
@@ -607,6 +636,25 @@ mod tests {
     }
 
     #[test]
+    fn on_result_can_run_more_sql_on_the_same_database() {
+        let db = Database::scratch(16).unwrap();
+        let mut counts_seen_by_callback = Vec::new();
+
+        db.execute_with(
+            "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2);",
+            |result| {
+                if let StatementResult::Count { .. } = result {
+                    let follow_up = db.execute("SELECT * FROM t;").unwrap();
+                    counts_seen_by_callback.push(ints(&follow_up[0]).len());
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(counts_seen_by_callback, vec![2]);
+    }
+
+    #[test]
     fn a_rolled_back_block_leaves_no_rows_behind() {
         let db = Database::scratch(16).unwrap();
         db.execute("CREATE TABLE t (a INTEGER);").unwrap();
@@ -671,6 +719,30 @@ mod tests {
             ints(&db.execute("SELECT * FROM t;").unwrap()[0]),
             vec![vec![7]]
         );
+    }
+
+    #[test]
+    fn execute_in_rejects_transaction_statements_and_leaves_the_transaction_running() {
+        let db = Database::scratch(16).unwrap();
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        let txn = db.txn_mgr().begin(IsolationLevel::SnapshotIsolation);
+
+        for sql in ["BEGIN;", "INSERT INTO t VALUES (1); COMMIT;", "ROLLBACK;"] {
+            assert!(
+                matches!(
+                    db.execute_in(&txn, sql),
+                    Err(QueryError::TransactionStatementInExecuteIn)
+                ),
+                "{sql}"
+            );
+        }
+
+        assert_eq!(txn.state(), TransactionState::Running);
+        assert!(
+            ints(&db.execute_in(&txn, "SELECT * FROM t;").unwrap()[0]).is_empty(),
+            "nothing in the rejected batch ran"
+        );
+        db.txn_mgr().commit(&txn).unwrap();
     }
 
     #[test]
