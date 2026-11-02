@@ -806,7 +806,42 @@ fn binder_and_planner_errors_are_reported() {
             "SELECT * FROM emp, dept",
             unsupported(Unsupported::CommaSeparatedFrom),
         ),
-        ("DROP TABLE emp", unsupported(Unsupported::Statement)),
+        (
+            "DROP VIEW emp",
+            BinderError::UnsupportedDropObject {
+                object_type: "VIEW".into(),
+            },
+        ),
+        (
+            "DROP TABLE emp, dept",
+            unsupported(Unsupported::DropManyObjects),
+        ),
+        (
+            "DROP TABLE emp CASCADE",
+            unsupported(Unsupported::DropCascade),
+        ),
+        (
+            "DROP TABLE emp ON dept",
+            unsupported(Unsupported::DropTableOn),
+        ),
+        (
+            "DROP TABLE nope",
+            BinderError::TableNotFound {
+                table: "nope".into(),
+            },
+        ),
+        (
+            "DROP INDEX nope",
+            BinderError::IndexNotFound {
+                index: "nope".into(),
+            },
+        ),
+        (
+            "DROP INDEX nope ON nowhere",
+            BinderError::TableNotFound {
+                table: "nowhere".into(),
+            },
+        ),
         (
             "SELECT id FROM emp JOIN dept ON emp.dept = dept.id",
             BinderError::AmbiguousColumn {
@@ -966,4 +1001,94 @@ fn select_over_a_stored_tuple_shorter_than_its_schema_is_an_error_not_a_panic() 
             "tuple {short:?} gave {err}"
         );
     }
+}
+
+fn scans_through_an_index(plan: &Plan) -> bool {
+    match plan {
+        Plan::IndexScan(_) => true,
+        Plan::Projection(p) => scans_through_an_index(&p.child),
+        Plan::Filter(p) => scans_through_an_index(&p.child),
+        _ => false,
+    }
+}
+
+#[test]
+fn drop_table_removes_the_table_and_its_indexes() {
+    let db = emp_db();
+    db.exec("CREATE INDEX emp_id ON emp (id)");
+    db.exec("DROP TABLE emp");
+    let err = db
+        .try_exec("SELECT * FROM emp")
+        .expect_err("the table is gone");
+    assert!(err.contains("table not found: emp"), "{err}");
+    let err = db.try_exec("DROP TABLE emp").expect_err("dropped already");
+    assert!(err.contains("table not found: emp"), "{err}");
+    let err = db
+        .try_exec("DROP INDEX emp_id")
+        .expect_err("dropped with emp");
+    assert!(err.contains("index not found: emp_id"), "{err}");
+
+    db.exec("CREATE TABLE emp (id INTEGER)");
+    db.exec("CREATE INDEX emp_id ON emp (id)");
+    db.exec("INSERT INTO emp VALUES (7)");
+    assert_eq!(
+        ints(&db.exec("SELECT id FROM emp WHERE id = 7")),
+        vec![[7]],
+        "a table and index can reuse the dropped names"
+    );
+}
+
+#[test]
+fn drop_index_makes_queries_fall_back_to_a_scan() {
+    let db = emp_db();
+    db.exec("CREATE INDEX emp_id ON emp (id)");
+    let lookup = "SELECT salary FROM emp WHERE id = 3";
+    assert!(scans_through_an_index(&db.plan_of(lookup)));
+
+    db.exec("DROP INDEX emp_id");
+    assert!(
+        !scans_through_an_index(&db.plan_of(lookup)),
+        "the planner no longer picks the dropped index"
+    );
+    assert_eq!(ints(&db.exec(lookup)), vec![[300]]);
+    assert!(db.catalog().index_oid("emp", "emp_id").is_err());
+}
+
+#[test]
+fn drop_index_on_a_table_picks_that_tables_index() {
+    let db = emp_db();
+    db.exec("CREATE TABLE dept (id INTEGER)");
+    db.exec("CREATE INDEX by_id ON emp (id)");
+    db.exec("CREATE INDEX by_id ON dept (id)");
+
+    let err = db
+        .try_exec("DROP INDEX by_id")
+        .expect_err("two tables have an index called by_id");
+    assert!(err.contains("ambiguous"), "{err}");
+
+    db.exec("DROP INDEX by_id ON dept");
+    assert!(db.catalog().index_oid("dept", "by_id").is_err());
+    assert!(db.catalog().index_oid("emp", "by_id").is_ok());
+    db.exec("DROP INDEX by_id");
+    assert!(db.catalog().index_oid("emp", "by_id").is_err());
+}
+
+#[test]
+fn drop_if_exists_skips_a_missing_table_or_index() {
+    let db = emp_db();
+    for sql in [
+        "DROP TABLE IF EXISTS nope",
+        "DROP INDEX IF EXISTS nope",
+        "DROP INDEX IF EXISTS nope ON emp",
+        "DROP INDEX IF EXISTS nope ON nowhere",
+    ] {
+        let results = db.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(results.len(), 1, "{sql}");
+    }
+
+    db.exec("CREATE INDEX emp_id ON emp (id)");
+    db.exec("DROP INDEX IF EXISTS emp_id");
+    assert!(db.catalog().index_oid("emp", "emp_id").is_err());
+    db.exec("DROP TABLE IF EXISTS emp");
+    assert!(db.catalog().table_oid("emp").is_err());
 }

@@ -1,6 +1,7 @@
-//! Executor tests on hand-built plans: hash join, and the plan nodes the planner
-//! does not emit yet (external merge sort, window functions, DROP TABLE/INDEX).
-//! Plans are built by hand on top of tables created through SQL.
+//! Executor tests on hand-built plans: hash join, the plan nodes the planner
+//! does not emit yet (external merge sort, window functions), and DROP plans
+//! whose target is already gone when they run. Plans are built by hand on top
+//! of tables created through SQL.
 mod common;
 
 use cmudb::catalog::{DataType, Schema, Value};
@@ -515,7 +516,7 @@ fn drop_index_then_drop_table() {
     let index_oid = db.catalog().index_oid("t", "t_id").unwrap();
 
     db.run_plan(&Plan::DropIndex(DropIndexPlanNode {
-        index_oid,
+        index_oid: Some(index_oid),
         if_exists: false,
     }))
     .unwrap();
@@ -532,18 +533,18 @@ fn drop_index_then_drop_table() {
         "falls back to a sequential scan once the index is gone"
     );
     let again = Plan::DropIndex(DropIndexPlanNode {
-        index_oid,
+        index_oid: Some(index_oid),
         if_exists: false,
     });
     assert!(db.run_plan(&again).is_err());
     let again = Plan::DropIndex(DropIndexPlanNode {
-        index_oid,
+        index_oid: Some(index_oid),
         if_exists: true,
     });
     db.run_plan(&again).unwrap();
 
     db.run_plan(&Plan::DropTable(DropTablePlanNode {
-        table_oid,
+        table_oid: Some(table_oid),
         if_exists: false,
     }))
     .unwrap();
@@ -552,16 +553,39 @@ fn drop_index_then_drop_table() {
         BinderError::TableNotFound { table: "t".into() }
     );
     let again = Plan::DropTable(DropTablePlanNode {
-        table_oid,
+        table_oid: Some(table_oid),
         if_exists: false,
     });
     assert!(db.run_plan(&again).is_err());
     let again = Plan::DropTable(DropTablePlanNode {
-        table_oid,
+        table_oid: Some(table_oid),
         if_exists: true,
     });
     db.run_plan(&again).unwrap();
     db.exec("CREATE TABLE t (id INTEGER)");
+}
+
+#[test]
+fn drop_plans_without_a_target_fail_unless_if_exists() {
+    let db = Db::new(8);
+    let missing_table = |if_exists| {
+        Plan::DropTable(DropTablePlanNode {
+            table_oid: None,
+            if_exists,
+        })
+    };
+    let missing_index = |if_exists| {
+        Plan::DropIndex(DropIndexPlanNode {
+            index_oid: None,
+            if_exists,
+        })
+    };
+    let err = db.run_plan(&missing_table(false)).unwrap_err();
+    assert!(err.contains("table does not exist"), "{err}");
+    let err = db.run_plan(&missing_index(false)).unwrap_err();
+    assert!(err.contains("index does not exist"), "{err}");
+    db.run_plan(&missing_table(true)).unwrap();
+    db.run_plan(&missing_index(true)).unwrap();
 }
 
 #[test]

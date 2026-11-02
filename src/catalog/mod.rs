@@ -258,6 +258,18 @@ impl Catalog {
             .ok_or(CatalogError::IndexDoesNotExist)
     }
 
+    /// The oids of every index called `index_name`, across all tables, in ascending order.
+    pub fn index_oids_named(&self, index_name: &str) -> Vec<u32> {
+        let entries = self.entries.read().unwrap();
+        let mut oids: Vec<u32> = entries
+            .index_oids_by_table_name
+            .values()
+            .filter_map(|table_indexes| table_indexes.get(index_name).copied())
+            .collect();
+        oids.sort_unstable();
+        oids
+    }
+
     pub fn get_index(&self, oid: u32) -> Result<Arc<IndexInfo>, CatalogError> {
         let entries = self.entries.read().unwrap();
         entries

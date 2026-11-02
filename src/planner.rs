@@ -4,15 +4,16 @@ use std::ops::Bound;
 use crate::catalog::Value;
 use crate::catalog::{Catalog, DataType, Schema};
 use crate::parser::{
-    BoundCreateIndex, BoundCreateTable, BoundDelete, BoundInsert, BoundJoin, BoundSelect,
-    BoundStatement, BoundUpdate, BoundValues, Scope, TableScope,
+    BoundCreateIndex, BoundCreateTable, BoundDelete, BoundDropIndex, BoundDropTable, BoundInsert,
+    BoundJoin, BoundSelect, BoundStatement, BoundUpdate, BoundValues, Scope, TableScope,
 };
 use crate::processor::plan::{
     AggType, AggregationPlanNode, ColIdx, ColumnAssignment, CreateIndexPlanNode,
-    CreateTablePlanNode, DeletePlanNode, Expression, ExternalMergeSortPlanNode, FilterPlanNode,
-    HashJoinPlanNode, IndexScanPlanNode, InsertPlanNode, JoinColumn, JoinPredicate, JoinType,
-    LimitPlanNode, NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, Op, Plan, ProjectionPlanNode,
-    SeqScanPlanNode, Side, UpdatePlanNode, ValuesPlanNode,
+    CreateTablePlanNode, DeletePlanNode, DropIndexPlanNode, DropTablePlanNode, Expression,
+    ExternalMergeSortPlanNode, FilterPlanNode, HashJoinPlanNode, IndexScanPlanNode, InsertPlanNode,
+    JoinColumn, JoinPredicate, JoinType, LimitPlanNode, NestedIndexJoinPlanNode,
+    NestedLoopJoinPlanNode, Op, Plan, ProjectionPlanNode, SeqScanPlanNode, Side, UpdatePlanNode,
+    ValuesPlanNode,
 };
 
 /// Turns bound statements into plans, without statistics or a cost model.
@@ -76,6 +77,8 @@ impl<'a> Planner<'a> {
             BoundStatement::Update(u) => self.plan_update(u),
             BoundStatement::CreateTable(c) => Ok(self.plan_create_table(c)),
             BoundStatement::CreateIndex(c) => self.plan_create_index(c),
+            BoundStatement::DropTable(d) => Ok(plan_drop_table(d)),
+            BoundStatement::DropIndex(d) => Ok(plan_drop_index(d)),
         }
     }
 
@@ -381,6 +384,20 @@ impl<'a> Planner<'a> {
             .find(|info| info.index.indexed_col_idxs == col_idxs)
             .map(|info| info.oid)
     }
+}
+
+fn plan_drop_table(d: BoundDropTable) -> Plan {
+    Plan::DropTable(DropTablePlanNode {
+        table_oid: d.table_oid,
+        if_exists: d.if_exists,
+    })
+}
+
+fn plan_drop_index(d: BoundDropIndex) -> Plan {
+    Plan::DropIndex(DropIndexPlanNode {
+        index_oid: d.index_oid,
+        if_exists: d.if_exists,
+    })
 }
 
 fn agg_type_name(t: &AggType) -> &'static str {

@@ -72,8 +72,12 @@ fn shell_reports_errors_and_keeps_going() {
 
 #[test]
 fn shell_exits_cleanly_at_end_of_input() {
-    let (out, _) = run_shell("CREATE TABLE t (a INTEGER);\nexit\n");
+    let (out, _) = run_shell(
+        "CREATE TABLE t (a INTEGER);\nCREATE INDEX t_a ON t (a);\nDROP INDEX t_a;\nDROP TABLE t;\nexit\n",
+    );
     assert!(out.contains("CREATE TABLE t"));
+    assert!(out.contains("DROP INDEX"), "{out}");
+    assert!(out.contains("DROP TABLE"), "{out}");
     let (out, _) = run_shell("");
     assert!(out.starts_with("cmudb"));
 }
