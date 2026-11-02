@@ -3060,7 +3060,15 @@ mod tests {
         let pin = bpm.read_page(first_page).unwrap();
 
         let err = exec.close().unwrap_err();
-        assert!(err.0.contains("pinned"), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                ExecutorError::TableHeap(TableHeapError::Bpm(
+                    crate::buffer_pool::BpmError::PagePinned { page_id }
+                )) if page_id == first_page
+            ),
+            "{err:?}"
+        );
         assert_eq!(
             bpm.live_page_count(),
             1,
