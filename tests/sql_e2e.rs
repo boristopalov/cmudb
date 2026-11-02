@@ -2,7 +2,9 @@
 //! planner and executors against a real buffer pool and disk manager.
 mod common;
 
+use cmudb::QueryError;
 use cmudb::catalog::Value;
+use cmudb::parser::{BinderError, Unsupported};
 use cmudb::processor::plan::Plan;
 use common::*;
 
@@ -664,10 +666,11 @@ fn other_column_types_parse() {
 fn insert_values_naming_a_column_is_a_bind_error_and_inserts_nothing() {
     let db = Db::new(8);
     db.exec("CREATE TABLE t (a INTEGER)");
-    let err = db
-        .try_exec("INSERT INTO t VALUES (a)")
-        .expect_err("a VALUES row has no input columns to read");
-    assert!(err.contains("column not found: a"), "{err}");
+    assert_eq!(
+        db.bind_error("INSERT INTO t VALUES (a)"),
+        BinderError::ColumnNotFound { column: "a".into() },
+        "a VALUES row has no input columns to read"
+    );
     assert!(db.exec("SELECT * FROM t").is_empty());
     db.exec("INSERT INTO t VALUES (1 + 2)");
     assert_eq!(ints(&db.exec("SELECT a FROM t")), vec![vec![3]]);
@@ -677,59 +680,135 @@ fn insert_values_naming_a_column_is_a_bind_error_and_inserts_nothing() {
 fn binder_and_planner_errors_are_reported() {
     let db = emp_db();
     db.exec("CREATE TABLE dept (id INTEGER, name INTEGER)");
+    let unsupported = BinderError::Unsupported;
     let cases = [
-        ("SELECT x FROM emp", "column not found"),
-        ("SELECT * FROM nope", "table not found"),
-        ("SELECT * FROM emp, dept", "comma-separated"),
-        ("DROP TABLE emp", "unsupported statement"),
+        (
+            "SELECT x FROM emp",
+            BinderError::ColumnNotFound { column: "x".into() },
+        ),
+        (
+            "SELECT * FROM nope",
+            BinderError::TableNotFound {
+                table: "nope".into(),
+            },
+        ),
+        (
+            "SELECT * FROM emp, dept",
+            unsupported(Unsupported::CommaSeparatedFrom),
+        ),
+        ("DROP TABLE emp", unsupported(Unsupported::Statement)),
         (
             "SELECT id FROM emp JOIN dept ON emp.dept = dept.id",
-            "ambiguous",
+            BinderError::AmbiguousColumn {
+                column: "id".into(),
+            },
         ),
         (
             "SELECT * FROM emp RIGHT JOIN dept ON emp.dept = dept.id",
-            "unsupported join",
+            unsupported(Unsupported::JoinType),
         ),
         (
             "SELECT emp.id FROM emp JOIN dept ON emp.dept = dept.id JOIN dept d2 ON d2.id = emp.id",
-            "2-way",
+            unsupported(Unsupported::MultiWayJoin),
         ),
-        ("SELECT id FROM emp WHERE id LIKE 1", "unsupported"),
+        (
+            "SELECT id FROM emp WHERE id LIKE 1",
+            BinderError::UnsupportedExpression {
+                expr: "id LIKE 1".into(),
+            },
+        ),
         (
             "SELECT id FROM emp WHERE id % 2 = 0",
-            "unsupported binary operator",
+            BinderError::UnsupportedOperator {
+                operator: sqlparser::ast::BinaryOperator::Modulo,
+            },
         ),
-        ("SELECT 'text'", "unsupported literal"),
-        ("SELECT id FROM emp LIMIT id", "LIMIT"),
-        ("SELECT foo.id FROM emp", ""),
-        ("SELECT a.b.c FROM emp", ""),
-        ("CREATE TABLE s (name TEXT)", "unsupported type"),
-        ("SELECT COUNT(*) FROM emp GROUP BY ALL", "GROUP BY ALL"),
-        ("UPDATE emp SET (id, dept) = (1, 2)", ""),
-        ("SELECT * FROM emp ORDER BY ALL", ""),
-        ("SELECT * FROM s.emp", "qualified name"),
-        ("SELECT CONCAT(id) FROM emp", ""),
-        ("SELECT id FROM (SELECT id FROM emp) sub", ""),
-        ("INSERT INTO emp SELECT * FROM emp", ""),
+        (
+            "SELECT 'text'",
+            BinderError::UnsupportedLiteral {
+                literal: "'text'".into(),
+            },
+        ),
+        (
+            "SELECT id FROM emp LIMIT id",
+            unsupported(Unsupported::LimitExpression),
+        ),
+        (
+            "SELECT foo.id FROM emp",
+            BinderError::TableNotInScope {
+                table: "foo".into(),
+            },
+        ),
+        (
+            "SELECT a.b.c FROM emp",
+            unsupported(Unsupported::CompoundIdentifier),
+        ),
+        (
+            "CREATE TABLE s (name TEXT)",
+            BinderError::UnsupportedType {
+                type_name: "TEXT".into(),
+            },
+        ),
+        (
+            "SELECT COUNT(*) FROM emp GROUP BY ALL",
+            unsupported(Unsupported::GroupByAll),
+        ),
+        (
+            "UPDATE emp SET (id, dept) = (1, 2)",
+            unsupported(Unsupported::TupleAssignment),
+        ),
+        (
+            "SELECT * FROM emp ORDER BY ALL",
+            BinderError::ColumnNotFound {
+                column: "ALL".into(),
+            },
+        ),
+        (
+            "SELECT * FROM s.emp",
+            BinderError::QualifiedName {
+                name: "s.emp".into(),
+            },
+        ),
+        (
+            "SELECT CONCAT(id) FROM emp",
+            BinderError::UnsupportedExpression {
+                expr: "CONCAT(id)".into(),
+            },
+        ),
+        (
+            "SELECT id FROM (SELECT id FROM emp) sub",
+            unsupported(Unsupported::FromTarget),
+        ),
+        (
+            "INSERT INTO emp SELECT * FROM emp",
+            unsupported(Unsupported::InsertSource),
+        ),
         (
             "SELECT id FROM emp WHERE id IN (1, 2)",
-            "unsupported expression",
+            BinderError::UnsupportedExpression {
+                expr: "id IN (1, 2)".into(),
+            },
         ),
-        ("SELECT emp.* FROM emp", ""),
+        (
+            "SELECT emp.* FROM emp",
+            unsupported(Unsupported::SelectItem),
+        ),
+        (
+            "CREATE INDEX i ON emp (nope)",
+            BinderError::ColumnNotFound {
+                column: "nope".into(),
+            },
+        ),
     ];
-    let mut failures = Vec::new();
-    for (sql, needle) in cases {
-        match db.try_exec(sql) {
-            Ok(rows) => failures.push(format!("{sql}: expected an error, got {rows:?}")),
-            Err(e) if !e.contains(needle) => {
-                failures.push(format!("{sql}: {e} does not mention {needle:?}"))
-            }
-            Err(_) => {}
-        }
-    }
+    let failures: Vec<String> = cases
+        .into_iter()
+        .filter_map(|(sql, expected)| match db.query_error(sql) {
+            QueryError::Bind(e) if e == expected => None,
+            other => Some(format!("{sql}: expected {expected:?}, got {other:?}")),
+        })
+        .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    assert!(db.try_exec("SELEC 1").unwrap_err().starts_with("parse:"));
-    assert!(db.try_exec("CREATE INDEX i ON emp (nope)").is_err());
+    assert!(matches!(db.query_error("SELEC 1"), QueryError::Parse(_)));
 }
 
 #[test]

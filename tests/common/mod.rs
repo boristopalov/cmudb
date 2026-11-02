@@ -5,8 +5,9 @@
 pub mod seed;
 
 use cmudb::catalog::Value;
+use cmudb::parser::BinderError;
 use cmudb::processor::plan::Plan;
-use cmudb::{Database, StatementResult};
+use cmudb::{Database, QueryError, StatementResult};
 use std::ops::Deref;
 
 pub type Row = cmudb::database::Row;
@@ -50,6 +51,23 @@ impl Db {
 
     pub fn exec(&self, sql: &str) -> Vec<Row> {
         self.try_exec(sql).unwrap_or_else(|e| panic!("{sql}: {e}"))
+    }
+
+    /// The error `sql` fails with, unwrapped from the rollback of its transaction.
+    pub fn query_error(&self, sql: &str) -> QueryError {
+        match self.db.execute(sql) {
+            Ok(results) => panic!("{sql}: expected an error, got {} results", results.len()),
+            Err(QueryError::RolledBack { cause, .. }) => *cause,
+            Err(e) => e,
+        }
+    }
+
+    /// The binder error `sql` fails with; panics if it fails any other way.
+    pub fn bind_error(&self, sql: &str) -> BinderError {
+        match self.query_error(sql) {
+            QueryError::Bind(e) => e,
+            other => panic!("{sql}: expected a bind error, got {other:?}"),
+        }
     }
 
     /// Runs `plan` in a transaction of its own, committed when the plan succeeds and rolled
