@@ -837,7 +837,7 @@ impl Index for BPlusTree {
             return Ok(None);
         };
         let leaf = LeafPageView::new(page.data(), self.key_len)?;
-        Ok(leaf.get(&key.0).map(IndexValue::IndexValue))
+        Ok(leaf.get(&key.0)?.map(IndexValue::IndexValue))
     }
 
     fn scan(&self, range: (Bound<IndexKey>, Bound<IndexKey>)) -> Result<IndexIter, IndexError> {
@@ -912,7 +912,13 @@ impl Iterator for BPlusTreeIter {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let buf = self.leaf.as_ref()?;
-            let leaf = LeafPageView::trusted(&buf[..], self.key_len);
+            let leaf = match LeafPageView::new(&buf[..], self.key_len) {
+                Ok(leaf) => leaf,
+                Err(e) => {
+                    self.leaf = None;
+                    return Some(Err(IndexError::PageError(e)));
+                }
+            };
 
             if self.slot_idx >= leaf.size() as usize {
                 let next_leaf_id = leaf.next_leaf_id();
@@ -950,8 +956,14 @@ impl Iterator for BPlusTreeIter {
                 return None;
             }
 
-            let val = IndexValue::IndexValue(leaf.record_id(i));
-            return Some(Ok((IndexKey(key.to_vec()), val)));
+            let rid = match leaf.record_id(i) {
+                Ok(rid) => rid,
+                Err(e) => {
+                    self.leaf = None;
+                    return Some(Err(IndexError::PageError(e)));
+                }
+            };
+            return Some(Ok((IndexKey(key.to_vec()), IndexValue::IndexValue(rid))));
         }
     }
 }
@@ -1122,13 +1134,12 @@ mod tests {
         let (bpm, _tmp) = make_bpm(16);
         let (tree, _, right) = two_leaf_tree(&bpm);
         assert_eq!(scan_all(&tree).unwrap().len(), 15);
-        bpm.write_page(right).unwrap().data_mut()[LEAF_FIXED_HEADER_BYTES] = 0xff;
+        let high_byte_of_first_page_id =
+            LEAF_FIXED_HEADER_BYTES + NO_TOMBSTONE_KEY_LEN as usize + 7;
+        bpm.write_page(right).unwrap().data_mut()[high_byte_of_first_page_id] = 0xff;
         assert!(
-            matches!(
-                scan_all(&tree),
-                Err(IndexError::PageError(PageCodecError::Malformed(_)))
-            ),
-            "the second leaf's keys are out of order"
+            matches!(scan_all(&tree), Err(IndexError::PageError(_))),
+            "the second leaf's first record id does not fit in u32"
         );
     }
 

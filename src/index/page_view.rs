@@ -308,36 +308,19 @@ impl<B: AsRef<[u8]>> LeafPageView<B> {
                 ));
             }
         }
-        view.validate_entries()?;
+        view.validate_bounds()?;
         Ok(view)
     }
 
-    /// A view over bytes that already passed `new` and have not changed since, such as a
-    /// scan's private copy of a leaf. It skips the O(entries) checks `new` repeats.
-    pub(crate) fn trusted(buf: B, key_len: u32) -> Self {
-        Self {
-            buf,
-            key_len: key_len as usize,
-        }
-    }
-
-    /// Rejects the corruptions that `LeafPage::decode` rejects, so a bad page read through a
-    /// view fails with an error instead of a panic: too many entries, keys out of order,
-    /// record ids that do not fit in `u32`, and tombstones naming a slot past the end.
-    fn validate_entries(&self) -> Result<(), PageCodecError> {
+    /// Rejects the corruptions that would make a read through this view panic: more entries
+    /// than the page holds, or a tombstone naming a slot past the end. It costs O(tombstones),
+    /// the same as one `is_tombstoned` call. Keys out of order give wrong answers rather than a
+    /// panic and are caught by `LeafPage::decode`; a record id wider than `u32` is reported by
+    /// `record_id`.
+    fn validate_bounds(&self) -> Result<(), PageCodecError> {
         let size = self.size() as usize;
         if self.size() > self.max_size().saturating_add(1) {
             return Err(PageCodecError::Malformed("leaf size exceeds max size"));
-        }
-        for idx in 0..size {
-            let off = self.entry_off(idx) + self.key_len;
-            decode_record_id(
-                get_u64_le(self.bytes(), off),
-                get_u64_le(self.bytes(), off + 8),
-            )?;
-            if idx > 0 && self.key(idx - 1) > self.key(idx) {
-                return Err(PageCodecError::Malformed("leaf keys out of order"));
-            }
         }
         if (0..self.tombstone_count()).any(|i| self.tombstone(i) as usize >= size) {
             return Err(PageCodecError::Malformed(
@@ -415,14 +398,15 @@ impl<B: AsRef<[u8]>> LeafPageView<B> {
         &self.bytes()[off..off + self.key_len]
     }
 
-    /// Record id of entry `idx`. Panics if `idx >= size()`. `new` has already checked that
-    /// every stored id fits in `u32`, so the conversion below cannot truncate.
-    pub fn record_id(&self, idx: usize) -> RecordId {
+    /// Record id of entry `idx`, or an error if the stored id does not fit in `u32`. Panics if
+    /// `idx >= size()`.
+    pub fn record_id(&self, idx: usize) -> Result<RecordId, PageCodecError> {
         assert!(idx < self.size() as usize, "leaf entry index out of bounds");
         let off = self.entry_off(idx) + self.key_len;
-        let page_id = get_u64_le(self.bytes(), off);
-        let slot_id = get_u64_le(self.bytes(), off + 8);
-        decode_record_id(page_id, slot_id).expect("record ids were validated in LeafPageView::new")
+        decode_record_id(
+            get_u64_le(self.bytes(), off),
+            get_u64_le(self.bytes(), off + 8),
+        )
     }
 
     pub fn tombstone_capacity(&self) -> usize {
@@ -475,12 +459,14 @@ impl<B: AsRef<[u8]>> LeafPageView<B> {
     }
 
     /// Point lookup; tombstoned keys are reported as absent.
-    pub fn get(&self, key: &[u8]) -> Option<RecordId> {
-        let pos = self.search(key).ok()?;
+    pub fn get(&self, key: &[u8]) -> Result<Option<RecordId>, PageCodecError> {
+        let Ok(pos) = self.search(key) else {
+            return Ok(None);
+        };
         if self.is_tombstoned(pos as u32) {
-            return None;
+            return Ok(None);
         }
-        Some(self.record_id(pos))
+        self.record_id(pos).map(Some)
     }
 }
 
@@ -758,15 +744,16 @@ mod tests {
         assert!(view.is_tombstoned(2));
         for probe in 0u8..60 {
             let key = IndexKey(vec![probe]);
-            assert_eq!(view.get(&[probe]), leaf.get(&key), "get {probe}");
+            assert_eq!(view.get(&[probe]).unwrap(), leaf.get(&key), "get {probe}");
             assert_eq!(view.lower_bound(&[probe]), leaf.lower_bound(&key));
             assert_eq!(view.upper_bound(&[probe]), leaf.upper_bound(&key));
             assert_eq!(view.search(&[probe]), leaf.keys.binary_search(&key));
         }
     }
 
-    /// Each corruption is rejected by both the view and the owned decoder, with an error
-    /// rather than a panic.
+    /// Every corruption is an error rather than a panic: the view rejects the ones that
+    /// would make it panic when it is built, reports a bad record id when it is read, and the
+    /// owned decoder rejects all of them.
     #[test]
     fn corrupt_leaf_pages_are_errors_not_panics() {
         let key_len = 1u32;
@@ -779,37 +766,27 @@ mod tests {
         let entry_bytes = key_len as usize + RECORD_ID_ENCODED_BYTES;
         let tomb_count_off = LEAF_FIXED_HEADER_BYTES + 3 * entry_bytes;
         let first_rid_off = LEAF_FIXED_HEADER_BYTES + key_len as usize;
+        let corrupted = |corrupt: &dyn Fn(&mut [u8])| {
+            let mut buf = good.clone();
+            corrupt(&mut buf[..]);
+            buf
+        };
 
-        type Corruption = Box<dyn Fn(&mut [u8])>;
-        let corruptions: [(&str, Corruption); 5] = [
+        let rejected_by_view = [
             (
                 "tombstone past the last slot",
-                Box::new(move |b| put_u32_le(b, tomb_count_off + TOMBSTONE_SLOT_ENCODED_BYTES, 3)),
-            ),
-            (
-                "page id wider than u32",
-                Box::new(move |b| put_u64_le(b, first_rid_off, u64::from(u32::MAX) + 1)),
-            ),
-            (
-                "slot id wider than u32",
-                Box::new(move |b| put_u64_le(b, first_rid_off + 8, u64::from(u32::MAX) + 1)),
-            ),
-            (
-                "keys out of order",
-                Box::new(|b| b[LEAF_FIXED_HEADER_BYTES] = 99),
+                corrupted(&|b| put_u32_le(b, tomb_count_off + TOMBSTONE_SLOT_ENCODED_BYTES, 3)),
             ),
             (
                 "size above max size",
-                Box::new(|b| put_u32_le(b, NODE_MAX_SIZE_OFF, 1)),
+                corrupted(&|b| put_u32_le(b, NODE_MAX_SIZE_OFF, 1)),
             ),
         ];
-        for (what, corrupt) in corruptions {
-            let mut buf = good.clone();
-            corrupt(&mut buf[..]);
+        for (what, buf) in &rejected_by_view {
             assert!(
                 matches!(
                     LeafPageView::new(&buf[..], key_len),
-                    Err(PageCodecError::Malformed(_) | PageCodecError::BufferError(_))
+                    Err(PageCodecError::Malformed(_))
                 ),
                 "view rejects {what}"
             );
@@ -818,6 +795,26 @@ mod tests {
                 "decode rejects {what}"
             );
         }
+
+        let wide_ids = [
+            corrupted(&|b| put_u64_le(b, first_rid_off, u64::from(u32::MAX) + 1)),
+            corrupted(&|b| put_u64_le(b, first_rid_off + 8, u64::from(u32::MAX) + 1)),
+        ];
+        for buf in &wide_ids {
+            let view = LeafPageView::new(&buf[..], key_len).unwrap();
+            assert!(
+                view.record_id(0).is_err(),
+                "a wide record id is reported, not truncated"
+            );
+            assert!(view.get(&[10]).is_err());
+            assert!(LeafPage::decode(&buf[..], key_len).is_err());
+        }
+
+        let out_of_order = corrupted(&|b| b[LEAF_FIXED_HEADER_BYTES] = 99);
+        assert!(
+            LeafPage::decode(&out_of_order[..], key_len).is_err(),
+            "decode rejects keys out of order instead of asserting"
+        );
     }
 
     /// Runs a random mix of inserts and removes against both the owned `LeafPage` and the
@@ -909,7 +906,7 @@ mod tests {
         let mut view = LeafPageView::new(&mut buf[..], key_len).unwrap();
         view.remove_key(&[2]).unwrap();
         view.insert(&[2], rid(42)).unwrap();
-        assert_eq!(view.get(&[2]), Some(rid(42)));
+        assert_eq!(view.get(&[2]).unwrap(), Some(rid(42)));
         assert_eq!(view.tombstone_count(), 0);
     }
 
