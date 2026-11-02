@@ -294,3 +294,105 @@ pub fn delete_tuple(
 ) -> Result<(), MvccError> {
     taint_on_err(txn, write_version(txn, txn_mgr, heap, rid, None))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::catalog::{Catalog, CatalogError, DataType, IndexType, Schema, TableInfo, Value};
+    use crate::concurrency::{IsolationLevel, TransactionState};
+    use tempfile::TempDir;
+
+    struct ShortRowTable {
+        mgr: TransactionManager,
+        table: Arc<TableInfo>,
+        indexes: Vec<Arc<IndexInfo>>,
+        short_rid: RecordId,
+        _catalog: Catalog,
+        _dir: TempDir,
+    }
+
+    fn short_tuple(v: i32) -> Tuple {
+        Schema::new(vec![(DataType::INT, "id".to_string())])
+            .encode_tuple(&[Some(Value::INT(v))])
+            .unwrap()
+    }
+
+    /// A table `(id, v)` indexed on `v`, holding one committed row too short to have a `v`.
+    fn table_with_a_short_row() -> ShortRowTable {
+        let (catalog, bpm, dir) = crate::testing::catalog(32);
+        let schema = Schema::new(vec![
+            (DataType::INT, "id".to_string()),
+            (DataType::INT, "v".to_string()),
+        ]);
+        let oid = catalog.create_table("t".into(), schema).unwrap();
+        catalog
+            .create_index(bpm.clone(), oid, "t_v".into(), &["v"], IndexType::BPlusTree)
+            .unwrap();
+        let table = catalog.get_table(oid).unwrap();
+        let short_rid = table.heap.insert(&short_tuple(1)).unwrap();
+        ShortRowTable {
+            mgr: TransactionManager::new(bpm),
+            indexes: catalog.get_table_indexes(oid).unwrap(),
+            table,
+            short_rid,
+            _catalog: catalog,
+            _dir: dir,
+        }
+    }
+
+    fn is_short_tuple_error(err: &MvccError) -> bool {
+        matches!(
+            err,
+            MvccError::Index(IndexError::Catalog(CatalogError::TupleSchemaMismatch))
+        )
+    }
+
+    #[test]
+    fn update_to_a_short_tuple_fails_after_the_write_and_taints_the_transaction() {
+        let t = table_with_a_short_row();
+        let txn = t.mgr.begin(IsolationLevel::SnapshotIsolation);
+
+        let err = update_tuple(
+            &txn,
+            &t.mgr,
+            &t.table.heap,
+            &t.indexes,
+            t.short_rid,
+            &short_tuple(1),
+            &short_tuple(2),
+        )
+        .expect_err("a new version too short for the indexed column is an error");
+
+        assert!(is_short_tuple_error(&err), "unexpected error: {err}");
+        assert_eq!(
+            txn.state(),
+            TransactionState::Tainted,
+            "the slot was already overwritten, so the transaction can only abort"
+        );
+        let entries: Vec<_> = t.indexes[0]
+            .index
+            .scan(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+            .unwrap()
+            .collect();
+        assert!(entries.is_empty(), "no index entry was added");
+    }
+
+    #[test]
+    fn reading_a_short_tuple_through_an_index_is_an_error() {
+        let t = table_with_a_short_row();
+        let txn = t.mgr.begin(IsolationLevel::SnapshotIsolation);
+
+        let err = read_visible_through_index(
+            &txn,
+            &t.mgr,
+            &t.table.heap,
+            &t.indexes[0].index,
+            &IndexKey(Vec::new()),
+            t.short_rid,
+        )
+        .expect_err("a visible tuple too short for the index key is an error");
+
+        assert!(is_short_tuple_error(&err), "unexpected error: {err}");
+    }
+}
