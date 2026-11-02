@@ -2,7 +2,7 @@
 
 ## Checks
 
-Run every check CI runs with one command before pushing:
+Run CI's lint and test checks with one command before pushing:
 
 ```sh
 just ci
