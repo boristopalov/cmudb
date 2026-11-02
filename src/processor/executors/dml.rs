@@ -74,7 +74,7 @@ impl<'a> Executor for InsertExecutor<'a> {
     }
 
     fn close(&mut self) -> Result<(), ExecutorError> {
-        Ok(())
+        self.child.close()
     }
 }
 
@@ -146,7 +146,7 @@ impl<'a> Executor for UpdateExecutor<'a> {
     }
 
     fn close(&mut self) -> Result<(), ExecutorError> {
-        Ok(())
+        self.child.close()
     }
 
     fn schema(&self) -> &Schema {
@@ -206,6 +206,6 @@ impl<'a> Executor for DeleteExecutor<'a> {
     }
 
     fn close(&mut self) -> Result<(), ExecutorError> {
-        Ok(())
+        self.child.close()
     }
 }

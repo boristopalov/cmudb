@@ -1,8 +1,12 @@
 use crate::catalog::{DataType, Schema, Value};
-use crate::processor::executor::{DEFAULT_BATCH_SIZE, Executor, collect_rows};
+use crate::processor::executor::{
+    Batch, DEFAULT_BATCH_SIZE, Executor, ExecutorError, collect_rows,
+};
 use crate::processor::executors::{ValuesExecutor, row_values};
 use crate::processor::plan::{ColIdx, Expression, Plan, ValuesPlanNode};
 use crate::table_heap::Tuple;
+use std::cell::Cell;
+use std::rc::Rc;
 
 pub(crate) fn int_schema(names: &[&str]) -> Schema {
     Schema::new(
@@ -106,5 +110,43 @@ pub(crate) fn divide_by_zero(col_idx: u32) -> Expression {
         left: Box::new(col(col_idx)),
         right: Box::new(Expression::Constant(Some(Value::INT(0)))),
         op: crate::processor::plan::Op::Div,
+    }
+}
+
+/// Wraps an executor and counts how many times it is closed.
+pub(crate) struct CountsCloses<'a> {
+    inner: Box<dyn Executor + 'a>,
+    closes: Rc<Cell<usize>>,
+}
+
+impl<'a> CountsCloses<'a> {
+    /// The wrapped `inner`, boxed as a child, and the counter its closes add to.
+    pub(crate) fn wrap(
+        inner: Box<dyn Executor + 'a>,
+        closes: &Rc<Cell<usize>>,
+    ) -> Box<dyn Executor + 'a> {
+        Box::new(Self {
+            inner,
+            closes: closes.clone(),
+        })
+    }
+}
+
+impl Executor for CountsCloses<'_> {
+    fn open(&mut self) -> Result<(), ExecutorError> {
+        self.inner.open()
+    }
+
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
+        self.inner.next_batch()
+    }
+
+    fn schema(&self) -> &Schema {
+        self.inner.schema()
+    }
+
+    fn close(&mut self) -> Result<(), ExecutorError> {
+        self.closes.set(self.closes.get() + 1);
+        self.inner.close()
     }
 }

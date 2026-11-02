@@ -71,7 +71,7 @@ impl<'a> Executor for AggregationExecutor<'a> {
     }
 
     fn close(&mut self) -> Result<(), ExecutorError> {
-        Ok(())
+        self.child.close()
     }
 
     fn schema(&self) -> &Schema {
@@ -250,7 +250,7 @@ impl<'a> Executor for WindowFunctionExecutor<'a> {
         &self.plan.schema
     }
     fn close(&mut self) -> Result<(), ExecutorError> {
-        Ok(())
+        self.child.close()
     }
 }
 

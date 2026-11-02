@@ -239,7 +239,8 @@ pub trait Executor {
     fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError>;
     /// Layout of the tuples `next_batch` yields.
     fn schema(&self) -> &Schema;
-    /// Releases resources early; dropping the executor releases the rest.
+    /// Releases resources early and closes every child, carrying on past a failure and
+    /// returning the first one; dropping the executor releases the rest.
     fn close(&mut self) -> Result<(), ExecutorError>;
 }
 

@@ -155,7 +155,9 @@ impl<'a> Executor for NestedLoopJoinExecutor<'a> {
     }
 
     fn close(&mut self) -> Result<(), ExecutorError> {
-        Ok(())
+        let left = self.left.close();
+        let right = self.right.close();
+        left.and(right)
     }
 }
 
@@ -276,7 +278,7 @@ impl<'a> Executor for NestedIndexJoinExecutor<'a> {
         &self.plan.schema
     }
     fn close(&mut self) -> Result<(), ExecutorError> {
-        Ok(())
+        self.child.close()
     }
 }
 
@@ -488,12 +490,16 @@ impl<'a> Executor for HashJoinExecutor<'a> {
         Ok(Batch::from_rows(out))
     }
 
+    /// Closes both inputs and deletes the pages of the partitions not joined yet.
     fn close(&mut self) -> Result<(), ExecutorError> {
         self.right_partition_iter = None;
         self.build_table = None;
         let left = std::mem::take(&mut self.left_partitions);
         let right = std::mem::take(&mut self.right_partitions);
-        free_all(left.into_iter().chain(right))
+        let freed = free_all(left.into_iter().chain(right));
+        let left = self.left.close();
+        let right = self.right.close();
+        freed.and(left).and(right)
     }
     fn schema(&self) -> &Schema {
         &self.plan.schema

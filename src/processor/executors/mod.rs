@@ -165,7 +165,22 @@ fn free_all(heaps: impl IntoIterator<Item = SpillHeap>) -> Result<(), ExecutorEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::IndexType;
+    use crate::concurrency::{IsolationLevel, TransactionManager};
+    use crate::processor::executor::{
+        DEFAULT_BATCH_SIZE, DEFAULT_SORT_MEMORY_BUDGET_BYTES, Executor, ExecutorContext,
+        collect_rows,
+    };
     use crate::processor::executors::test_support::*;
+    use crate::processor::plan::{
+        AggType, AggregationPlanNode, ColIdx, ColumnAssignment, DeletePlanNode,
+        ExternalMergeSortPlanNode, FilterPlanNode, HashJoinPlanNode, InsertPlanNode, JoinPredicate,
+        JoinType, LimitPlanNode, NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, Plan,
+        ProjectionPlanNode, SeqScanPlanNode, SortExpr, SortPlanNode, UpdatePlanNode,
+        WindowFunctionPlanNode,
+    };
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     #[test]
     fn joined_row_pads_a_missing_right_row_with_nulls() {
@@ -185,5 +200,258 @@ mod tests {
             joined_row(&left, lt, &right, None).unwrap(),
             vec![Some(Value::INT(1)), Some(Value::INT(2)), None]
         );
+    }
+
+    /// Opens `exec`, drains it, closes it and returns how many child closes `closes` counted.
+    fn closes_after_running(exec: &mut dyn Executor, closes: &Rc<Cell<usize>>) -> usize {
+        exec.open().expect("open");
+        collect_rows(exec).expect("next_batch");
+        exec.close().expect("close");
+        closes.get()
+    }
+
+    #[test]
+    fn every_executor_with_inputs_closes_each_of_them() {
+        let schema = int_schema(&["a"]);
+        let rows = values_plan(&schema, &[&[1], &[2]]);
+        let pair_schema = int_schema(&["l", "r"]);
+        let col_a = || col(0);
+        let always: JoinPredicate = Expression::Constant(Some(Value::BOOLEAN(true)));
+        let (bpm, _dir) = crate::testing::bpm(32);
+        let closes = Rc::new(Cell::new(0));
+        let child = || CountsCloses::wrap(values_child(&rows), &closes);
+
+        let filter = FilterPlanNode {
+            schema: schema.clone(),
+            predicate: Expression::Constant(Some(Value::BOOLEAN(true))),
+            child: Box::new(values_plan(&schema, &[])),
+        };
+        let projection = ProjectionPlanNode {
+            schema: schema.clone(),
+            expressions: vec![col_a()],
+            child: Box::new(values_plan(&schema, &[])),
+        };
+        let limit = LimitPlanNode {
+            schema: schema.clone(),
+            limit: 1,
+            child: Box::new(values_plan(&schema, &[])),
+        };
+        let aggregation = AggregationPlanNode {
+            schema: int_schema(&["count"]),
+            child: Box::new(values_plan(&schema, &[])),
+            group_bys: vec![],
+            aggregates: vec![(col_a(), AggType::COUNT)],
+        };
+        let window = WindowFunctionPlanNode {
+            schema: int_schema(&["a", "count"]),
+            child: Box::new(values_plan(&schema, &[])),
+            order_by_exprs: None,
+            partition_by_exprs: None,
+            aggregates: vec![(col_a(), AggType::COUNT)],
+            columns: vec![col_a()],
+        };
+        let sort = SortPlanNode {
+            schema: schema.clone(),
+            child: Box::new(values_plan(&schema, &[])),
+            order_by_exprs: vec![SortExpr::ascending(col_a())],
+        };
+        let external_sort = ExternalMergeSortPlanNode {
+            schema: schema.clone(),
+            child: Box::new(values_plan(&schema, &[])),
+            order_by_exprs: vec![SortExpr::ascending(col_a())],
+        };
+        let nested_loop = NestedLoopJoinPlanNode {
+            schema: pair_schema.clone(),
+            left: Box::new(values_plan(&schema, &[])),
+            right: Box::new(values_plan(&schema, &[])),
+            predicate: always,
+            join_type: JoinType::Inner,
+        };
+        let hash = HashJoinPlanNode {
+            schema: pair_schema.clone(),
+            left: Box::new(values_plan(&schema, &[])),
+            right: Box::new(values_plan(&schema, &[])),
+            left_exprs: vec![col_a()],
+            right_exprs: vec![col_a()],
+            residual: None,
+            join_type: JoinType::Inner,
+        };
+
+        let mut cases: Vec<(&str, Box<dyn Executor + '_>, usize)> = vec![
+            ("filter", Box::new(FilterExecutor::new(&filter, child())), 1),
+            (
+                "projection",
+                Box::new(ProjectionExecutor::new(&projection, child())),
+                1,
+            ),
+            ("limit", Box::new(LimitExecutor::new(&limit, child())), 1),
+            (
+                "aggregation",
+                Box::new(AggregationExecutor::new(
+                    &aggregation,
+                    child(),
+                    DEFAULT_BATCH_SIZE,
+                )),
+                1,
+            ),
+            (
+                "window",
+                Box::new(WindowFunctionExecutor::new(
+                    &window,
+                    child(),
+                    DEFAULT_BATCH_SIZE,
+                )),
+                1,
+            ),
+            (
+                "sort",
+                Box::new(SortExecutor::new(&sort, child(), DEFAULT_BATCH_SIZE)),
+                1,
+            ),
+            (
+                "external sort",
+                Box::new(ExternalMergeSortExecutor::new(
+                    &external_sort,
+                    child(),
+                    bpm.clone(),
+                    DEFAULT_BATCH_SIZE,
+                    DEFAULT_SORT_MEMORY_BUDGET_BYTES,
+                )),
+                1,
+            ),
+            (
+                "nested loop join",
+                Box::new(NestedLoopJoinExecutor::new(
+                    &nested_loop,
+                    child(),
+                    child(),
+                    DEFAULT_BATCH_SIZE,
+                )),
+                2,
+            ),
+            (
+                "hash join",
+                Box::new(HashJoinExecutor::new(
+                    &hash,
+                    child(),
+                    child(),
+                    bpm.clone(),
+                    DEFAULT_BATCH_SIZE,
+                )),
+                2,
+            ),
+        ];
+        for (name, exec, inputs) in &mut cases {
+            closes.set(0);
+            assert_eq!(
+                closes_after_running(exec.as_mut(), &closes),
+                *inputs,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_executor_that_writes_or_probes_a_table_closes_its_input() {
+        let (catalog, bpm, _dir) = crate::testing::catalog(32);
+        let schema = int_schema(&["a"]);
+        let table_oid = catalog
+            .create_table("t".to_string(), schema.clone())
+            .expect("create table");
+        let index_oid = catalog
+            .create_index(
+                bpm.clone(),
+                table_oid,
+                "t_a".to_string(),
+                &["a"],
+                IndexType::BPlusTree,
+            )
+            .expect("create index");
+        let txn_mgr = Arc::new(TransactionManager::new(bpm.clone()));
+        let ctx = ExecutorContext::new(
+            &catalog,
+            bpm.clone(),
+            txn_mgr.begin(IsolationLevel::SnapshotIsolation),
+            txn_mgr.clone(),
+        );
+        let rows = values_plan(&schema, &[&[1], &[2]]);
+        let scan = Plan::SeqScan(SeqScanPlanNode {
+            table_oid,
+            schema: schema.clone(),
+        });
+        let closes = Rc::new(Cell::new(0));
+
+        let insert = InsertPlanNode {
+            schema: schema.clone(),
+            child: Box::new(values_plan(&schema, &[])),
+            table_oid,
+        };
+        let mut exec = InsertExecutor::new(
+            &ctx,
+            &insert,
+            CountsCloses::wrap(values_child(&rows), &closes),
+        );
+        assert_eq!(closes_after_running(&mut exec, &closes), 1, "insert");
+
+        let probe = NestedIndexJoinPlanNode {
+            schema: int_schema(&["l", "r"]),
+            child: Box::new(values_plan(&schema, &[])),
+            key_predicate: col(0),
+            table_oid,
+            table_schema: schema.clone(),
+            index_oid,
+            join_type: JoinType::Inner,
+        };
+        closes.set(0);
+        let mut exec = NestedIndexJoinExecutor::new(
+            &ctx,
+            &probe,
+            CountsCloses::wrap(values_child(&rows), &closes),
+            DEFAULT_BATCH_SIZE,
+        );
+        assert_eq!(
+            closes_after_running(&mut exec, &closes),
+            1,
+            "nested index join"
+        );
+
+        let update = UpdatePlanNode {
+            schema: schema.clone(),
+            assignments: vec![ColumnAssignment {
+                col_idx: ColIdx(0),
+                value: col(0),
+            }],
+            child: Box::new(values_plan(&schema, &[])),
+            table_oid,
+        };
+        closes.set(0);
+        let scan_child = || {
+            CountsCloses::wrap(
+                Box::new(SeqScanExecutor::new(
+                    &ctx,
+                    scan_node(&scan),
+                    DEFAULT_BATCH_SIZE,
+                )),
+                &closes,
+            )
+        };
+        let mut exec = UpdateExecutor::new(&ctx, &update, scan_child());
+        assert_eq!(closes_after_running(&mut exec, &closes), 1, "update");
+
+        let delete = DeletePlanNode {
+            schema: schema.clone(),
+            child: Box::new(values_plan(&schema, &[])),
+            table_oid,
+        };
+        closes.set(0);
+        let mut exec = DeleteExecutor::new(&ctx, &delete, scan_child());
+        assert_eq!(closes_after_running(&mut exec, &closes), 1, "delete");
+    }
+
+    fn scan_node(plan: &Plan) -> &SeqScanPlanNode {
+        let Plan::SeqScan(scan) = plan else {
+            panic!("expected a SeqScan plan");
+        };
+        scan
     }
 }

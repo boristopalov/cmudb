@@ -82,7 +82,7 @@ impl<'a> Executor for FilterExecutor<'a> {
     }
 
     fn close(&mut self) -> Result<(), ExecutorError> {
-        Ok(())
+        self.child.close()
     }
 }
 
@@ -125,7 +125,7 @@ impl<'a> Executor for ProjectionExecutor<'a> {
     }
 
     fn close(&mut self) -> Result<(), ExecutorError> {
-        Ok(())
+        self.child.close()
     }
 }
 
