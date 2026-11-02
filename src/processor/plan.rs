@@ -379,7 +379,7 @@ impl<C: Copy> Expression<C> {
                 eval_binary(op, l, r)
             }
             Expression::Column { col, .. } => row.column_value(*col),
-            Expression::Constant(v) => Ok(*v),
+            Expression::Constant(v) => Ok(v.clone()),
         }
     }
 
@@ -420,26 +420,26 @@ fn eval_binary(
     l: Option<Value>,
     r: Option<Value>,
 ) -> Result<Option<Value>, ExecutorError> {
-    let cmp = |holds: fn(Ordering) -> bool| -> Result<Option<Value>, ExecutorError> {
+    let cmp = |holds: fn(Ordering) -> bool, l, r| -> Result<Option<Value>, ExecutorError> {
         Ok(compare(l, r)?.map(|ord| Value::BOOLEAN(holds(ord))))
     };
-    let arith = |op: Arithmetic| -> Result<Option<Value>, ExecutorError> {
+    let arith = |op: Arithmetic, l, r| -> Result<Option<Value>, ExecutorError> {
         match (l, r) {
             (Some(l), Some(r)) => op.apply(l, r).map(Some),
             _ => Ok(None),
         }
     };
     match op {
-        Op::Add => arith(Arithmetic::Add),
-        Op::Sub => arith(Arithmetic::Sub),
-        Op::Mul => arith(Arithmetic::Mul),
-        Op::Div => arith(Arithmetic::Div),
-        Op::Eq => cmp(Ordering::is_eq),
-        Op::NEq => cmp(Ordering::is_ne),
-        Op::Lt => cmp(Ordering::is_lt),
-        Op::Gt => cmp(Ordering::is_gt),
-        Op::Lte => cmp(Ordering::is_le),
-        Op::Gte => cmp(Ordering::is_ge),
+        Op::Add => arith(Arithmetic::Add, l, r),
+        Op::Sub => arith(Arithmetic::Sub, l, r),
+        Op::Mul => arith(Arithmetic::Mul, l, r),
+        Op::Div => arith(Arithmetic::Div, l, r),
+        Op::Eq => cmp(Ordering::is_eq, l, r),
+        Op::NEq => cmp(Ordering::is_ne, l, r),
+        Op::Lt => cmp(Ordering::is_lt, l, r),
+        Op::Gt => cmp(Ordering::is_gt, l, r),
+        Op::Lte => cmp(Ordering::is_le, l, r),
+        Op::Gte => cmp(Ordering::is_ge, l, r),
         Op::And => match (as_bool(l)?, as_bool(r)?) {
             (Some(false), _) | (_, Some(false)) => Ok(Some(Value::BOOLEAN(false))),
             (Some(true), Some(true)) => Ok(Some(Value::BOOLEAN(true))),
@@ -484,15 +484,19 @@ pub enum Arithmetic {
 
 impl Arithmetic {
     pub(crate) fn apply(self, l: Value, r: Value) -> Result<Value, ExecutorError> {
-        let operands = ExecutorError::ArithmeticOperands {
+        let operands = |left, right| ExecutorError::ArithmeticOperands {
             op: self,
-            left: l,
-            right: r,
+            left,
+            right,
         };
         let Some(common) = l.data_type().common_numeric(r.data_type()) else {
-            return Err(operands);
+            return Err(operands(l, r));
         };
-        match (common, l.coerce_to(common), r.coerce_to(common)) {
+        match (
+            common,
+            l.clone().coerce_to(common),
+            r.clone().coerce_to(common),
+        ) {
             (DataType::INT, Ok(Value::INT(a)), Ok(Value::INT(b))) => self
                 .apply_integer(
                     i64::from(a),
@@ -506,7 +510,7 @@ impl Arithmetic {
             (DataType::FLOAT, Ok(Value::FLOAT(a)), Ok(Value::FLOAT(b))) => {
                 Ok(Value::float(self.apply_float(a.0, b.0)))
             }
-            _ => Err(operands),
+            _ => Err(operands(l, r)),
         }
     }
 

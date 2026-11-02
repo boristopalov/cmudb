@@ -146,6 +146,40 @@ fn bigint_and_float_values_keep_their_full_width_across_a_restart() {
 }
 
 #[test]
+fn text_rows_and_varchar_indexes_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open(dir.path());
+        run(
+            &db,
+            "CREATE TABLE p (name VARCHAR(10), bio TEXT); CREATE INDEX p_name ON p (name);\
+             INSERT INTO p VALUES ('ada', 'wrote the first program'), ('grace', NULL);\
+             UPDATE p SET bio = 'found a moth in the relay' WHERE name = 'grace';",
+        );
+        db.close().unwrap();
+    }
+
+    let db = open(dir.path());
+    let query = "SELECT bio FROM p WHERE name = 'grace';";
+    assert!(uses_index(&db, query));
+    assert_eq!(
+        rows(&db, query),
+        vec![vec![Some(Value::text("found a moth in the relay"))]]
+    );
+    let err = db
+        .execute("INSERT INTO p VALUES ('much too long a name', NULL);")
+        .expect_err("the VARCHAR(10) limit is kept on disk");
+    assert!(err.to_string().contains("VARCHAR(10)"), "{err}");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT name FROM p WHERE bio = 'wrote the first program';"
+        ),
+        vec![vec![Some(Value::text("ada"))]]
+    );
+}
+
+#[test]
 fn a_database_can_be_reopened_again_and_again() {
     let dir = tempfile::tempdir().unwrap();
     for round in 0..4 {

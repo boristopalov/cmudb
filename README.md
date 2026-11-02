@@ -28,7 +28,7 @@ CONTRIBUTING.md lists the checks CI runs, and ARCHITECTURE.md maps the code.
 ## What's missing:
 - optimizer
 - serializable isolation
-- text and other variable-length types; columns are `INT` (32-bit), `BIGINT`, `FLOAT` (64-bit), `BOOLEAN` and `TIMESTAMP` (microseconds, no time zone, written as `'YYYY-MM-DD HH:MM:SS'`)
+- `CHAR(n)`, string functions and `LIKE`; columns are `INT` (32-bit), `BIGINT`, `FLOAT` (64-bit), `BOOLEAN`, `TIMESTAMP` (microseconds, no time zone, written as `'YYYY-MM-DD HH:MM:SS'`), `TEXT` and `VARCHAR(n)` (at most `n` characters; only `VARCHAR(n)` columns can be indexed, and a row must fit in one 8 KiB page)
 - external merge sort, window functions and `DROP TABLE`/`DROP INDEX` have executors, but the binder and planner never produce them
 
 ## Benchmarks

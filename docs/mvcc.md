@@ -24,7 +24,11 @@ allows something simpler. Code: `src/concurrency/`.
   a newest-first chain of `UndoLog { ts, is_deleted, data, prev }`. Every entry is a full
   image of an older version.
 - **Updates are in place.** A row keeps its record id for life; `UPDATE` used to tombstone
-  and append. cmudb tuples are fixed-width, so the new image always fits.
+  and append. Each slot records the capacity of its byte region, and the capacity never
+  shrinks, so writing an older image back on abort always fits. A new image longer than
+  the capacity moves within its page; when the page has no room left, the update fails
+  with `UpdateDoesNotFit` and changes nothing. Tables with a `TEXT` or `VARCHAR` column
+  leave `TEXT_UPDATE_RESERVE` bytes free on each page for rows to grow into.
 
 ## Visibility
 
@@ -107,7 +111,7 @@ Kept:
 
 Changed:
 - **Full-image undo logs instead of partial (modified-fields) deltas.** cmudb rows are
-  small and fixed-width, so the memory saving is small, and full images make
+  small, so the memory saving is small, and full images make
   reconstruction a lookup rather than a merge of partial columns.
 - **Chains are `Arc` links owned by the version map**, not `(txn_id, log_idx)` pointers into
   each transaction's undo buffer. BusTub has to keep finished transactions in `txn_map_`

@@ -101,7 +101,7 @@ fn oversized_insert_and_update_leave_page_bytes_and_original_row_unchanged() {
     assert!(matches!(
         heap.update_in_place(rid, TupleMeta::default(), &oversized),
         Err(TableHeapError::Page {
-            source: TablePageError::SizeChange { .. },
+            source: TablePageError::DoesNotFit { .. },
             ..
         })
     ));

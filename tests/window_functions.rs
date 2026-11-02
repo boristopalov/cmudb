@@ -395,7 +395,7 @@ fn avg_over_a_window_is_a_float() {
                 "SELECT AVG(amount) OVER ({window}) FROM sales ORDER BY dept, amount"
             ))
             .into_iter()
-            .map(|r| r[0])
+            .map(|r| r[0].clone())
             .collect();
         let expected: Vec<Option<Value>> = expected
             .into_iter()

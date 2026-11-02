@@ -35,10 +35,15 @@ const RID_MIN: RecordId = RecordId {
 };
 const RID_MAX: RecordId = RecordId::RESERVED;
 
-/// The schema of the key made of `indexed_col_idxs` of `table_schema`.
+/// The schema of the key made of `indexed_col_idxs` of `table_schema` and the length of its
+/// encoding. Fails with [`IndexError::UnindexableColumn`] for a column whose type has no
+/// [`DataType::key_width`].
 ///
 /// Panics if a column index is out of range for `table_schema`.
-fn key_schema(table_schema: &Schema, indexed_col_idxs: &[usize]) -> Schema {
+fn key_schema(
+    table_schema: &Schema,
+    indexed_col_idxs: &[usize],
+) -> Result<(Schema, usize), IndexError> {
     let key_cols: Vec<(DataType, String)> = indexed_col_idxs
         .iter()
         .map(|&i| {
@@ -49,12 +54,24 @@ fn key_schema(table_schema: &Schema, indexed_col_idxs: &[usize]) -> Schema {
             (col.dtype, col.name.clone())
         })
         .collect();
-    Schema::new(key_cols)
+    let mut key_len = 0usize;
+    for (dtype, name) in &key_cols {
+        let width = dtype
+            .key_width()
+            .ok_or_else(|| IndexError::UnindexableColumn {
+                column: name.clone(),
+                dtype: *dtype,
+            })?;
+        key_len = key_len.saturating_add(width);
+    }
+    Ok((Schema::new(key_cols), key_len))
 }
 
-/// Length of a B+ tree key: the user key followed by the record id.
-fn entry_key_len(key_schema: &Schema) -> u32 {
-    (key_schema.data_len + RID_SUFFIX_LEN) as u32
+/// Length of a B+ tree key: the user key followed by the record id. Fails with
+/// [`IndexError::UnsupportedKeyLength`] past `u32::MAX`.
+fn entry_key_len(key_len: usize) -> Result<u32, IndexError> {
+    let len = key_len.saturating_add(RID_SUFFIX_LEN);
+    u32::try_from(len).map_err(|_| IndexError::UnsupportedKeyLength(u32::MAX))
 }
 
 /// Iterator over `(user key, record id)` index entries.
@@ -76,6 +93,8 @@ pub struct TableIndex {
     pub indexed_col_idxs: Vec<usize>,
     /// Schema of the index key (the key columns only).
     pub schema: Schema,
+    /// Length of an encoded user key, the sum of its columns' [`DataType::key_width`]s.
+    key_len: usize,
     pub index_type: IndexType,
     /// The page [`TableIndex::open`] finds the index at.
     pub header_page_id: PageId,
@@ -95,16 +114,16 @@ impl TableIndex {
         indexed_col_idxs: Vec<usize>,
         index_type: IndexType,
     ) -> Result<Self, IndexError> {
-        let schema = key_schema(&table_schema, &indexed_col_idxs);
+        let (schema, key_len) = key_schema(&table_schema, &indexed_col_idxs)?;
         let tree = match index_type {
-            IndexType::BPlusTree => BPlusTree::new(index_name, entry_key_len(&schema), bpm)?,
+            IndexType::BPlusTree => BPlusTree::new(index_name, entry_key_len(key_len)?, bpm)?,
         };
         Ok(Self::over(
             tree,
             index_type,
             table_schema,
             indexed_col_idxs,
-            schema,
+            (schema, key_len),
         ))
     }
 
@@ -120,10 +139,10 @@ impl TableIndex {
         index_type: IndexType,
         header_page_id: PageId,
     ) -> Result<Self, IndexError> {
-        let schema = key_schema(&table_schema, &indexed_col_idxs);
+        let (schema, key_len) = key_schema(&table_schema, &indexed_col_idxs)?;
         let tree = match index_type {
             IndexType::BPlusTree => {
-                BPlusTree::open(index_name, entry_key_len(&schema), header_page_id, bpm)?
+                BPlusTree::open(index_name, entry_key_len(key_len)?, header_page_id, bpm)?
             }
         };
         Ok(Self::over(
@@ -131,7 +150,7 @@ impl TableIndex {
             index_type,
             table_schema,
             indexed_col_idxs,
-            schema,
+            (schema, key_len),
         ))
     }
 
@@ -140,12 +159,13 @@ impl TableIndex {
         index_type: IndexType,
         table_schema: Schema,
         indexed_col_idxs: Vec<usize>,
-        schema: Schema,
+        (schema, key_len): (Schema, usize),
     ) -> Self {
         Self {
             table_schema,
             indexed_col_idxs,
             schema,
+            key_len,
             index_type,
             header_page_id: tree.header_page_id,
             idx: Box::new(tree),
@@ -175,15 +195,20 @@ impl TableIndex {
             self.indexed_col_idxs.len(),
             "an index key needs one value per key column"
         );
-        let mut data = Vec::with_capacity(self.schema.data_len);
-        for v in vals {
+        let mut data = Vec::with_capacity(self.key_len);
+        for (v, col) in vals.iter().zip(&self.schema.cols) {
+            let start = data.len();
             v.encode_order_preserving(&mut data);
+            if let Some(width) = col.dtype.key_width() {
+                let end = start.saturating_add(width).max(data.len());
+                data.resize(end, 0);
+            }
         }
         IndexKey(data)
     }
 
     fn entry_key(&self, key: &IndexKey, rid: RecordId) -> IndexKey {
-        let mut data = Vec::with_capacity(self.schema.data_len + RID_SUFFIX_LEN);
+        let mut data = Vec::with_capacity(self.key_len + RID_SUFFIX_LEN);
         data.extend_from_slice(&key.0);
         data.extend_from_slice(&rid_suffix(rid));
         IndexKey(data)
@@ -260,7 +285,7 @@ impl TableIndex {
         start: Bound<IndexKey>,
         end: Bound<IndexKey>,
     ) -> Result<TableIndexIter, IndexError> {
-        let key_size = self.schema.data_len;
+        let key_size = self.key_len;
         let iter = self.idx.scan((start, end))?;
         Ok(Box::new(iter.map(move |r| {
             r.map(|(mut key, IndexValue::IndexValue(rid))| {

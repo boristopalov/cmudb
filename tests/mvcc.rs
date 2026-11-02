@@ -613,7 +613,7 @@ mod failure_paths {
     use cmudb::concurrency::TxnError;
     use cmudb::concurrency::mvcc::{self, MvccError};
     use cmudb::table_heap::{TableHeap, TableHeapError, Tuple};
-    use cmudb::table_page::TablePageError;
+    use cmudb::table_page::{TablePageError, TablePageRef};
 
     fn tuple(b: u8) -> Tuple {
         Tuple { data: vec![b; 16] }
@@ -714,16 +714,19 @@ mod failure_paths {
         let heap = TableHeap::new(db.bpm.clone()).unwrap();
         let t0 = db.begin();
         let a = mvcc::insert_tuple(&t0, &heap, &[], &tuple(1)).unwrap();
+        mvcc::insert_tuple(&t0, &heap, &[], &tuple(2)).unwrap();
         db.commit(&t0);
 
         let t1 = db.begin();
-        let wider = Tuple { data: vec![9; 17] };
+        let wider = Tuple {
+            data: vec![9; TablePageRef::MAX_TUPLE_SIZE],
+        };
         let err = mvcc::update_tuple(&t1, &db.mgr, &heap, &[], a, &tuple(1), &wider).unwrap_err();
         assert!(
             matches!(
                 err,
                 MvccError::Txn(TxnError::Storage(TableHeapError::Page {
-                    source: TablePageError::SizeChange { .. },
+                    source: TablePageError::UpdateDoesNotFit { .. },
                     ..
                 }))
             ),

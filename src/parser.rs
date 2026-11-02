@@ -3,13 +3,13 @@ use std::collections::HashMap;
 use std::fmt;
 
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, CreateIndex as SqlCreateIndex,
-    CreateTable as SqlCreateTable, DataType as SqlDataType, Delete, Distinct, Expr, FromTable,
-    Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Insert, JoinConstraint,
-    JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderByExpr, OrderByKind,
-    Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
-    TimezoneInfo, UnaryOperator, Update, Value as SqlValue, WildcardAdditionalOptions, WindowSpec,
-    WindowType,
+    Assignment, AssignmentTarget, BinaryOperator, CharLengthUnits, CharacterLength,
+    CreateIndex as SqlCreateIndex, CreateTable as SqlCreateTable, DataType as SqlDataType, Delete,
+    Distinct, Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+    GroupByExpr, Insert, JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart,
+    ObjectType, OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, Statement,
+    TableFactor, TableObject, TableWithJoins, TimezoneInfo, UnaryOperator, Update,
+    Value as SqlValue, WildcardAdditionalOptions, WindowSpec, WindowType,
 };
 
 use crate::catalog::timestamp::{self, InvalidTimestamp};
@@ -176,6 +176,13 @@ pub enum BinderError {
         expected: DataType,
         value: Value,
     },
+    /// An INSERT or UPDATE stores a string constant of `len` characters in a `VARCHAR(max_chars)`
+    /// column.
+    ColumnTooLong {
+        column: String,
+        max_chars: u32,
+        len: usize,
+    },
     /// An INSERT row has other than one value per target column.
     InsertArity {
         table: String,
@@ -188,12 +195,13 @@ pub enum BinderError {
     InvalidLimit { limit: String },
     /// A table or index name has more than one part, such as `schema.table`.
     QualifiedName { name: String },
-    /// A column type other than INT, BIGINT, FLOAT, BOOLEAN or TIMESTAMP (without time zone).
+    /// A column type other than INT, BIGINT, FLOAT, BOOLEAN, TIMESTAMP (without time zone), TEXT,
+    /// VARCHAR or VARCHAR(n) with `n` from 1 to `u32::MAX` characters.
     UnsupportedType { type_name: String },
     /// A binary operator with no bound counterpart, such as `%`.
     UnsupportedOperator { operator: BinaryOperator },
-    /// A literal other than a number, a boolean or NULL, such as a string where no TIMESTAMP is
-    /// expected.
+    /// A literal other than a number, a string, a boolean or NULL, such as a dollar-quoted
+    /// string.
     UnsupportedLiteral { literal: String },
     /// An expression form the binder does not handle, such as `IN (...)`.
     UnsupportedExpression { expr: String },
@@ -294,6 +302,14 @@ impl fmt::Display for BinderError {
             } => write!(
                 f,
                 "{value} is out of range for {expected} column `{column}`"
+            ),
+            BinderError::ColumnTooLong {
+                column,
+                max_chars,
+                len,
+            } => write!(
+                f,
+                "value of {len} characters is too long for VARCHAR({max_chars}) column `{column}`"
             ),
             BinderError::InsertArity {
                 table,
@@ -726,6 +742,7 @@ impl<'a> Binder<'a> {
                     SqlValue::Null => None,
                     SqlValue::Boolean(b) => Some(Value::BOOLEAN(*b)),
                     SqlValue::Number(s, _) => Some(number_literal(s)?),
+                    SqlValue::SingleQuotedString(s) => Some(Value::text(s)),
                     other => {
                         return Err(BinderError::UnsupportedLiteral {
                             literal: other.to_string(),
@@ -782,6 +799,7 @@ impl<'a> Binder<'a> {
         let resolved = self.resolve_expr_expecting(expr, scope, Some(col.dtype))?;
         match resolved {
             Expression::Constant(Some(v)) => v
+                .clone()
                 .coerce_to(col.dtype)
                 .map(|v| Expression::Constant(Some(v)))
                 .map_err(|e| match e {
@@ -794,6 +812,11 @@ impl<'a> Binder<'a> {
                         column: col.name.clone(),
                         expected: col.dtype,
                         value: v,
+                    },
+                    CoercionError::TooLong { max_chars, len } => BinderError::ColumnTooLong {
+                        column: col.name.clone(),
+                        max_chars,
+                        len,
                     },
                 }),
             other => match other.dtype() {
@@ -1899,9 +1922,32 @@ fn sql_to_dtype(t: &SqlDataType) -> Result<DataType, BinderError> {
         SqlDataType::Timestamp(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
             Ok(DataType::TIMESTAMP)
         }
+        SqlDataType::Text
+        | SqlDataType::Varchar(None)
+        | SqlDataType::CharacterVarying(None)
+        | SqlDataType::CharVarying(None) => Ok(DataType::TEXT),
+        SqlDataType::Varchar(Some(length))
+        | SqlDataType::CharacterVarying(Some(length))
+        | SqlDataType::CharVarying(Some(length)) => varchar_limit(length)
+            .map(DataType::VARCHAR)
+            .ok_or_else(|| BinderError::UnsupportedType {
+                type_name: t.to_string(),
+            }),
         other => Err(BinderError::UnsupportedType {
             type_name: other.to_string(),
         }),
+    }
+}
+
+/// The character limit of a `VARCHAR(n)`: `n` when it counts characters and is from 1 to
+/// `u32::MAX`.
+fn varchar_limit(length: &CharacterLength) -> Option<u32> {
+    match length {
+        CharacterLength::IntegerLength {
+            length,
+            unit: None | Some(CharLengthUnits::Characters),
+        } => u32::try_from(*length).ok().filter(|&n| n > 0),
+        _ => None,
     }
 }
 
@@ -1965,7 +2011,7 @@ fn negate(inner: Expression) -> Result<Expression, BinderError> {
     match inner {
         Expression::Constant(None) => Ok(Expression::Constant(None)),
         Expression::Constant(Some(v)) => {
-            let negated = match v {
+            let negated = match &v {
                 Value::FLOAT(f) => Some(Value::float(-f.0)),
                 other => other
                     .as_i64()
@@ -2028,7 +2074,7 @@ fn check_operand_types(
 /// FLOATs and can use an index on `f`.
 fn match_constant_to_other_side(l: Expression, r: Expression) -> (Expression, Expression) {
     let exactly = |constant: &Expression, target: Option<DataType>| match (constant, target) {
-        (Expression::Constant(Some(v)), Some(t)) => v.exactly_as(t),
+        (Expression::Constant(Some(v)), Some(t)) => v.clone().exactly_as(t),
         _ => None,
     };
     match (&l, &r) {

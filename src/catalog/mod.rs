@@ -27,7 +27,18 @@ pub enum CatalogError {
         expected: DataType,
         value: Value,
     },
+    /// A string of `len` characters was stored in column `column`, which holds at most
+    /// `max_chars`.
+    ColumnTooLong {
+        column: String,
+        max_chars: u32,
+        len: usize,
+    },
     ColumnOutOfBounds,
+    /// An encoded row of `size` bytes is past what a tuple can address.
+    RowTooLarge {
+        size: usize,
+    },
     ColumnNotFound,
     TableExists,
     TableDoesNotExist,
@@ -60,8 +71,19 @@ impl fmt::Display for CatalogError {
                 f,
                 "{value} is out of range for {expected} column `{column}`"
             ),
+            CatalogError::ColumnTooLong {
+                column,
+                max_chars,
+                len,
+            } => write!(
+                f,
+                "value of {len} characters is too long for VARCHAR({max_chars}) column `{column}`"
+            ),
             CatalogError::ColumnOutOfBounds => {
                 write!(f, "the column index is past the schema's last column")
+            }
+            CatalogError::RowTooLarge { size } => {
+                write!(f, "a row of {size} bytes is too large to store")
             }
             CatalogError::ColumnNotFound => write!(f, "column not found"),
             CatalogError::TableExists => write!(f, "table already exists"),
@@ -162,11 +184,13 @@ impl Catalog {
     ) -> Result<Self, CatalogError> {
         let mut entries = CatalogEntries::default();
         for t in &snapshot.tables {
+            let schema = Schema::new(t.columns.clone());
             let heap = TableHeap::open(bpm.clone(), t.first_page_id)
-                .map_err(|e| CatalogError::TableOpenError(format!("table {}: {e}", t.name)))?;
+                .map_err(|e| CatalogError::TableOpenError(format!("table {}: {e}", t.name)))?
+                .with_update_reserve(schema.update_reserve());
             let info = TableInfo {
                 name: t.name.clone(),
-                schema: Schema::new(t.columns.clone()),
+                schema,
                 heap,
             };
             entries.tables.insert(t.oid, Arc::new(info));
@@ -274,7 +298,8 @@ impl Catalog {
         }
 
         let heap = TableHeap::new(self.bpm.clone())
-            .map_err(|e| CatalogError::TableCreationError(e.to_string()))?;
+            .map_err(|e| CatalogError::TableCreationError(e.to_string()))?
+            .with_update_reserve(schema.update_reserve());
         let tinfo = TableInfo {
             name: name.clone(),
             schema,
@@ -469,7 +494,9 @@ impl Catalog {
 #[derive(Debug, Clone)]
 pub struct Schema {
     pub cols: Vec<Column>,
-    /// Size of the column payload in bytes, excluding the null bitmap.
+    /// Size in bytes of the fixed-width part of the payload, excluding the null bitmap. A text
+    /// column takes a [`TEXT_DESCRIPTOR_LEN`]-byte descriptor there; its characters follow
+    /// the fixed-width part.
     pub data_len: usize,
     /// Size in bytes of the null bitmap that starts every encoded tuple.
     pub bitmap_len: usize,
@@ -487,7 +514,7 @@ impl Schema {
                     dtype,
                     offset,
                 };
-                offset += col.dtype.size();
+                offset += col.dtype.fixed_width();
                 col
             })
             .collect();
@@ -513,6 +540,9 @@ impl Schema {
             .get(self.bitmap_len..)
             .and_then(|payload| payload.get(col.payload_range()))
             .ok_or(CatalogError::TupleSchemaMismatch)?;
+        if col.dtype.is_text() {
+            return text_at(&tuple.data, bytes).map(Some);
+        }
         Ok(Some(Value::decode(bytes, &col.dtype)))
     }
 
@@ -526,14 +556,24 @@ impl Schema {
         }
         let mut data = vec![0u8; self.bitmap_len];
         data.reserve(self.data_len);
+        let mut texts = Vec::new();
         for (i, (col, val)) in self.cols.iter().zip(values).enumerate() {
-            match val {
-                Some(v) => col.coerce(*v)?.encode(&mut data),
+            match val.as_ref().map(|v| col.coerce(v.clone())).transpose()? {
+                Some(Value::TEXT(s)) => {
+                    texts.push((data.len(), s));
+                    data.resize(data.len() + TEXT_DESCRIPTOR_LEN, 0);
+                }
+                Some(v) => v.encode(&mut data),
                 None => {
                     data[i / 8] |= 1 << (i % 8);
-                    data.resize(data.len() + col.dtype.size(), 0);
+                    data.resize(data.len() + col.dtype.fixed_width(), 0);
                 }
             }
+        }
+        for (descriptor_at, s) in texts {
+            let descriptor = text_descriptor(data.len(), s.len())?;
+            data[descriptor_at..descriptor_at + TEXT_DESCRIPTOR_LEN].copy_from_slice(&descriptor);
+            data.extend_from_slice(s.as_bytes());
         }
         Ok(Tuple { data })
     }
@@ -541,6 +581,50 @@ impl Schema {
     pub fn col_idx(&self, name: &str) -> Option<usize> {
         self.cols.iter().position(|c| c.name == name)
     }
+
+    /// Free bytes a table of this schema keeps on each page for updates that make rows longer:
+    /// [`TEXT_UPDATE_RESERVE`] when it has a text column, none when every row has one length.
+    pub fn update_reserve(&self) -> usize {
+        if self.cols.iter().any(|c| c.dtype.is_text()) {
+            TEXT_UPDATE_RESERVE
+        } else {
+            0
+        }
+    }
+}
+
+/// Free bytes each page of a table with a text column keeps for rows that grow, an eighth of a
+/// page.
+pub const TEXT_UPDATE_RESERVE: usize = crate::disk::PAGE_SIZE / 8;
+
+/// Bytes a text column takes in the fixed-width part of a tuple: the `u32` offset of its
+/// characters from the start of the tuple, then their `u32` length in bytes.
+pub const TEXT_DESCRIPTOR_LEN: usize = 8;
+
+/// The descriptor of a text value whose UTF-8 bytes start `offset` bytes into the tuple. Fails
+/// with [`CatalogError::RowTooLarge`] when either does not fit a `u32`.
+fn text_descriptor(offset: usize, len: usize) -> Result<[u8; TEXT_DESCRIPTOR_LEN], CatalogError> {
+    let too_large = || CatalogError::RowTooLarge { size: offset + len };
+    let offset = u32::try_from(offset).map_err(|_| too_large())?;
+    let len = u32::try_from(len).map_err(|_| too_large())?;
+    let mut out = [0u8; TEXT_DESCRIPTOR_LEN];
+    out[..4].copy_from_slice(&offset.to_le_bytes());
+    out[4..].copy_from_slice(&len.to_le_bytes());
+    Ok(out)
+}
+
+/// The text value `descriptor` points at in `tuple`. Fails with
+/// [`CatalogError::TupleSchemaMismatch`] when it points past the tuple or at bytes that are not
+/// UTF-8.
+fn text_at(tuple: &[u8], descriptor: &[u8]) -> Result<Value, CatalogError> {
+    let word = |at: usize| u32::from_le_bytes(descriptor[at..at + 4].try_into().unwrap()) as usize;
+    let (offset, len) = (word(0), word(4));
+    let bytes = offset
+        .checked_add(len)
+        .and_then(|end| tuple.get(offset..end))
+        .ok_or(CatalogError::TupleSchemaMismatch)?;
+    let text = std::str::from_utf8(bytes).map_err(|_| CatalogError::TupleSchemaMismatch)?;
+    Ok(Value::text(text))
 }
 
 /// Reads the null bit for `col_idx` from a tuple's bitmap prefix. Fails with
@@ -563,7 +647,7 @@ pub struct Column {
 impl Column {
     /// Converts `value` to this column's type, naming the column in the error.
     pub fn coerce(&self, value: Value) -> Result<Value, CatalogError> {
-        value.coerce_to(self.dtype).map_err(|e| match e {
+        value.clone().coerce_to(self.dtype).map_err(|e| match e {
             CoercionError::WrongType => CatalogError::ColumnType {
                 column: self.name.clone(),
                 expected: self.dtype,
@@ -574,18 +658,24 @@ impl Column {
                 expected: self.dtype,
                 value,
             },
+            CoercionError::TooLong { max_chars, len } => CatalogError::ColumnTooLong {
+                column: self.name.clone(),
+                max_chars,
+                len,
+            },
         })
     }
 
     fn payload_range(&self) -> std::ops::Range<usize> {
-        self.offset..self.offset + self.dtype.size()
+        self.offset..self.offset + self.dtype.fixed_width()
     }
 }
 
 /// A non-NULL SQL value. FLOAT is totally ordered through `OrderedFloat`: NaN equals itself and
 /// sorts above every other float. The derived order only ranks values of the same type; values of
-/// different types compare through [`Value::compare`].
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash)]
+/// different types compare through [`Value::compare`]. TEXT orders by its UTF-8 bytes, which is
+/// Unicode code point order.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Hash)]
 pub enum Value {
     BOOLEAN(bool),
     INT(i32),
@@ -593,6 +683,8 @@ pub enum Value {
     FLOAT(OrderedFloat<f64>),
     /// Microseconds since 1970-01-01 00:00:00 UTC.
     TIMESTAMP(i64),
+    /// A string, in a TEXT or VARCHAR column.
+    TEXT(Arc<str>),
 }
 
 /// Why a value could not be converted to another type.
@@ -602,6 +694,8 @@ pub enum CoercionError {
     WrongType,
     /// The conversion exists but the value does not fit the target type.
     OutOfRange,
+    /// A string of `len` characters stored as a `VARCHAR(max_chars)`.
+    TooLong { max_chars: u32, len: usize },
 }
 
 impl Value {
@@ -612,7 +706,13 @@ impl Value {
             Value::BIGINT(_) => DataType::BIGINT,
             Value::FLOAT(_) => DataType::FLOAT,
             Value::TIMESTAMP(_) => DataType::TIMESTAMP,
+            Value::TEXT(_) => DataType::TEXT,
         }
+    }
+
+    /// A TEXT value.
+    pub fn text(s: &str) -> Value {
+        Value::TEXT(Arc::from(s))
     }
 
     /// The narrowest integer value holding `i`: an INT when it fits 32 bits, otherwise a BIGINT.
@@ -647,20 +747,27 @@ impl Value {
 
     /// Converts the value to `to` the way an INSERT or UPDATE stores it in a column of that type:
     /// INT widens to BIGINT and FLOAT, BIGINT widens to FLOAT and narrows to INT when it fits.
-    /// FLOAT does not convert to an integer type, and BOOLEAN and TIMESTAMP convert to nothing
-    /// but themselves.
+    /// FLOAT does not convert to an integer type, BOOLEAN and TIMESTAMP convert to nothing but
+    /// themselves, and TEXT converts to a VARCHAR that holds as many characters.
     pub fn coerce_to(self, to: DataType) -> Result<Value, CoercionError> {
         if self.data_type() == to {
             return Ok(self);
         }
         match (self, to) {
+            (Value::TEXT(s), DataType::VARCHAR(max_chars)) => {
+                let len = s.chars().count();
+                if len <= max_chars as usize {
+                    Ok(Value::TEXT(s))
+                } else {
+                    Err(CoercionError::TooLong { max_chars, len })
+                }
+            }
             (Value::INT(i), DataType::BIGINT) => Ok(Value::BIGINT(i64::from(i))),
             (Value::BIGINT(i), DataType::INT) => i32::try_from(i)
                 .map(Value::INT)
                 .map_err(|_| CoercionError::OutOfRange),
-            (Value::INT(_) | Value::BIGINT(_), DataType::FLOAT) => {
-                Ok(Value::float(self.as_f64().ok_or(CoercionError::WrongType)?))
-            }
+            (Value::INT(i), DataType::FLOAT) => Ok(Value::float(f64::from(i))),
+            (Value::BIGINT(i), DataType::FLOAT) => Ok(Value::float(i as f64)),
             _ => Err(CoercionError::WrongType),
         }
     }
@@ -672,15 +779,16 @@ impl Value {
         if self.data_type() == to {
             return Some(self);
         }
-        match (self, to) {
+        match (&self, to) {
             (Value::INT(_) | Value::BIGINT(_), DataType::INT | DataType::BIGINT) => {
-                self.coerce_to(to).ok()
+                self.clone().coerce_to(to).ok()
             }
             (Value::INT(_) | Value::BIGINT(_), DataType::FLOAT) => {
                 let i = self.as_i64()?;
                 ((i.unsigned_abs() as f64) < I64_EXACT_FLOAT_BOUND).then(|| Value::float(i as f64))
             }
             (Value::FLOAT(f), DataType::INT | DataType::BIGINT) => {
+                let f = *f;
                 if f.0.fract() != 0.0 || f.0.abs() >= I64_EXACT_FLOAT_BOUND {
                     return None;
                 }
@@ -710,6 +818,7 @@ impl Value {
             Value::BIGINT(i) => out.extend_from_slice(&i.to_le_bytes()),
             Value::FLOAT(f) => out.extend_from_slice(&f.to_le_bytes()),
             Value::TIMESTAMP(t) => out.extend_from_slice(&t.to_le_bytes()),
+            Value::TEXT(s) => out.extend_from_slice(s.as_bytes()),
         }
     }
 
@@ -720,6 +829,7 @@ impl Value {
             DataType::BIGINT => Value::BIGINT(i64::from_le_bytes(bytes.try_into().unwrap())),
             DataType::FLOAT => Value::float(f64::from_le_bytes(bytes.try_into().unwrap())),
             DataType::TIMESTAMP => Value::TIMESTAMP(i64::from_le_bytes(bytes.try_into().unwrap())),
+            DataType::TEXT | DataType::VARCHAR(_) => Value::text(&String::from_utf8_lossy(bytes)),
         }
     }
 }
@@ -737,6 +847,7 @@ impl fmt::Display for Value {
             Value::BIGINT(i) => write!(f, "{i}"),
             Value::FLOAT(x) => write!(f, "{}", x.0),
             Value::TIMESTAMP(t) => f.write_str(&timestamp::format(*t)),
+            Value::TEXT(s) => f.write_str(s),
         }
     }
 }
@@ -755,8 +866,31 @@ impl Value {
                 out.extend_from_slice(&((*i as u64) ^ SIGN_BIT_64).to_be_bytes())
             }
             Value::FLOAT(f) => out.extend_from_slice(&order_preserving_f64_bits(f.0).to_be_bytes()),
+            Value::TEXT(s) => encode_order_preserving_bytes(s.as_bytes(), out),
         }
     }
+}
+
+/// The most bytes one character takes in UTF-8.
+const MAX_UTF8_CHAR_LEN: usize = 4;
+/// Bytes that end an order-preserving string encoding: a zero byte, then [`TEXT_TERMINATOR`].
+const TEXT_KEY_TERMINATOR_LEN: usize = 2;
+
+/// Byte that ends an order-preserving string encoding, after a zero byte.
+const TEXT_TERMINATOR: u8 = 0x00;
+/// Byte written after each zero byte of a string, so that the terminator sorts first.
+const TEXT_ESCAPE: u8 = 0xFF;
+
+/// Appends `bytes` with every zero byte followed by [`TEXT_ESCAPE`], then a zero byte and
+/// [`TEXT_TERMINATOR`], so that a string sorts before every longer string it is a prefix of.
+fn encode_order_preserving_bytes(bytes: &[u8], out: &mut Vec<u8>) {
+    for &b in bytes {
+        out.push(b);
+        if b == 0 {
+            out.push(TEXT_ESCAPE);
+        }
+    }
+    out.extend_from_slice(&[0, TEXT_TERMINATOR]);
 }
 
 /// Maps an `f64` to a `u64` that orders like `OrderedFloat<f64>`: every NaN maps to one value above
@@ -777,10 +911,9 @@ fn order_preserving_f64_bits(f: f64) -> u64 {
     }
 }
 
-/// The type of a column. Every type has a fixed width (see `size`), so every tuple of a
-/// table has the same length. MVCC relies on that: updates overwrite the tuple in place (see
-/// `TablePage::update_in_place`). A variable-length type would need out-of-place updates (a
-/// new slot plus a forwarding pointer, or delete + insert) before it can be added.
+/// The type of a column. Every type but TEXT and VARCHAR has a fixed width (see
+/// [`DataType::fixed_width`]); a text value's characters follow the fixed-width part of its
+/// tuple, so tuples of a table with a text column differ in length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
     BOOLEAN,
@@ -792,16 +925,50 @@ pub enum DataType {
     FLOAT,
     /// Microseconds since 1970-01-01 00:00:00 UTC, with no time zone.
     TIMESTAMP,
+    /// A string of any length (`TEXT`, `VARCHAR`).
+    TEXT,
+    /// A string of at most this many characters (`VARCHAR(n)`).
+    VARCHAR(u32),
 }
 
 impl DataType {
-    fn size(&self) -> usize {
+    /// Bytes the type takes in the fixed-width part of a tuple.
+    fn fixed_width(&self) -> usize {
         match self {
             DataType::BOOLEAN => 1,
             DataType::INT => 4,
             DataType::BIGINT => 8,
             DataType::FLOAT => 8,
             DataType::TIMESTAMP => 8,
+            DataType::TEXT | DataType::VARCHAR(_) => TEXT_DESCRIPTOR_LEN,
+        }
+    }
+
+    /// Bytes an index key spends on a value of this type, padded with zeros after the value's
+    /// [`Value::encode_order_preserving`] encoding, so that every key of an index has one length.
+    /// A `VARCHAR(n)` takes the encoding of `n` four-byte characters; TEXT has no bound and so
+    /// no width.
+    pub fn key_width(&self) -> Option<usize> {
+        match self {
+            DataType::TEXT => None,
+            DataType::VARCHAR(n) => (*n as usize)
+                .checked_mul(MAX_UTF8_CHAR_LEN)
+                .and_then(|bytes| bytes.checked_add(TEXT_KEY_TERMINATOR_LEN)),
+            fixed => Some(fixed.fixed_width()),
+        }
+    }
+
+    /// True for TEXT and VARCHAR.
+    pub fn is_text(&self) -> bool {
+        matches!(self, DataType::TEXT | DataType::VARCHAR(_))
+    }
+
+    /// The type of the values a column of this type holds: TEXT for a VARCHAR, the type itself
+    /// otherwise.
+    pub fn value_type(self) -> DataType {
+        match self {
+            DataType::VARCHAR(_) => DataType::TEXT,
+            other => other,
         }
     }
 
@@ -827,6 +994,7 @@ impl DataType {
     /// [`Value::coerce_to`]); a BIGINT stored as INT can still be out of range.
     pub fn coerces_to(self, to: DataType) -> bool {
         self == to
+            || (self.is_text() && to.is_text())
             || matches!(
                 (self, to),
                 (DataType::INT, DataType::BIGINT | DataType::FLOAT)
@@ -836,19 +1004,21 @@ impl DataType {
 
     /// True when values of the two types can be compared with `=`, `<` and the like.
     pub fn compares_with(self, other: DataType) -> bool {
-        self == other || self.common_numeric(other).is_some()
+        self.value_type() == other.value_type() || self.common_numeric(other).is_some()
     }
 }
 
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            DataType::BOOLEAN => "BOOLEAN",
-            DataType::INT => "INT",
-            DataType::BIGINT => "BIGINT",
-            DataType::FLOAT => "FLOAT",
-            DataType::TIMESTAMP => "TIMESTAMP",
-        })
+        match self {
+            DataType::BOOLEAN => f.write_str("BOOLEAN"),
+            DataType::INT => f.write_str("INT"),
+            DataType::BIGINT => f.write_str("BIGINT"),
+            DataType::FLOAT => f.write_str("FLOAT"),
+            DataType::TIMESTAMP => f.write_str("TIMESTAMP"),
+            DataType::TEXT => f.write_str("TEXT"),
+            DataType::VARCHAR(n) => write!(f, "VARCHAR({n})"),
+        }
     }
 }
 

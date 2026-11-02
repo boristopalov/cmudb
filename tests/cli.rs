@@ -102,6 +102,24 @@ fn shell_prints_bigints_floats_and_timestamps_readably() {
 }
 
 #[test]
+fn shell_prints_text_values_as_written() {
+    let (out, err) = run_shell(
+        "CREATE TABLE notes (id INT, body TEXT, tag VARCHAR(8));\n\
+         INSERT INTO notes VALUES (1, 'it''s here', 'déjà vu'), (2, '', NULL);\n\
+         SELECT * FROM notes ORDER BY id;\n",
+    );
+    assert_eq!(err, "", "unexpected stderr");
+    assert!(
+        out.contains("| 1  | it's here | déjà vu |"),
+        "row 1 in:\n{out}"
+    );
+    assert!(
+        out.contains("| 2  |           | NULL    |"),
+        "row 2 in:\n{out}"
+    );
+}
+
+#[test]
 fn a_database_directory_keeps_its_data_from_one_shell_to_the_next() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("mydb");
