@@ -434,6 +434,52 @@ fn select_clauses_the_binder_does_not_bind_are_rejected() {
 }
 
 #[test]
+fn wildcard_options_are_rejected_instead_of_returning_every_column() {
+    let db = emp_db();
+    for (sql, expected, message) in [
+        (
+            "SELECT * EXCLUDE (dept) FROM emp",
+            Unsupported::WildcardExclude,
+            "SELECT * EXCLUDE is not supported",
+        ),
+        (
+            "SELECT * EXCLUDE dept FROM emp",
+            Unsupported::WildcardExclude,
+            "SELECT * EXCLUDE is not supported",
+        ),
+        (
+            "SELECT * EXCEPT (dept) FROM emp",
+            Unsupported::WildcardExcept,
+            "SELECT * EXCEPT is not supported",
+        ),
+        (
+            "SELECT * REPLACE (salary * 2 AS salary) FROM emp",
+            Unsupported::WildcardReplace,
+            "SELECT * REPLACE is not supported",
+        ),
+        (
+            "SELECT * RENAME (dept AS department) FROM emp",
+            Unsupported::WildcardRename,
+            "SELECT * RENAME is not supported",
+        ),
+        (
+            "SELECT * ILIKE 'd%' FROM emp",
+            Unsupported::WildcardIlike,
+            "SELECT * ILIKE is not supported",
+        ),
+    ] {
+        let err = db.bind_error(sql);
+        assert_eq!(err, BinderError::Unsupported(expected), "{sql}");
+        assert_eq!(err.to_string(), message, "{sql}");
+    }
+    assert_eq!(
+        db.exec("SELECT * FROM emp").len(),
+        4,
+        "a bare * still selects every row"
+    );
+}
+
+#[test]
 fn values_statement() {
     let db = Db::new(8);
     assert_eq!(
