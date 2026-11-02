@@ -28,7 +28,7 @@ pub struct ExecutorError(pub String);
 
 impl From<CatalogError> for ExecutorError {
     fn from(e: CatalogError) -> Self {
-        ExecutorError(format!("catalog error: {:?}", e))
+        ExecutorError(format!("catalog error: {e}"))
     }
 }
 

@@ -3,6 +3,7 @@ use crate::{buffer_pool::BufferPoolManager, table_heap::TableHeap};
 use crate::{catalog::index_schema::TableIndex, table_heap::Tuple};
 use ordered_float::OrderedFloat;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicU32;
@@ -19,6 +20,26 @@ pub enum CatalogError {
     IndexExists,
     IndexDoesNotExist,
     IndexCreationError(String),
+}
+
+impl fmt::Display for CatalogError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CatalogError::TupleSchemaMismatch => {
+                write!(f, "the tuple does not match the table's schema")
+            }
+            CatalogError::ColumnOutOfBounds => {
+                write!(f, "the column index is past the schema's last column")
+            }
+            CatalogError::ColumnNotFound => write!(f, "column not found"),
+            CatalogError::TableExists => write!(f, "table already exists"),
+            CatalogError::TableDoesNotExist => write!(f, "table does not exist"),
+            CatalogError::TableCreationError(msg) => write!(f, "table creation failed: {msg}"),
+            CatalogError::IndexExists => write!(f, "index already exists"),
+            CatalogError::IndexDoesNotExist => write!(f, "index does not exist"),
+            CatalogError::IndexCreationError(msg) => write!(f, "index creation failed: {msg}"),
+        }
+    }
 }
 
 pub struct TableInfo {
@@ -514,6 +535,36 @@ impl DataType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_errors_display_readable_messages() {
+        let cases = [
+            (
+                CatalogError::TupleSchemaMismatch,
+                "the tuple does not match the table's schema",
+            ),
+            (
+                CatalogError::ColumnOutOfBounds,
+                "the column index is past the schema's last column",
+            ),
+            (CatalogError::ColumnNotFound, "column not found"),
+            (CatalogError::TableExists, "table already exists"),
+            (CatalogError::TableDoesNotExist, "table does not exist"),
+            (
+                CatalogError::TableCreationError("no free frame".to_string()),
+                "table creation failed: no free frame",
+            ),
+            (CatalogError::IndexExists, "index already exists"),
+            (CatalogError::IndexDoesNotExist, "index does not exist"),
+            (
+                CatalogError::IndexCreationError("failed to index row 3".to_string()),
+                "index creation failed: failed to index row 3",
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.to_string(), expected, "display of {err:?}");
+        }
+    }
 
     #[test]
     fn test_schema_encode_decode_roundtrip() {
