@@ -2,6 +2,7 @@ use crate::buf::{BufReader, BufWriter, BufferError};
 use crate::index::b_plus_page::{INVALID_PAGE_ID, PageId};
 use crate::table_heap::RecordId;
 use std::fmt;
+use std::num::TryFromIntError;
 
 const MAGIC: [u8; 4] = *b"CMDB";
 const VERSION: u16 = 2;
@@ -30,6 +31,15 @@ pub enum PageCodecError {
     InvalidSize,
     Malformed(&'static str),
     BufferError(BufferError),
+}
+
+/// A size or id that does not fit the type it is encoded or decoded as.
+pub const OVERFLOW: PageCodecError = PageCodecError::BufferError(BufferError::Overflow);
+
+impl From<TryFromIntError> for PageCodecError {
+    fn from(_: TryFromIntError) -> Self {
+        OVERFLOW
+    }
 }
 
 impl From<BufferError> for PageCodecError {
@@ -71,14 +81,14 @@ pub fn encode_page_id(page_id: PageId) -> Result<u64, PageCodecError> {
     if page_id == INVALID_PAGE_ID {
         return Ok(u64::MAX);
     }
-    u64::try_from(page_id).map_err(|_| PageCodecError::BufferError(BufferError::Overflow))
+    Ok(u64::try_from(page_id)?)
 }
 
 pub fn decode_page_id(raw: u64) -> Result<PageId, PageCodecError> {
     if raw == u64::MAX {
         return Ok(INVALID_PAGE_ID);
     }
-    usize::try_from(raw).map_err(|_| PageCodecError::BufferError(BufferError::Overflow))
+    Ok(usize::try_from(raw)?)
 }
 
 pub fn encode_record_id(rid: &RecordId) -> Result<(u64, u64), PageCodecError> {
@@ -87,10 +97,8 @@ pub fn encode_record_id(rid: &RecordId) -> Result<(u64, u64), PageCodecError> {
 
 pub fn decode_record_id(page_id: u64, slot_id: u64) -> Result<RecordId, PageCodecError> {
     Ok(RecordId {
-        page_id: u32::try_from(page_id)
-            .map_err(|_| PageCodecError::BufferError(BufferError::Overflow))?,
-        slot_id: u32::try_from(slot_id)
-            .map_err(|_| PageCodecError::BufferError(BufferError::Overflow))?,
+        page_id: u32::try_from(page_id)?,
+        slot_id: u32::try_from(slot_id)?,
     })
 }
 
@@ -113,6 +121,18 @@ pub fn read_common_header(r: &mut BufReader<'_>) -> Result<u8, PageCodecError> {
     let kind = r.read_u8()?;
     let _reserved = r.read_u8()?;
     Ok(kind)
+}
+
+/// Reads the common header and fails with `WrongPageKind` unless the page is of `expected` kind.
+pub fn read_common_header_of_kind(
+    r: &mut BufReader<'_>,
+    expected: u8,
+) -> Result<(), PageCodecError> {
+    let actual = read_common_header(r)?;
+    if actual != expected {
+        return Err(PageCodecError::WrongPageKind { expected, actual });
+    }
+    Ok(())
 }
 
 /// Validates the common header in place and returns the page kind, without a cursor.

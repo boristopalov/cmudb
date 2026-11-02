@@ -2,7 +2,8 @@ use crate::buffer_pool::{BufferPoolManager, PageMut, PageRef};
 use crate::catalog::index_schema::{IndexKey, IndexValue};
 use crate::disk::PAGE_SIZE;
 use crate::index::b_plus_page::{
-    HeaderPage, INVALID_PAGE_ID, InternalPage, LeafPage, NUM_TOMBSTONES, Page, PageId, PageKind,
+    HeaderPage, INVALID_PAGE_ID, InternalPage, Layout, LeafPage, NUM_TOMBSTONES, Page, PageId,
+    PageKind,
 };
 use crate::index::context::TreeContext;
 use crate::index::page_codec::{KIND_LEAF, PageCodecError, peek_common_header};
@@ -46,11 +47,11 @@ struct Split {
 }
 
 fn leaf_has_spare_entry(leaf: &LeafPage) -> bool {
-    leaf.keys.len() > leaf.min_size() as usize
+    leaf.len() > leaf.min_size() as usize
 }
 
 fn internal_has_spare_key(node: &InternalPage) -> bool {
-    node.keys.len() > node.min_size() as usize
+    node.len() > node.min_size() as usize
 }
 
 fn safe_for_insert(page: &NodeView<&[u8]>) -> bool {
@@ -66,11 +67,11 @@ fn safe_for_remove(page: &NodeView<&[u8]>) -> bool {
 
 /// The child of the internal page in `buf` to descend into for `key`, or `None` when `buf`
 /// holds a leaf. A leaf is only told apart by its kind here; whoever reads it validates it.
-fn child_for_key(buf: &[u8], key_len: u32, key: &IndexKey) -> Result<Option<PageId>, IndexError> {
+fn child_for_key(buf: &[u8], layout: Layout, key: &IndexKey) -> Result<Option<PageId>, IndexError> {
     if peek_common_header(buf)? == KIND_LEAF {
         return Ok(None);
     }
-    InternalPageView::new(buf, key_len)?
+    InternalPageView::new(buf, layout)?
         .child_for(&key.0)
         .ok_or(NO_CHILD_FOR_KEY)
         .map(Some)
@@ -91,7 +92,7 @@ fn step_down<'a>(current: &mut PageRef<'a>, child: PageRef<'a>) {
 #[derive(Debug)]
 pub struct BPlusTree {
     pub header_page_id: PageId,
-    key_len: u32,
+    layout: Layout,
     index_name: String,
     leaf_max_size: u32,
     internal_max_size: u32,
@@ -100,7 +101,7 @@ pub struct BPlusTree {
 
 pub struct LeafPagesIter {
     bpm: Arc<BufferPoolManager>,
-    key_len: u32,
+    layout: Layout,
     next_leaf_id: PageId,
     seen: HashSet<PageId>,
     finished: bool,
@@ -131,9 +132,9 @@ impl Iterator for LeafPagesIter {
             }
         };
 
-        match LeafPage::decode(page.data(), self.key_len) {
+        match LeafPage::decode(page.data(), self.layout) {
             Ok(leaf) => {
-                self.next_leaf_id = leaf.next_leaf_id;
+                self.next_leaf_id = leaf.next_leaf_id();
                 Some(Ok((leaf_id, leaf)))
             }
             Err(e) => {
@@ -150,14 +151,7 @@ impl BPlusTree {
         key_len: u32,
         bpm: Arc<BufferPoolManager>,
     ) -> Result<Self, IndexError> {
-        let key_len_usize =
-            usize::try_from(key_len).map_err(|_| IndexError::UnsupportedKeyLength(key_len))?;
-        let (Some(leaf_capacity), Some(internal_capacity)) = (
-            LeafPage::max_size_for_layout(key_len_usize),
-            InternalPage::max_size_for_layout(key_len_usize),
-        ) else {
-            return Err(IndexError::UnsupportedKeyLength(key_len));
-        };
+        let (layout, leaf_capacity, internal_capacity) = Self::layout_for(key_len)?;
 
         let header_page_id = {
             let mut page = bpm.new_page()?;
@@ -169,7 +163,7 @@ impl BPlusTree {
 
         Ok(Self {
             index_name,
-            key_len,
+            layout,
             header_page_id,
             leaf_max_size: leaf_capacity,
             internal_max_size: internal_capacity,
@@ -186,17 +180,10 @@ impl BPlusTree {
         header_page_id: PageId,
         bpm: Arc<BufferPoolManager>,
     ) -> Result<Self, IndexError> {
-        let key_len_usize =
-            usize::try_from(key_len).map_err(|_| IndexError::UnsupportedKeyLength(key_len))?;
-        let (Some(leaf_capacity), Some(internal_capacity)) = (
-            LeafPage::max_size_for_layout(key_len_usize),
-            InternalPage::max_size_for_layout(key_len_usize),
-        ) else {
-            return Err(IndexError::UnsupportedKeyLength(key_len));
-        };
+        let (layout, leaf_capacity, internal_capacity) = Self::layout_for(key_len)?;
         let tree = Self {
             index_name,
-            key_len,
+            layout,
             header_page_id,
             leaf_max_size: leaf_capacity,
             internal_max_size: internal_capacity,
@@ -204,6 +191,19 @@ impl BPlusTree {
         };
         tree.read_header()?;
         Ok(tree)
+    }
+
+    /// The page layout for `key_len`-byte keys and how many entries a leaf and keys an internal
+    /// page hold. Fails with [`IndexError::UnsupportedKeyLength`] when a page cannot hold one.
+    fn layout_for(key_len: u32) -> Result<(Layout, u32, u32), IndexError> {
+        let unsupported = IndexError::UnsupportedKeyLength(key_len);
+        let Ok(layout) = Layout::new(key_len) else {
+            return Err(unsupported);
+        };
+        match (layout.leaf_max_entries(), layout.internal_max_keys()) {
+            (Some(leaf), Some(internal)) => Ok((layout, leaf, internal)),
+            _ => Err(unsupported),
+        }
     }
 
     /// Acquires a read latch on the header page and copies out its fields.
@@ -214,10 +214,11 @@ impl BPlusTree {
 
     fn header_from_bytes(&self, buf: &[u8]) -> Result<HeaderPage, IndexError> {
         let view = HeaderPageView::new(buf)?;
-        if view.key_len() != self.key_len {
+        let actual = view.key_len() as usize;
+        if actual != self.layout.key_len() {
             return Err(IndexError::KeyLength {
-                expected: self.key_len as usize,
-                actual: view.key_len() as usize,
+                expected: self.layout.key_len(),
+                actual,
             });
         }
         Ok(HeaderPage {
@@ -236,11 +237,11 @@ impl BPlusTree {
     }
 
     fn check_key_len(&self, key: &IndexKey) -> Result<(), IndexError> {
-        if key.0.len() == self.key_len as usize {
+        if key.0.len() == self.layout.key_len() {
             Ok(())
         } else {
             Err(IndexError::KeyLength {
-                expected: self.key_len as usize,
+                expected: self.layout.key_len(),
                 actual: key.0.len(),
             })
         }
@@ -248,7 +249,7 @@ impl BPlusTree {
 
     fn decode_leaf(&self, page_id: PageId) -> Result<LeafPage, IndexError> {
         let page = self.bpm.read_page(page_id)?;
-        Ok(LeafPage::decode(page.data(), self.key_len)?)
+        Ok(LeafPage::decode(page.data(), self.layout)?)
     }
 
     fn allocate_page(&self) -> Result<(PageId, PageMut<'_>), IndexError> {
@@ -257,11 +258,9 @@ impl BPlusTree {
     }
 
     fn new_leaf(&self) -> LeafPage {
-        let tombstone_capacity = LeafPage::tombstone_capacity_for_layout(
-            self.leaf_max_size,
-            self.key_len,
-            NUM_TOMBSTONES,
-        );
+        let tombstone_capacity = self
+            .layout
+            .tombstone_capacity(self.leaf_max_size, NUM_TOMBSTONES);
         LeafPage::new(self.leaf_max_size, tombstone_capacity)
     }
 
@@ -277,11 +276,11 @@ impl BPlusTree {
             .push_back(self.bpm.write_page(ctx.root_page_id)?);
         loop {
             let current = ctx.write_set.back().ok_or(LATCH_NOT_HELD)?;
-            let Some(child_id) = child_for_key(current.data(), self.key_len, key)? else {
+            let Some(child_id) = child_for_key(current.data(), self.layout, key)? else {
                 return Ok(());
             };
             let child = self.bpm.write_page(child_id)?;
-            let child_is_safe = is_safe(&NodeView::new(child.data(), self.key_len)?);
+            let child_is_safe = is_safe(&NodeView::new(child.data(), self.layout)?);
             ctx.descend_into(child, child_is_safe);
         }
     }
@@ -296,7 +295,7 @@ impl BPlusTree {
             let mut leaf = self.new_leaf();
             leaf.insert(key, record_id)
                 .map_err(|_| IndexError::Insert(InsertError::DuplicateKey))?;
-            leaf.encode(leaf_page.data_mut(), self.key_len)?;
+            leaf.encode(leaf_page.data_mut(), self.layout)?;
             header.root_page_id = leaf_id;
             header.first_leaf_id = leaf_id;
             Self::store_header(&mut header_page, &header)?;
@@ -309,19 +308,19 @@ impl BPlusTree {
         if self.insert_in_place(&mut leaf_page, &key, record_id)? {
             return Ok(());
         }
-        let mut leaf = LeafPage::decode(leaf_page.data(), self.key_len)?;
+        let mut leaf = LeafPage::decode(leaf_page.data(), self.layout)?;
         leaf.insert(key, record_id)
             .map_err(|_| IndexError::Insert(InsertError::DuplicateKey))?;
         if !leaf.is_overfull() {
-            leaf.encode(leaf_page.data_mut(), self.key_len)?;
+            leaf.encode(leaf_page.data_mut(), self.layout)?;
             return Ok(());
         }
 
         let (right_id, mut right_page) = self.allocate_page()?;
         let mut right_leaf = self.new_leaf();
         let separator = leaf.split_into(&mut right_leaf, right_id);
-        leaf.encode(leaf_page.data_mut(), self.key_len)?;
-        right_leaf.encode(right_page.data_mut(), self.key_len)?;
+        leaf.encode(leaf_page.data_mut(), self.layout)?;
+        right_leaf.encode(right_page.data_mut(), self.layout)?;
         let mut split = Split {
             left_id: page_id_of(&leaf_page)?,
             separator,
@@ -329,18 +328,18 @@ impl BPlusTree {
         };
 
         while let Some(mut parent_page) = ctx.write_set.pop_back() {
-            let mut parent = InternalPage::decode(parent_page.data_mut(), self.key_len)?;
+            let mut parent = InternalPage::decode(parent_page.data_mut(), self.layout)?;
             parent.insert_separator(split.separator, split.right_id);
             if !parent.is_overfull() {
-                parent.encode(parent_page.data_mut(), self.key_len)?;
+                parent.encode(parent_page.data_mut(), self.layout)?;
                 return Ok(());
             }
 
             let (right_id, mut right_page) = self.allocate_page()?;
             let mut right = InternalPage::new(self.internal_max_size);
             let separator = parent.split_into(&mut right);
-            parent.encode(parent_page.data_mut(), self.key_len)?;
-            right.encode(right_page.data_mut(), self.key_len)?;
+            parent.encode(parent_page.data_mut(), self.layout)?;
+            right.encode(right_page.data_mut(), self.layout)?;
             split = Split {
                 left_id: page_id_of(&parent_page)?,
                 separator,
@@ -362,10 +361,13 @@ impl BPlusTree {
         }
         let header_page = ctx.header.as_mut().ok_or(HEADER_LATCH_RELEASED)?;
         let (root_id, mut root_page) = self.allocate_page()?;
-        let mut root = InternalPage::new(self.internal_max_size);
-        root.children.push(split.left_id);
-        root.insert_separator(split.separator, split.right_id);
-        root.encode(root_page.data_mut(), self.key_len)?;
+        let root = InternalPage::new_root(
+            self.internal_max_size,
+            split.left_id,
+            split.separator,
+            split.right_id,
+        );
+        root.encode(root_page.data_mut(), self.layout)?;
         header.root_page_id = root_id;
         Self::store_header(header_page, header)?;
         Ok(())
@@ -379,7 +381,7 @@ impl BPlusTree {
         key: &IndexKey,
         record_id: RecordId,
     ) -> Result<bool, IndexError> {
-        match LeafPageView::new(leaf_page.data_mut(), self.key_len)?.insert(&key.0, record_id) {
+        match LeafPageView::new(leaf_page.data_mut(), self.layout)?.insert(&key.0, record_id) {
             Ok(()) => Ok(true),
             Err(LeafInsertError::DuplicateKey) => {
                 Err(IndexError::Insert(InsertError::DuplicateKey))
@@ -401,22 +403,22 @@ impl BPlusTree {
         if self.remove_in_place_if_final(&mut ctx, &mut header, &mut leaf_page, &key)? {
             return Ok(());
         }
-        let mut leaf = LeafPage::decode(leaf_page.data(), self.key_len)?;
+        let mut leaf = LeafPage::decode(leaf_page.data(), self.layout)?;
         leaf.remove_key(&key)?;
         if !leaf.is_underfull() {
-            leaf.encode(leaf_page.data_mut(), self.key_len)?;
+            leaf.encode(leaf_page.data_mut(), self.layout)?;
             return Ok(());
         }
 
         let mut parent_page = ctx.write_set.pop_back().ok_or(LATCH_NOT_HELD)?;
-        let mut parent = InternalPage::decode(parent_page.data_mut(), self.key_len)?;
+        let mut parent = InternalPage::decode(parent_page.data_mut(), self.layout)?;
         let mut outcome = self.rebalance_leaf(&key, leaf, &mut leaf_page, &mut parent)?;
-        parent.encode(parent_page.data_mut(), self.key_len)?;
+        parent.encode(parent_page.data_mut(), self.layout)?;
 
         while outcome == Rebalance::Merged {
             if parent_page.page_id() == Some(ctx.root_page_id) {
-                if parent.children.len() == 1 {
-                    header.root_page_id = parent.children[0];
+                if let [only_child] = parent.children() {
+                    header.root_page_id = *only_child;
                     let header_page = ctx.header.as_mut().ok_or(HEADER_LATCH_RELEASED)?;
                     Self::store_header(header_page, &header)?;
                 }
@@ -426,9 +428,9 @@ impl BPlusTree {
                 return Ok(());
             }
             let mut grandparent_page = ctx.write_set.pop_back().ok_or(LATCH_NOT_HELD)?;
-            let mut grandparent = InternalPage::decode(grandparent_page.data_mut(), self.key_len)?;
+            let mut grandparent = InternalPage::decode(grandparent_page.data_mut(), self.layout)?;
             outcome = self.rebalance_internal(&key, parent, &mut parent_page, &mut grandparent)?;
-            grandparent.encode(grandparent_page.data_mut(), self.key_len)?;
+            grandparent.encode(grandparent_page.data_mut(), self.layout)?;
             parent_page = grandparent_page;
             parent = grandparent;
         }
@@ -448,7 +450,7 @@ impl BPlusTree {
         key: &IndexKey,
     ) -> Result<bool, IndexError> {
         let leaf_is_root = page_id_of(leaf_page)? == ctx.root_page_id;
-        let mut leaf = LeafPageView::new(leaf_page.data_mut(), self.key_len)?;
+        let mut leaf = LeafPageView::new(leaf_page.data_mut(), self.layout)?;
         if !leaf_is_root {
             if leaf.size() <= leaf.min_size() {
                 return Ok(false);
@@ -489,7 +491,7 @@ impl BPlusTree {
         let leaf_idx = parent.find_child_index(key);
         let (sibling_idx, sibling_id) = Self::sibling_of(parent, leaf_idx)?;
         let mut sibling_page = self.bpm.write_page(sibling_id)?;
-        let mut sibling = LeafPage::decode(sibling_page.data_mut(), self.key_len)?;
+        let mut sibling = LeafPage::decode(sibling_page.data_mut(), self.layout)?;
         let sibling_is_right = sibling_idx > leaf_idx;
 
         while leaf.is_underfull() && leaf_has_spare_entry(&sibling) {
@@ -499,8 +501,7 @@ impl BPlusTree {
                 sibling.pop_last()
             };
             let (k, rid, tombstoned) = borrowed.ok_or(EMPTY_SIBLING)?;
-            let leaf_tombstones_full = leaf.tombstones.len() >= leaf.tombstone_capacity;
-            if tombstoned && leaf_tombstones_full {
+            if tombstoned && leaf.tombstones_full() {
                 continue;
             }
             if sibling_is_right {
@@ -514,24 +515,24 @@ impl BPlusTree {
             if sibling_is_right {
                 leaf.absorb_right(&mut sibling);
                 parent.remove_separator(leaf_idx);
-                leaf.encode(leaf_page.data_mut(), self.key_len)?;
+                leaf.encode(leaf_page.data_mut(), self.layout)?;
             } else {
                 sibling.absorb_right(&mut leaf);
                 parent.remove_separator(sibling_idx);
-                sibling.encode(sibling_page.data_mut(), self.key_len)?;
+                sibling.encode(sibling_page.data_mut(), self.layout)?;
             }
             return Ok(Rebalance::Merged);
         }
 
         if sibling_is_right {
-            let new_separator = sibling.keys.first().ok_or(EMPTY_SIBLING)?.clone();
+            let new_separator = sibling.first_key().ok_or(EMPTY_SIBLING)?.clone();
             parent.replace_key(leaf_idx, new_separator);
         } else {
-            let new_separator = leaf.keys.first().ok_or(EMPTY_SIBLING)?.clone();
+            let new_separator = leaf.first_key().ok_or(EMPTY_SIBLING)?.clone();
             parent.replace_key(sibling_idx, new_separator);
         }
-        sibling.encode(sibling_page.data_mut(), self.key_len)?;
-        leaf.encode(leaf_page.data_mut(), self.key_len)?;
+        sibling.encode(sibling_page.data_mut(), self.layout)?;
+        leaf.encode(leaf_page.data_mut(), self.layout)?;
         Ok(Rebalance::Redistributed)
     }
 
@@ -545,20 +546,20 @@ impl BPlusTree {
         let node_idx = parent.find_child_index(key);
         let (sibling_idx, sibling_id) = Self::sibling_of(parent, node_idx)?;
         let mut sibling_page = self.bpm.write_page(sibling_id)?;
-        let mut sibling = InternalPage::decode(sibling_page.data_mut(), self.key_len)?;
+        let mut sibling = InternalPage::decode(sibling_page.data_mut(), self.layout)?;
         let sibling_is_right = sibling_idx > node_idx;
 
         if !internal_has_spare_key(&sibling) {
             if sibling_is_right {
-                let separator = parent.keys[node_idx].clone();
+                let separator = parent.keys()[node_idx].clone();
                 node.absorb_right(separator, &mut sibling);
                 parent.remove_separator(node_idx);
-                node.encode(node_page.data_mut(), self.key_len)?;
+                node.encode(node_page.data_mut(), self.layout)?;
             } else {
-                let separator = parent.keys[sibling_idx].clone();
+                let separator = parent.keys()[sibling_idx].clone();
                 sibling.absorb_right(separator, &mut node);
                 parent.remove_separator(sibling_idx);
-                sibling.encode(sibling_page.data_mut(), self.key_len)?;
+                sibling.encode(sibling_page.data_mut(), self.layout)?;
             }
             return Ok(Rebalance::Merged);
         }
@@ -572,8 +573,8 @@ impl BPlusTree {
             let old_separator = parent.replace_key(sibling_idx, rotated_key);
             node.prepend_child_and_key(old_separator, rotated_child);
         }
-        sibling.encode(sibling_page.data_mut(), self.key_len)?;
-        node.encode(node_page.data_mut(), self.key_len)?;
+        sibling.encode(sibling_page.data_mut(), self.layout)?;
+        node.encode(node_page.data_mut(), self.layout)?;
         Ok(Rebalance::Redistributed)
     }
 
@@ -581,7 +582,7 @@ impl BPlusTree {
         let header = self.read_header()?;
         Ok(LeafPagesIter {
             bpm: self.bpm.clone(),
-            key_len: self.key_len,
+            layout: self.layout,
             next_leaf_id: header.first_leaf_id,
             seen: std::collections::HashSet::new(),
             finished: false,
@@ -614,7 +615,7 @@ impl BPlusTree {
             "BPlusTree {{ index_name: {}, header_page_id: {}, key_len: {}, leaf_max_size: {}, internal_max_size: {} }}",
             self.index_name,
             fmt_pid(self.header_page_id),
-            self.key_len,
+            self.layout.key_len(),
             self.leaf_max_size,
             self.internal_max_size
         );
@@ -662,24 +663,24 @@ impl BPlusTree {
             }
 
             let page = tree.bpm.read_page(page_id)?;
-            match LeafPage::decode(page.data(), tree.key_len) {
+            match LeafPage::decode(page.data(), tree.layout) {
                 Ok(leaf) => {
                     println!(
                         "{prefix}{branch}leaf page_id={} keys={} next_leaf_id={}",
                         fmt_pid(page_id),
-                        leaf.keys.len(),
-                        fmt_pid(leaf.next_leaf_id)
+                        leaf.len(),
+                        fmt_pid(leaf.next_leaf_id())
                     );
                     Ok(())
                 }
                 Err(PageCodecError::WrongPageKind { .. }) => {
-                    match InternalPage::decode(page.data(), tree.key_len) {
+                    match InternalPage::decode(page.data(), tree.layout) {
                         Ok(internal) => {
-                            let children = internal.children.clone();
+                            let children = internal.children().to_vec();
                             println!(
                                 "{prefix}{branch}internal page_id={} keys={} children={}",
                                 fmt_pid(page_id),
-                                internal.keys.len(),
+                                internal.len(),
                                 fmt_children(&children)
                             );
 
@@ -751,10 +752,10 @@ impl BPlusTree {
             println!(
                 "  [{idx}] page_id={} keys={} next_leaf_id={}",
                 fmt_pid(leaf_id),
-                leaf.keys.len(),
-                fmt_pid(leaf.next_leaf_id)
+                leaf.len(),
+                fmt_pid(leaf.next_leaf_id())
             );
-            leaf_id = leaf.next_leaf_id;
+            leaf_id = leaf.next_leaf_id();
             idx += 1;
         }
 
@@ -787,7 +788,7 @@ impl BPlusTree {
             return Ok(None);
         };
         loop {
-            let Some(child_id) = child_for_key(current.data(), self.key_len, key)? else {
+            let Some(child_id) = child_for_key(current.data(), self.layout, key)? else {
                 return Ok(None);
             };
             let child = self.bpm.read_page(child_id)?;
@@ -818,7 +819,7 @@ impl BPlusTree {
         let Some(mut current) = self.get_root_page_from_header()? else {
             return Ok(None);
         };
-        while let Some(child_id) = child_for_key(current.data(), self.key_len, key)? {
+        while let Some(child_id) = child_for_key(current.data(), self.layout, key)? {
             let child = self.bpm.read_page(child_id)?;
             step_down(&mut current, child);
         }
@@ -849,7 +850,7 @@ impl Index for BPlusTree {
         self.check_key_len(&key)?;
 
         if let Some(mut leaf_page) = self.latch_leaf_for_write(&key)? {
-            let mut leaf = LeafPageView::new(leaf_page.data_mut(), self.key_len)?;
+            let mut leaf = LeafPageView::new(leaf_page.data_mut(), self.layout)?;
             if leaf.size() > leaf.min_size() {
                 leaf.remove_key(&key.0)?;
                 return Ok(());
@@ -871,7 +872,7 @@ impl Index for BPlusTree {
         let Some(page) = self.find_leaf(key)? else {
             return Ok(None);
         };
-        let leaf = LeafPageView::new(page.data(), self.key_len)?;
+        let leaf = LeafPageView::new(page.data(), self.layout)?;
         Ok(leaf.get(&key.0)?.map(IndexValue::IndexValue))
     }
 
@@ -888,7 +889,7 @@ impl Index for BPlusTree {
             return Ok(Box::new(std::iter::empty()));
         };
         let start_leaf_id = start_page.page_id().ok_or(UNNUMBERED_FRAME)?;
-        let leaf = LeafPageView::new(start_page.data(), self.key_len)?;
+        let leaf = LeafPageView::new(start_page.data(), self.layout)?;
         let start_slot = match range.start_bound() {
             Bound::Unbounded => 0,
             Bound::Excluded(key) => leaf.upper_bound(&key.0),
@@ -899,7 +900,7 @@ impl Index for BPlusTree {
 
         Ok(Box::new(BPlusTreeIter {
             bpm: self.bpm.clone(),
-            key_len: self.key_len,
+            layout: self.layout,
             leaf: Some(buf),
             seen: HashSet::from([start_leaf_id]),
             slot_idx: start_slot,
@@ -913,7 +914,7 @@ impl Index for BPlusTree {
 /// reads entries through a `LeafPageView` over that copy.
 pub struct BPlusTreeIter {
     bpm: Arc<BufferPoolManager>,
-    key_len: u32,
+    layout: Layout,
     /// Copy of the current leaf's bytes; `None` once the scan is finished.
     leaf: Option<Box<[u8; PAGE_SIZE]>>,
     seen: HashSet<PageId>,
@@ -934,7 +935,7 @@ impl BPlusTreeIter {
             )));
         }
         let page = self.bpm.read_page(leaf_id)?;
-        LeafPageView::new(page.data(), self.key_len)?;
+        LeafPageView::new(page.data(), self.layout)?;
         if let Some(buf) = self.leaf.as_mut() {
             buf.copy_from_slice(page.data());
         }
@@ -947,7 +948,7 @@ impl Iterator for BPlusTreeIter {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let buf = self.leaf.as_ref()?;
-            let leaf = match LeafPageView::new(&buf[..], self.key_len) {
+            let leaf = match LeafPageView::new(&buf[..], self.layout) {
                 Ok(leaf) => leaf,
                 Err(e) => {
                     self.leaf = None;
@@ -1024,11 +1025,8 @@ mod tests {
         let tree = BPlusTree::new("idx".to_string(), NO_TOMBSTONE_KEY_LEN, bpm).unwrap();
         assert_eq!(tree.leaf_max_size, 14);
         assert_eq!(
-            LeafPage::tombstone_capacity_for_layout(
-                tree.leaf_max_size,
-                NO_TOMBSTONE_KEY_LEN,
-                NUM_TOMBSTONES
-            ),
+            tree.layout
+                .tombstone_capacity(tree.leaf_max_size, NUM_TOMBSTONES),
             0
         );
     }
@@ -1049,18 +1047,18 @@ mod tests {
         let header = tree.read_header().unwrap();
         let root = InternalPage::decode(
             bpm.read_page(header.root_page_id).unwrap().data(),
-            NO_TOMBSTONE_KEY_LEN,
+            Layout::new(NO_TOMBSTONE_KEY_LEN).unwrap(),
         )
         .unwrap();
         assert_eq!(
-            root.children.len(),
+            root.children().len(),
             2,
             "15 inserts split the root leaf once"
         );
-        let (left_id, right_id) = (root.children[0], root.children[1]);
+        let (left_id, right_id) = (root.children()[0], root.children()[1]);
         let left = tree.decode_leaf(left_id).unwrap();
         assert_eq!(
-            left.keys.len() as u32,
+            left.len() as u32,
             left.min_size(),
             "left leaf sits at min size"
         );
@@ -1152,10 +1150,10 @@ mod tests {
             bpm.read_page(tree.read_header().unwrap().root_page_id)
                 .unwrap()
                 .data(),
-            NO_TOMBSTONE_KEY_LEN,
+            Layout::new(NO_TOMBSTONE_KEY_LEN).unwrap(),
         )
         .unwrap();
-        (tree, root.children[0], root.children[1])
+        (tree, root.children()[0], root.children()[1])
     }
 
     fn scan_all(tree: &BPlusTree) -> Result<Vec<(IndexKey, IndexValue)>, IndexError> {
@@ -1181,10 +1179,10 @@ mod tests {
         let (bpm, _tmp) = crate::testing::bpm(16);
         let (tree, left, right) = two_leaf_tree(&bpm);
         let mut leaf = tree.decode_leaf(right).unwrap();
-        leaf.next_leaf_id = left;
+        leaf.set_next_leaf_id(left);
         leaf.encode(
             bpm.write_page(right).unwrap().data_mut(),
-            NO_TOMBSTONE_KEY_LEN,
+            Layout::new(NO_TOMBSTONE_KEY_LEN).unwrap(),
         )
         .unwrap();
         assert!(matches!(
@@ -1233,8 +1231,8 @@ mod tests {
         while leaf_id != INVALID_PAGE_ID {
             assert!(seen.insert(leaf_id), "cycle in leaf chain at {leaf_id}");
             let leaf = tree.decode_leaf(leaf_id).expect("leaf decode");
-            total += leaf.keys.len();
-            leaf_id = leaf.next_leaf_id;
+            total += leaf.len();
+            leaf_id = leaf.next_leaf_id();
         }
         total
     }
@@ -1248,7 +1246,7 @@ mod tests {
             assert!(seen.insert(leaf_id), "cycle in leaf chain at {leaf_id}");
             let leaf = tree.decode_leaf(leaf_id).expect("leaf decode");
             count += 1;
-            leaf_id = leaf.next_leaf_id;
+            leaf_id = leaf.next_leaf_id();
         }
         count
     }
@@ -1317,23 +1315,26 @@ mod tests {
         assert_ne!(header.first_leaf_id, INVALID_PAGE_ID);
 
         let root_page = bpm.read_page(header.root_page_id).unwrap();
-        let root = InternalPage::decode(root_page.data(), header.key_len).unwrap();
-        assert_eq!(root.keys.len(), 1);
-        assert_eq!(root.children.len(), 2);
+        let root =
+            InternalPage::decode(root_page.data(), Layout::new(header.key_len).unwrap()).unwrap();
+        assert_eq!(root.len(), 1);
+        assert_eq!(root.children().len(), 2);
 
         let left_leaf_id = root.get_child(0).unwrap();
         let right_leaf_id = root.get_child(1).unwrap();
         assert_eq!(header.first_leaf_id, *left_leaf_id);
 
         let left_leaf_page = bpm.read_page(*left_leaf_id).unwrap();
-        let left_leaf = LeafPage::decode(left_leaf_page.data(), header.key_len).unwrap();
+        let left_leaf =
+            LeafPage::decode(left_leaf_page.data(), Layout::new(header.key_len).unwrap()).unwrap();
         let right_leaf_page = bpm.read_page(*right_leaf_id).unwrap();
-        let right_leaf = LeafPage::decode(right_leaf_page.data(), header.key_len).unwrap();
+        let right_leaf =
+            LeafPage::decode(right_leaf_page.data(), Layout::new(header.key_len).unwrap()).unwrap();
 
-        assert_eq!(left_leaf.next_leaf_id, *right_leaf_id);
-        assert_eq!(right_leaf.next_leaf_id, INVALID_PAGE_ID);
-        assert_eq!(left_leaf.keys.len(), 2);
-        assert_eq!(right_leaf.keys.len(), 3);
+        assert_eq!(left_leaf.next_leaf_id(), *right_leaf_id);
+        assert_eq!(right_leaf.next_leaf_id(), INVALID_PAGE_ID);
+        assert_eq!(left_leaf.len(), 2);
+        assert_eq!(right_leaf.len(), 3);
     }
 
     #[test]
@@ -1473,18 +1474,19 @@ mod tests {
         let (_left_leaf_id, _right_leaf_id) = {
             let header = tree.read_header().unwrap();
             let root_page = bpm.read_page(header.root_page_id).unwrap();
-            let root = InternalPage::decode(root_page.data(), header.key_len).unwrap();
-            assert_eq!(root.keys.len(), 1);
-            assert_eq!(root.children.len(), 2);
+            let root = InternalPage::decode(root_page.data(), Layout::new(header.key_len).unwrap())
+                .unwrap();
+            assert_eq!(root.len(), 1);
+            assert_eq!(root.children().len(), 2);
 
             let left_leaf_id = *root.get_child(0).unwrap();
             let right_leaf_id = *root.get_child(1).unwrap();
             let left_leaf = tree.decode_leaf(left_leaf_id).unwrap();
             let right_leaf = tree.decode_leaf(right_leaf_id).unwrap();
-            assert_eq!(left_leaf.keys.len(), 2);
-            assert_eq!(right_leaf.keys.len(), 3);
-            assert_eq!(left_leaf.next_leaf_id, right_leaf_id);
-            assert_eq!(right_leaf.next_leaf_id, INVALID_PAGE_ID);
+            assert_eq!(left_leaf.len(), 2);
+            assert_eq!(right_leaf.len(), 3);
+            assert_eq!(left_leaf.next_leaf_id(), right_leaf_id);
+            assert_eq!(right_leaf.next_leaf_id(), INVALID_PAGE_ID);
 
             (left_leaf_id, right_leaf_id)
         };
@@ -1619,10 +1621,10 @@ mod tests {
             leaves_in_order: &mut Vec<(PageId, usize)>,
         ) {
             let page = tree.bpm.read_page(page_id).unwrap();
-            match Page::decode(page.data(), tree.key_len).unwrap() {
+            match Page::decode(page.data(), tree.layout).unwrap() {
                 Page::Leaf(leaf) => {
                     assert!(
-                        leaf.keys.iter().all(|k| bounds.contains(k)),
+                        leaf.keys().all(|k| bounds.contains(k)),
                         "leaf {page_id} holds a key outside its parent's separator range"
                     );
                     leaves_in_order.push((page_id, depth));
@@ -1630,28 +1632,28 @@ mod tests {
                 Page::Internal(node) => {
                     if is_root {
                         assert!(
-                            node.children.len() >= 2,
+                            node.children().len() >= 2,
                             "internal root {page_id} has fewer than two children"
                         );
                     } else {
                         assert!(
-                            node.keys.len() >= node.min_size() as usize,
+                            node.len() >= node.min_size() as usize,
                             "non-root internal page {page_id} is below minimum occupancy"
                         );
                     }
                     assert!(
-                        node.keys.iter().all(|k| bounds.contains(k)),
+                        node.keys().iter().all(|k| bounds.contains(k)),
                         "internal page {page_id} holds a separator outside its parent's range"
                     );
                     drop(page);
-                    for (i, &child) in node.children.iter().enumerate() {
+                    for (i, &child) in node.children().iter().enumerate() {
                         let child_bounds = SubtreeBounds {
                             lower: if i == 0 {
                                 bounds.lower.clone()
                             } else {
-                                Some(node.keys[i - 1].clone())
+                                Some(node.keys()[i - 1].clone())
                             },
-                            upper: node.keys.get(i).cloned().or(bounds.upper.clone()),
+                            upper: node.keys().get(i).cloned().or(bounds.upper.clone()),
                         };
                         walk_subtree(tree, child, child_bounds, depth + 1, false, leaves_in_order);
                     }
