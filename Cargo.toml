@@ -2,6 +2,7 @@
 name = "cmudb"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.99"
 
 [dependencies]
 log = "0.4.29"
@@ -15,6 +16,12 @@ criterion = { version = "0.7", optional = true, default-features = false, featur
 [features]
 bench = ["dep:criterion"]
 deadlock_detection = ["parking_lot/deadlock_detection"]
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
 
 [dev-dependencies]
 env_logger = "0.11.5"

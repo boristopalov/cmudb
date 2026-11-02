@@ -1,3 +1,5 @@
+mod common;
+
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -9,6 +11,7 @@ use cmudb::index::BPlusTree;
 use cmudb::index::Index;
 use cmudb::replacer::ArcReplacer;
 use cmudb::table_heap::RecordId;
+use common::seed::{seed_from_env, stream_rng};
 use env_logger::Env;
 use rand::Rng;
 use tempfile::tempdir;
@@ -16,7 +19,7 @@ use tempfile::tempdir;
 fn init_logger() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        let _ = env_logger::Builder::from_env(Env::default().default_filter_or("debug")).try_init();
+        let _ = env_logger::Builder::from_env(Env::default().default_filter_or("warn")).try_init();
     });
 }
 
@@ -90,6 +93,8 @@ fn b_plus_tree_soak_concurrent() {
     let key_space = 256;
     let max_pages = 100;
 
+    let report = seed_from_env();
+    let seed = report.seed();
     let (bpm, _tmp) = make_bpm(num_frames);
     let tree = Arc::new(BPlusTree::new("idx".to_string(), key_len as u32, bpm.clone()).unwrap());
     assert_eq!(tree.header_page_id, 0);
@@ -101,7 +106,7 @@ fn b_plus_tree_soak_concurrent() {
         let tree = tree.clone();
         let barrier = barrier.clone();
         handles.push(thread::spawn(move || {
-            let mut rng = rand::rng();
+            let mut rng = stream_rng(seed, t as u64);
             barrier.wait();
 
             for op_i in 0..ops_per_thread {

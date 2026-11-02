@@ -3,6 +3,8 @@
 //! SQL text, returning decoded rows.
 #![allow(dead_code)]
 
+pub mod seed;
+
 use cmudb::buffer_pool::BufferPoolManager;
 use cmudb::catalog::{Catalog, Value};
 use cmudb::concurrency::{IsolationLevel, TransactionManager};

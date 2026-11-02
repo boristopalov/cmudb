@@ -2,16 +2,26 @@
 
 ## Checks
 
-CI runs these on every pull request; run them locally before pushing:
+Run every check CI runs with one command before pushing:
 
 ```sh
-cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings
-cargo clippy --benches --features bench -- -D warnings
-python3 scripts/check_comments.py
-cargo test
-cargo llvm-cov --fail-under-lines 80   # needs cargo-llvm-cov
+just ci
 ```
+
+It runs `cargo fmt --all --check`, clippy on all targets and on the benches,
+`scripts/check_comments.py`, and `cargo test` with `RUST_LOG=warn`. CI calls
+the same `just lint` and `just test` recipes, so a green `just ci` means a
+green CI. Install `just` with `cargo install just` (or `pip install rust-just`).
+
+`just coverage` runs CI's 80% line-coverage gate and needs `cargo-llvm-cov`.
+
+The toolchain is pinned in `rust-toolchain.toml`, and rustup installs it on
+first use. Lint levels live in `Cargo.toml` under `[lints]`, so a plain
+`cargo clippy` and rust-analyzer report what CI reports.
+
+The randomized soak tests take their seed from `CMUDB_SEED` (a fixed default
+when unset) and print it when they fail; rerun with `CMUDB_SEED=<seed>` to
+replay the same operations.
 
 CI type-checks the benchmarks in `benches/` but never runs them. To run each bench once
 without timing it, including the checks it makes on its results:

@@ -1,3 +1,5 @@
+mod common;
+
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -5,14 +7,16 @@ use cmudb::buffer_pool::{BpmError, BufferPoolManager};
 use cmudb::create_buffer_pool_manager;
 use cmudb::disk::{DiskManager, DiskScheduler};
 use cmudb::replacer::ArcReplacer;
+use common::seed::{seed_from_env, stream_rng};
 use env_logger::Env;
 use parking_lot::RwLock;
+use rand::Rng;
 use tempfile::tempdir;
 
 fn init_logger() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        let _ = env_logger::Builder::from_env(Env::default().default_filter_or("debug")).try_init();
+        let _ = env_logger::Builder::from_env(Env::default().default_filter_or("warn")).try_init();
     });
 }
 
@@ -307,11 +311,14 @@ fn soak_randomized_workload_with_more_pages_than_frames() {
     const THREADS: usize = 20;
     const OPS_PER_THREAD: usize = 5000;
 
+    let report = seed_from_env();
+    let seed = report.seed();
     let (bpm, _tmp) = make_bpm(NUM_FRAMES);
 
+    let mut setup_rng = stream_rng(seed, THREADS as u64);
     let mut expected = Vec::with_capacity(NUM_PAGES);
     for _ in 0..NUM_PAGES {
-        let val = rand::random::<u8>();
+        let val = setup_rng.random::<u8>();
         {
             let mut page = bpm.new_page().unwrap();
             page.data_mut()[0] = val;
@@ -328,10 +335,11 @@ fn soak_randomized_workload_with_more_pages_than_frames() {
         let expected = expected.clone();
         let barrier = start_barrier.clone();
         let handle = thread::spawn(move || {
+            let mut rng = stream_rng(seed, t as u64);
             barrier.wait();
             for _ in 0..OPS_PER_THREAD {
-                let page_id = rand::random_range(0..NUM_PAGES);
-                let should_read = rand::random_bool(0.5);
+                let page_id = rng.random_range(0..NUM_PAGES);
+                let should_read = rng.random_bool(0.5);
                 if should_read {
                     match bpm.read_page(page_id) {
                         Ok(page) => {
