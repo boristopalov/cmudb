@@ -16,9 +16,8 @@ green CI. Install `just` with `cargo install just` (or `pip install rust-just`).
 `just coverage` runs CI's 80% line-coverage gate and needs `cargo-llvm-cov`.
 
 The toolchain is pinned in `rust-toolchain.toml`, and rustup installs it on
-first use. Lint levels live in `Cargo.toml` under `[lints]`, so a plain
-`cargo clippy` and rust-analyzer report the same lints as CI. Warnings only
-fail `just lint`, `just ci` and CI (`-D warnings`), not local builds.
+first use. Warnings fail `just lint`, `just ci` and CI (clippy runs with
+`-D warnings`), but not local `cargo build` or `cargo test`.
 
 The randomized soak tests take their seed from `CMUDB_SEED` (a fixed default
 when unset) and print it when they fail; rerun with `CMUDB_SEED=<seed>` to

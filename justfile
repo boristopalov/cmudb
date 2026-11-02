@@ -6,7 +6,7 @@ export RUST_LOG := env("RUST_LOG", "warn")
 # Run fmt, clippy, the comment policy and the tests, as CI does.
 ci: lint test
 
-# fmt check, clippy with warnings as errors (lint levels live in Cargo.toml) and the comment policy.
+# fmt check, clippy with warnings as errors, and the comment policy.
 lint:
     cargo fmt --all --check
     cargo clippy --all-targets -- -D warnings
