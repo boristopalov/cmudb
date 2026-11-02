@@ -1332,4 +1332,29 @@ fn select_distinct_removes_duplicate_window_function_rows() {
         )),
         vec![[10, 2], [20, 1], [30, 1]]
     );
+    assert_eq!(
+        ints(&db.exec(
+            "SELECT DISTINCT dept, COUNT(*) OVER (PARTITION BY dept) FROM emp \
+             ORDER BY COUNT(*) OVER (PARTITION BY dept) DESC, dept"
+        )),
+        vec![[10, 2], [20, 1], [30, 1]]
+    );
+}
+
+#[test]
+fn identical_window_calls_read_one_window_column() {
+    let db = emp_db();
+    let sql = "SELECT id, RANK() OVER (ORDER BY salary DESC), RANK() OVER (ORDER BY salary DESC) * 10 \
+               FROM emp ORDER BY RANK() OVER (ORDER BY salary DESC)";
+    assert_eq!(
+        ints(&db.exec(sql)),
+        vec![[4, 1, 10], [3, 2, 20], [2, 3, 30], [1, 4, 40]]
+    );
+    assert!(
+        plan_contains(&db.plan_of(sql), |plan| matches!(
+            plan,
+            Plan::WindowFunction(w) if w.aggregates.len() == 1
+        )),
+        "RANK() over the same window is computed once"
+    );
 }

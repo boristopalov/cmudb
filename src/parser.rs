@@ -742,13 +742,23 @@ impl<'a> Binder<'a> {
         let ctx = ctx_mut
             .as_mut()
             .ok_or(BinderError::WindowOutsideProjection)?;
-        let placeholder = ctx.input_width + ctx.calls.len();
-        ctx.calls.push((window, ctx.windows[window].calls.len()));
-        ctx.windows[window].calls.push(BoundWindowCall {
-            arg,
-            agg_type,
-            dtype,
+        let existing = ctx.calls.iter().position(|&(w, pos)| {
+            let call = &ctx.windows[w].calls[pos];
+            w == window && call.arg == arg && call.agg_type == agg_type
         });
+        let call = match existing {
+            Some(call) => call,
+            None => {
+                ctx.calls.push((window, ctx.windows[window].calls.len()));
+                ctx.windows[window].calls.push(BoundWindowCall {
+                    arg,
+                    agg_type,
+                    dtype,
+                });
+                ctx.calls.len() - 1
+            }
+        };
+        let placeholder = ctx.input_width + call;
         Ok(Expression::Column {
             col: ColIdx(placeholder as u32),
             dtype,
