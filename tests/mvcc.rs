@@ -779,7 +779,7 @@ mod failure_paths {
         };
         let t0 = mgr.begin(IsolationLevel::SnapshotIsolation);
         let rids: Vec<_> = (0..8)
-            .map(|b| mvcc::insert_tuple(&t0, &heap, &[], &row(b)).unwrap())
+            .map(|b| mvcc::insert_tuple(&t0, &mgr, &heap, &[], &row(b)).unwrap())
             .collect();
         mgr.commit(&t0).unwrap();
         assert!(rids.iter().all(|r| r.page_id == rids[0].page_id));

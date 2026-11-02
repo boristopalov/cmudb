@@ -469,6 +469,56 @@ fn a_kill_rolls_back_a_transaction_whose_writes_another_commit_made_durable() {
 }
 
 #[test]
+fn a_kill_rolls_back_an_update_that_moved_its_row_to_another_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let long = |c: char, n: usize| c.to_string().repeat(n);
+    {
+        let db = open(dir.path());
+        run(
+            &db,
+            "CREATE TABLE t (a INTEGER, b TEXT); CREATE INDEX t_a ON t (a);",
+        );
+        for a in 1..=6 {
+            run(
+                &db,
+                &format!("INSERT INTO t VALUES ({a}, '{}');", long('x', 1200)),
+            );
+        }
+        let open_txn = begin(&db);
+        db.execute_in(
+            &open_txn,
+            &format!("UPDATE t SET b = '{}' WHERE a = 1;", long('y', 4000)),
+        )
+        .unwrap();
+        run(&db, "INSERT INTO t VALUES (7, 'seven');");
+        db.abandon();
+    }
+
+    let db = open(dir.path());
+    assert_eq!(
+        rows(&db, "SELECT a, b FROM t WHERE a = 1 OR a = 7 ORDER BY a;"),
+        vec![
+            vec![Some(Value::INT(1)), Some(Value::text(&long('x', 1200)))],
+            vec![Some(Value::INT(7)), Some(Value::text("seven"))],
+        ],
+        "the moved row is back at its old version and the later commit is kept"
+    );
+    assert_eq!(ints(&db, "SELECT COUNT(*) FROM t;"), vec![vec![7]]);
+    run(
+        &db,
+        &format!("UPDATE t SET b = '{}' WHERE a = 1;", long('z', 4000)),
+    );
+    assert_eq!(
+        ints(
+            &db,
+            "SELECT a FROM t WHERE b <> 'seven' AND a < 3 ORDER BY a;"
+        ),
+        vec![vec![1], vec![2]],
+        "the row the open transaction moved can be moved again"
+    );
+}
+
+#[test]
 fn a_kill_after_writes_evicted_from_a_small_pool_keeps_only_the_commits() {
     let dir = tempfile::tempdir().unwrap();
     let values: Vec<String> = (0..5_000).map(|i| format!("({i})")).collect();
