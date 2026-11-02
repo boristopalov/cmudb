@@ -14,7 +14,8 @@
 #
 # Each stage says how it starts:
 #   enforced_by: a workflow in the consuming repo runs it automatically.
-#   scheduled:   the coordinator's scheduled run starts it.
+#   scheduled:   the hourly loop run hands it to the coordinator, which
+#                starts it (see `handoff:`).
 # Nothing here is executed by a runtime; this file is the spec, and the
 # workflows and scheduled run it names are what actually run.
 version: 1
@@ -114,12 +115,27 @@ gates:
       verdict: pass
       risk: [low, medium]
       confidence: high
-    never_self_merge: ['.github/**', 'agents/**', '.claude/**', 'codex/**', factory.yaml, rubric.md]
+    never_self_merge: ['.github/**', 'agents/**', '.claude/**', 'codex/**', factory.yaml, rubric.md, 'rust-toolchain*']
+    on_permission_block: stop_and_report   # never another way to merge; the coordinator passes Boris's go-ahead
     otherwise: boris
     stacked: bottom_first
 
+# Scheduled loop runs can't message the coordinator session or start agents,
+# so each run posts its handoff on the project timeline. The coordinator
+# wakes on every post and starts the implement agents.
+handoff:
+  post_starts_with: "Loop handoff for the coordinator: Todo issues ready for implement agents:"
+  lists: Todo issues not In Progress, highest priority first, one line each with key, title and priority
+  own_post: true             # never combined with a ping to Boris
+  quiet_hours: ignored       # it's for the coordinator, not Boris
+  skip_when: [list is empty, list unchanged since the last handoff post]
+  coordinator: { max_running: stages.implement.max_parallel, skip: issues with a running agent }
+
 # When the loop pings Boris. Everything else, agents handle.
 ping_boris:
-  - a PR is merge-ready but the gate leaves it to him (high risk, or confidence below high)
-  - an issue is flagged "Needs Boris:"
-  - work is stuck (CI red or a review finding unresolved after two attempts)
+  when:
+    - a PR is merge-ready but the gate leaves it to him (high risk, or confidence below high)
+    - an issue is flagged "Needs Boris:"
+    - work is stuck (CI red or a review finding unresolved after two attempts)
+  own_post: true             # separate from the handoff post
+  quiet_hours: { from: "22:00", to: "09:00", tz: America/Los_Angeles }   # no pings then; the first run after 9am sends one combined ping
