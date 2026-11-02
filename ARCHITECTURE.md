@@ -1,0 +1,75 @@
+# Architecture
+
+A one-minute map of cmudb. Rules the compiler or tests can check live in code; this file
+holds the ones that cut across modules. MVCC details are in `docs/mvcc.md`.
+
+## Layer map
+
+A SQL statement flows top to bottom:
+
+| Layer | Code | Output |
+|---|---|---|
+| Parse | `sqlparser` crate | `Statement` AST |
+| Bind | `src/parser.rs` (`Binder`) | `BoundStatement`, names resolved against the catalog |
+| Plan | `src/planner.rs` (`Planner`) | `Plan` tree (`src/processor/plan.rs`) |
+| Build | `src/processor/executor_factory.rs` | `Box<dyn Executor>` tree |
+| Execute | `src/processor/executor.rs` | `Batch`es of rows, pulled with `next_batch` |
+| Access | `src/catalog/`, `src/table_heap.rs`, `src/index/`, `src/concurrency/` | tuples, index entries, visible versions |
+| Pages | `src/table_page.rs`, `src/index/page_view.rs` | typed views over a pinned frame's bytes |
+| Buffer pool | `src/buffer_pool.rs`, `src/replacer.rs` (ARC) | `PageRef` / `PageMut` guards |
+| Disk | `src/disk.rs` | `DiskScheduler` thread over `DiskManager` |
+
+The catalog is in memory. Today the pipeline is wired up in several places: the shell
+(`src/main.rs`), the test harness (`tests/common`) and some test files. BOR-21 moves it into
+one library entry point.
+
+## Pins and latches
+
+- `read_page` returns a `PageRef`: a pin plus a shared latch. `write_page` and `new_page`
+  return a `PageMut`: a pin plus an exclusive latch, and the page is marked dirty. Dropping
+  the guard releases both. There is no separate unpin call.
+- Latches are `parking_lot` locks and are not reentrant. Asking for a page your thread
+  already holds deadlocks, even read after read once a writer is queued.
+- Every live guard pins a frame. With every frame pinned, fetching a page that isn't
+  resident fails with `BpmError::NoFreeFrame`. Keep guards in a block scope and don't keep one across a
+  `next_batch` return; scans copy what they need (`BPlusTreeIter` copies the leaf) or run a
+  closure under the latch (`TableHeapIterator::next_with`, `TableHeap::write_with`).
+- Outside the B+ tree, hold one page guard at a time. `TableHeap::insert` drops the new
+  tail page before it latches the old tail to link it.
+- B+ tree latches go top down: header, root, then each child before its parent is
+  released (`step_down`). Pessimistic inserts and removes write-latch the header and the
+  path, releasing ancestors once a child is safe (`TreeContext::descend_into`). Searches,
+  scans and the optimistic write path read-crab from the root after copying its id out of
+  the header; an optimistic write trades the leaf's read latch for a write latch while it
+  still holds the parent. A sibling is latched only while its parent is held. Range scans
+  hold one leaf at a time.
+- Across modules: an index's `unique_latch` (several indexes in ascending oid order), then
+  page latches, then the transaction manager's version map. Commit takes `commit_latch`
+  before any page latch.
+
+## Adding an executor
+
+1. Add a plan node struct and a `Plan` variant in `src/processor/plan.rs`.
+2. Implement `Executor` in `src/processor/executor.rs`. `next_batch` never returns an empty
+   batch or more rows than its batch size, and keeps returning `None` once it has;
+   `tests/batch_execution.rs` checks this across batch sizes.
+3. Add its arm to `create_executor_with_batch_size` in `executor_factory.rs`.
+4. Have `src/planner.rs` emit it, or, until it does, build its plan by hand in
+   `tests/executors.rs`, as hash join, external merge sort, window functions and `DROP`
+   do today.
+5. Reach it through SQL in tests. Once BOR-21's library entry point lands, that is the one
+   place statements run from.
+
+## Tests
+
+| Kind | Where |
+|---|---|
+| Unit | `#[cfg(test)] mod tests` beside the code |
+| Storage and index integration, concurrency soaks | `tests/buffer_pool_integration.rs`, `tests/table_heap_integration.rs`, `tests/b_plus_tree_integration.rs` |
+| SQL end to end | `tests/sql_e2e.rs` on the `tests/common` harness; `tests/e2e.rs`, `tests/mvcc.rs` and `tests/batch_execution.rs` |
+| Hand-built plans | `tests/executors.rs` |
+| Shell binary | `tests/cli.rs` |
+| Benchmark result and plan checks | `tests/bench_queries.rs`, cases in `tests/bench_cases` |
+
+A known gap is a typed error plus a test marked `#[ignore = "known gap: …"]` that names it,
+never a comment (see `CONTRIBUTING.md`).
