@@ -2,12 +2,22 @@
 
 This is a Rust implementation of a relational DBMS. It takes heavy inspiration from CMU's BusTub (https://github.com/cmu-db/bustub).
 
+## Build and run
+
+```sh
+cargo build
+cargo run      # SQL shell on a fresh temporary database; end statements with `;`, quit with \q
+cargo test
+```
+
+CONTRIBUTING.md lists the checks CI runs, and ARCHITECTURE.md maps the code.
+
 ## What's done:
-- disk-backed pages for tables
+- disk-backed pages for tables, read and written in place through typed views over the page bytes
 - Adaptive replacement cache policy for pages
 - B+ tree indexes with optimistic latch coupling
 - An in-memory catalog
-- Most executors described in the CMU course
+- Most executors described in the CMU course, exchanging batches of rows (pull-based, 1024 rows per batch by default)
 - MVCC with snapshot isolation (`BEGIN`/`COMMIT`/`ROLLBACK` in the shell; see docs/mvcc.md)
 - parser (using sqlparser crate)
 - binder
@@ -17,11 +27,7 @@ This is a Rust implementation of a relational DBMS. It takes heavy inspiration f
 - optimizer
 - serializable isolation
 - support for more types, only a few basic types are supported (int, booleans, floats, timestamps)
-
-
-## Things I would change if I have the time:
-- Pages as typed views: Currently pages are fully decoded and encoded as we read from and write to them. A better approach is for pages act as typed views over raw bytes, which would save quite a bit of i/o work.
-- Improved execution model: A volcano-style iteration model is used here, and notably there is no batching going on, so rows that the db system materializes are pulled 1 by 1.
+- hash joins, external merge sort, window functions and `DROP TABLE`/`DROP INDEX` have executors, but the binder and planner never produce them
 
 ## Benchmarks
 
