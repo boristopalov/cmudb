@@ -47,6 +47,7 @@ const TYPE_TAG_BOOLEAN: u8 = 0;
 const TYPE_TAG_INT: u8 = 1;
 const TYPE_TAG_FLOAT: u8 = 2;
 const TYPE_TAG_TIMESTAMP: u8 = 3;
+const TYPE_TAG_BIGINT: u8 = 4;
 
 const INDEX_TAG_BPLUS_TREE: u8 = 0;
 
@@ -238,6 +239,7 @@ fn encode_type(w: &mut Writer, dtype: DataType) {
         DataType::INT => TYPE_TAG_INT,
         DataType::FLOAT => TYPE_TAG_FLOAT,
         DataType::TIMESTAMP => TYPE_TAG_TIMESTAMP,
+        DataType::BIGINT => TYPE_TAG_BIGINT,
     });
 }
 
@@ -247,6 +249,7 @@ fn decode_type(r: &mut Reader<'_>) -> Result<DataType, PersistError> {
         TYPE_TAG_INT => Ok(DataType::INT),
         TYPE_TAG_FLOAT => Ok(DataType::FLOAT),
         TYPE_TAG_TIMESTAMP => Ok(DataType::TIMESTAMP),
+        TYPE_TAG_BIGINT => Ok(DataType::BIGINT),
         tag => Err(PersistError::UnknownColumnType(tag)),
     }
 }
@@ -500,6 +503,7 @@ mod tests {
             (DataType::INT, TYPE_TAG_INT),
             (DataType::FLOAT, TYPE_TAG_FLOAT),
             (DataType::TIMESTAMP, TYPE_TAG_TIMESTAMP),
+            (DataType::BIGINT, TYPE_TAG_BIGINT),
         ] {
             let mut w = Writer::default();
             encode_type(&mut w, dtype);

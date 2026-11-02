@@ -119,6 +119,33 @@ fn tables_rows_and_indexes_survive_a_restart() {
 }
 
 #[test]
+fn bigint_and_float_values_keep_their_full_width_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open(dir.path());
+        run(
+            &db,
+            "CREATE TABLE w (n BIGINT, x FLOAT); CREATE INDEX w_n ON w (n);\
+             INSERT INTO w VALUES (9000000000, 0.1), (-9000000000, 16777217);",
+        );
+        db.close().unwrap();
+    }
+
+    let db = open(dir.path());
+    assert_eq!(
+        rows(&db, "SELECT n, x FROM w WHERE n = 9000000000;"),
+        vec![vec![
+            Some(Value::BIGINT(9_000_000_000)),
+            Some(Value::FLOAT(OrderedFloat(0.1)))
+        ]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT x FROM w WHERE n = -9000000000;"),
+        vec![vec![Some(Value::FLOAT(OrderedFloat(16_777_217.0)))]]
+    );
+}
+
+#[test]
 fn a_database_can_be_reopened_again_and_again() {
     let dir = tempfile::tempdir().unwrap();
     for round in 0..4 {
