@@ -1,21 +1,33 @@
 # Buffer Pool Manager
 
-The buffer pool manager (BPM) mediates access to database pages between memory and disk. It owns the in-memory frames, coordinates pin/unpin, eviction, and integrates with the disk scheduler and ARC-based replacer. Callers never manipulate latches or dirty/evictable flags directly; they interact through sessions and page handles.
+`BufferPoolManager` (`src/buffer_pool.rs`) caches disk pages in a fixed set of frames.
+Callers get pages as RAII guards and never touch pin counts, dirty flags or the replacer.
+The rules for holding guards are in `ARCHITECTURE.md`.
 
-## Architecture
-- **Frames**: Fixed-size slots (`FrameHeader`) holding a page buffer, page_id, pin count, and dirty flag. Stored as a `Vec<RwLock<FrameHeader>>`.
-- **Page table**: Maps `page_id -> frame_id` so the BPM can find cached pages.
-- **Replacer**: ARC policy tracks recency/frequency and chooses victims among evictable (unpinned) frames.
-- **Disk scheduler**: Asynchronous request queue to read/write pages; BPM schedules I/O when pages are missing or need flushing.
-- **Free list**: Pool of unused frames; used before eviction.
+## State
+- **Frames**: `Vec<RwLock<FrameHeader>>`. A frame holds a page buffer, its page id and a
+  dirty flag. The frame's `RwLock` is the page latch.
+- **Meta** (one `Mutex`): the page table (`page_id -> frame_id`), the free list, the ARC
+  replacer and every frame's pin count. Pins sit beside the replacer so a frame is marked
+  evictable only while nothing pins it.
+- **Disk scheduler**: a worker thread that runs page reads and writes; the pool waits on
+  each request's reply.
 
-## Page Handles
-- **PageRef/PageMut**: Lightweight RAII guards holding a mapped lock guard to the frame. 
+## Guards
+- `read_page(id)` returns a `PageRef`: one pin and the frame's read latch.
+- `write_page(id)` returns a `PageMut`: one pin and the write latch, with the page marked
+  dirty.
+- `new_page()` allocates the next page id and returns a dirty `PageMut` for the caller to
+  initialise.
+- Dropping either guard releases the latch, then the pin. A frame whose pin count reaches
+  zero becomes evictable. Unpinning never flushes.
 
-## Lifecycle and Operations
-- **Pin (read)**: Look up in page table; on hit, pin_count++, mark nonevictable, return `PageRef`. On miss, get a free/evictable frame, load from disk via scheduler, install mapping, pin_count=1, nonevictable, return `PageRef`.
-- **Pin (write)**: Same as read, but mark dirty and return `PageMut`. Write path assumes the page exists; new pages come from `new_page`.
-- **New page**: Allocates a page_id, reserves a frame (free/evictable), clears it, marks dirty and pinned, installs mapping, nonevictable, returns `PageMut` to initialize.
-- **Unpin**: Decrements pin_count; when it reaches zero, marks the frame evictable in the replacer. Flush is not automatic on unpin.
-- **Flush page**: Schedules a write of the frame buffer to disk and clears the dirty flag. Does not change pinning/evictable state.
-- **Eviction**: When no free frame is available, the replacer selects an evictable frame. If dirty, the BPM flushes it before reuse, removes its mapping, clears metadata, and rebinds it to the new page.
+## Fetching a page
+- **Hit**: pin the frame under the meta lock, release the meta lock, then take the frame
+  latch. If the frame was given to another page in between, drop the pin and retry.
+- **Miss**: take a frame from the free list, or ask the replacer for a victim and write it
+  back first if it is dirty. Read the page from disk into the frame, map it and pin it. If
+  the read fails, the victim is put back.
+- With no free frame and nothing evictable, the fetch fails with `BpmError::NoFreeFrame`.
+- `flush_page(id)` writes a resident page to disk and clears its dirty flag without
+  changing its pins.
