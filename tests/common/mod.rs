@@ -5,11 +5,12 @@
 
 use cmudb::buffer_pool::BufferPoolManager;
 use cmudb::catalog::{Catalog, Value};
+use cmudb::concurrency::{IsolationLevel, TransactionManager};
 use cmudb::create_buffer_pool_manager;
 use cmudb::disk::{DiskManager, DiskScheduler};
 use cmudb::parser::Binder;
 use cmudb::planner::Planner;
-use cmudb::processor::executor::RowCursor;
+use cmudb::processor::executor::{ExecutorContext, RowCursor};
 use cmudb::processor::executor_factory::create_executor;
 use cmudb::processor::plan::Plan;
 use cmudb::replacer::ArcReplacer;
@@ -23,6 +24,7 @@ pub type Row = Vec<Option<Value>>;
 pub struct Db {
     pub catalog: Catalog,
     pub bpm: Arc<BufferPoolManager>,
+    pub txn_mgr: Arc<TransactionManager>,
     _dir: TempDir,
 }
 
@@ -38,6 +40,7 @@ impl Db {
         let catalog = Catalog::new(bpm.clone());
         Self {
             catalog,
+            txn_mgr: Arc::new(TransactionManager::new(bpm.clone())),
             bpm,
             _dir: dir,
         }
@@ -66,8 +69,33 @@ impl Db {
         self.try_exec(sql).unwrap_or_else(|e| panic!("{sql}: {e}"))
     }
 
+    /// Runs `plan` in a transaction of its own, committed when the plan succeeds and rolled
+    /// back when it fails.
     pub fn run_plan(&self, plan: &Plan) -> Result<Vec<Row>, String> {
-        let mut exec = create_executor(&self.catalog, &self.bpm, plan);
+        let txn = self.txn_mgr.begin(IsolationLevel::SnapshotIsolation);
+        let ctx = ExecutorContext::new(
+            &self.catalog,
+            self.bpm.clone(),
+            txn.clone(),
+            self.txn_mgr.clone(),
+        );
+        let result = Self::run_in(&ctx, plan);
+        match &result {
+            Ok(_) => {
+                self.txn_mgr
+                    .commit(&txn)
+                    .map_err(|e| format!("commit: {e}"))?;
+            }
+            Err(_) => self
+                .txn_mgr
+                .abort(&txn)
+                .map_err(|e| format!("abort: {e}"))?,
+        }
+        result
+    }
+
+    fn run_in(ctx: &ExecutorContext<'_>, plan: &Plan) -> Result<Vec<Row>, String> {
+        let mut exec = create_executor(ctx, plan);
         exec.open().map_err(|e| format!("open: {}", e.0))?;
         let mut rows = Vec::new();
         match plan {

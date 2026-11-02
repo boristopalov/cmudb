@@ -172,6 +172,16 @@ impl Catalog {
             let (tuple, rid) = row.map_err(|e| {
                 CatalogError::IndexCreationError(format!("failed to scan table: {}", e.0))
             })?;
+            if let Some(key) = index.key_of_tuple(&tuple) {
+                let taken = index.entries_for_key(&key).map_err(|e| {
+                    CatalogError::IndexCreationError(format!("failed to index row {rid}: {e}"))
+                })?;
+                if !taken.is_empty() {
+                    return Err(CatalogError::IndexCreationError(format!(
+                        "row {rid} duplicates the key of another row"
+                    )));
+                }
+            }
             index.insert(&tuple, rid).map_err(|e| {
                 CatalogError::IndexCreationError(format!("failed to index row {rid}: {e}"))
             })?;
@@ -468,7 +478,10 @@ impl std::ops::Div for Value {
     }
 }
 
-/// The type of a column. Every type has a fixed width (see `size`).
+/// The type of a column. Every type has a fixed width (see `size`), so every tuple of a
+/// table has the same length. MVCC relies on that: updates overwrite the tuple in place (see
+/// `TablePage::update_in_place`). A variable-length type would need out-of-place updates (a
+/// new slot plus a forwarding pointer, or delete + insert) before it can be added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
     BOOLEAN,
@@ -649,8 +662,8 @@ mod tests {
         for (id, rid) in rids.iter().enumerate() {
             assert_eq!(
                 index.index.search(&[Value::INT(id as i32)]).unwrap(),
-                Some(*rid),
-                "row with id {id} must be findable through the new index"
+                vec![*rid],
+                "row with id {id} is findable through the new index"
             );
         }
     }

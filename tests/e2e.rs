@@ -1,10 +1,12 @@
 mod common;
 
 use cmudb::catalog::{Catalog, Schema, Value};
+use cmudb::concurrency::{IsolationLevel, TransactionManager};
 use cmudb::create_buffer_pool_manager;
 use cmudb::disk::{DiskManager, DiskScheduler};
 use cmudb::parser::Binder;
 use cmudb::planner::Planner;
+use cmudb::processor::executor::ExecutorContext;
 use cmudb::processor::executor_factory::create_executor;
 use cmudb::processor::plan::Plan;
 use cmudb::replacer::ArcReplacer;
@@ -52,6 +54,7 @@ fn scan_driven_sql_update_visits_each_original_row_once() {
             DiskScheduler::new(dm),
         ));
         let catalog = Catalog::new(bpm.clone());
+        let txn_mgr = Arc::new(TransactionManager::new(bpm.clone()));
         let context = new_test_context(&catalog);
         let execute_sql = |sql: &str| {
             let ast = Parser::parse_sql(&GenericDialect, sql).unwrap();
@@ -59,7 +62,13 @@ fn scan_driven_sql_update_visits_each_original_row_once() {
             let mut result = Vec::new();
             for statement in statements {
                 let plan = context.planner.plan(statement).unwrap();
-                let mut exec = create_executor(&catalog, &bpm, &plan);
+                let ctx = ExecutorContext::new(
+                    &catalog,
+                    bpm.clone(),
+                    txn_mgr.begin(IsolationLevel::SnapshotIsolation),
+                    txn_mgr.clone(),
+                );
+                let mut exec = create_executor(&ctx, &plan);
                 exec.open().unwrap();
                 let produces_single_status_row =
                     matches!(plan, Plan::Insert(_) | Plan::CreateTable(_));
@@ -70,12 +79,13 @@ fn scan_driven_sql_update_visits_each_original_row_once() {
                         result.extend(batch);
                         assert!(
                             result.len() <= row_count,
-                            "statement revisited appended replacement rows: {sql}"
+                            "statement emitted more rows than the table holds: {sql}"
                         );
                     }
                     assert!(exec.next_batch().unwrap().is_none());
                 }
                 exec.close().unwrap();
+                txn_mgr.commit(&ctx.txn).unwrap();
             }
             result
         };
@@ -107,7 +117,10 @@ fn scan_driven_sql_update_visits_each_original_row_once() {
                 Some(Value::INT(id as i32))
             );
             assert_eq!(schema.get_value(tuple, 1).unwrap(), Some(Value::INT(1)));
-            assert!(!original_rids.contains(rid));
+            assert_eq!(
+                *rid, original_rids[id],
+                "updates happen in place, so every row keeps its record id"
+            );
         }
     }
 }
@@ -124,16 +137,24 @@ fn where_and_join_queries_over_table_scans_open_their_children() {
         DiskScheduler::new(dm),
     ));
     let catalog = Catalog::new(bpm.clone());
+    let txn_mgr = Arc::new(TransactionManager::new(bpm.clone()));
     let context = new_test_context(&catalog);
     let run_sql = |sql: &str| {
         let ast = Parser::parse_sql(&GenericDialect, sql).unwrap();
         let mut rows = Vec::new();
         for statement in context.binder.bind(ast).unwrap() {
             let plan = context.planner.plan(statement).unwrap();
-            let mut exec = create_executor(&catalog, &bpm, &plan);
+            let ctx = ExecutorContext::new(
+                &catalog,
+                bpm.clone(),
+                txn_mgr.begin(IsolationLevel::SnapshotIsolation),
+                txn_mgr.clone(),
+            );
+            let mut exec = create_executor(&ctx, &plan);
             exec.open().unwrap();
             rows = collect_rows(&mut *exec).unwrap();
             exec.close().unwrap();
+            txn_mgr.commit(&ctx.txn).unwrap();
         }
         rows
     };

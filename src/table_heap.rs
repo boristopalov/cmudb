@@ -1,5 +1,7 @@
 use crate::buffer_pool::{BpmError, BufferPoolManager};
-use crate::table_page::{NO_NEXT_PAGE, TablePage, TablePageError, TablePageMut, TablePageRef};
+use crate::table_page::{
+    NO_NEXT_PAGE, TablePage, TablePageError, TablePageMut, TablePageRef, TupleMeta,
+};
 use parking_lot::{Mutex, MutexGuard};
 use std::fmt;
 use std::sync::Arc;
@@ -19,7 +21,7 @@ impl From<BpmError> for TableHeapError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RecordId {
     pub page_id: u32,
     pub slot_id: u32,
@@ -67,10 +69,16 @@ pub struct TableHeapIterator {
     finished: bool,
 }
 
-impl Iterator for TableHeapIterator {
-    type Item = Result<(Tuple, RecordId), TableHeapError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl TableHeapIterator {
+    /// Advances to the next slot and calls `f` with its record id, metadata and bytes while
+    /// the page's read latch is held, so `f` sees the slot exactly as one writer left it.
+    /// Slots for which `f` returns `None` are skipped. Every slot is visited, deleted ones
+    /// included; callers decide what is visible. The rest of a page is visited under one
+    /// latch acquisition.
+    pub fn next_with<R>(
+        &mut self,
+        mut f: impl FnMut(RecordId, TupleMeta, &[u8]) -> Option<R>,
+    ) -> Option<Result<R, TableHeapError>> {
         loop {
             if self.finished
                 || (self.current_page_id == self.last_page_id
@@ -101,44 +109,74 @@ impl Iterator for TableHeapIterator {
                 }
             };
 
-            let slot = self.current_slot_id;
-            let Some(meta) = page.slot(slot) else {
-                match page.next_page_id() {
-                    Some(next) if self.current_page_id != self.last_page_id => {
-                        self.current_page_id = next;
-                        self.current_slot_id = 0;
-                        continue;
-                    }
-                    _ => {
-                        self.finished = true;
-                        return None;
-                    }
-                }
-            };
-            self.current_slot_id += 1;
-            if meta.is_deleted {
-                continue;
-            }
-            let data = match page.tuple_bytes(&meta) {
-                Ok(bytes) => bytes.to_vec(),
-                Err(e) => {
+            loop {
+                if self.current_page_id == self.last_page_id
+                    && self.current_slot_id >= self.last_page_slots
+                {
                     self.finished = true;
-                    return Some(Err(TableHeapError(format!(
-                        "corrupt slot {slot} on page {} during scan: {}",
-                        self.current_page_id, e.0
-                    ))));
+                    return None;
                 }
-            };
-
-            return Some(Ok((
-                Tuple { data },
-                RecordId {
+                let slot_id = self.current_slot_id;
+                let Some(slot) = page.slot(slot_id) else {
+                    match page.next_page_id() {
+                        Some(next) if self.current_page_id != self.last_page_id => {
+                            self.current_page_id = next;
+                            self.current_slot_id = 0;
+                            break;
+                        }
+                        _ => {
+                            self.finished = true;
+                            return None;
+                        }
+                    }
+                };
+                self.current_slot_id += 1;
+                let bytes = match page.tuple_bytes(&slot) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        self.finished = true;
+                        return Some(Err(TableHeapError(format!(
+                            "corrupt slot {slot_id} on page {} during scan: {}",
+                            self.current_page_id, e.0
+                        ))));
+                    }
+                };
+                let rid = RecordId {
                     page_id: self.current_page_id,
-                    slot_id: slot,
-                },
-            )));
+                    slot_id,
+                };
+                if let Some(out) = f(rid, slot.meta, bytes) {
+                    return Some(Ok(out));
+                }
+            }
         }
     }
+}
+
+/// Plain iteration yields every tuple whose newest version is not a deletion, ignoring
+/// timestamps. Transactional reads go through [`TableHeapIterator::next_with`] instead.
+impl Iterator for TableHeapIterator {
+    type Item = Result<(Tuple, RecordId), TableHeapError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_with(|rid, meta, bytes| {
+            (!meta.is_deleted).then(|| {
+                (
+                    Tuple {
+                        data: bytes.to_vec(),
+                    },
+                    rid,
+                )
+            })
+        })
+    }
+}
+
+/// The new state of a slot written by [`TableHeap::write_with`].
+pub struct SlotWrite {
+    pub meta: TupleMeta,
+    /// Replacement bytes, or `None` to keep the current ones.
+    pub data: Option<Vec<u8>>,
 }
 
 impl TableHeap {
@@ -173,9 +211,16 @@ impl TableHeap {
         }
     }
 
+    /// Appends a tuple stamped with timestamp 0, i.e. visible to every transaction. Used for
+    /// non-transactional heaps such as spill files.
     pub fn insert(&self, t: &Tuple) -> Result<RecordId, TableHeapError> {
+        self.insert_with_meta(TupleMeta::default(), t)
+    }
+
+    /// Appends a tuple with the given MVCC metadata.
+    pub fn insert_with_meta(&self, meta: TupleMeta, t: &Tuple) -> Result<RecordId, TableHeapError> {
         let mut tail = self.tail.lock();
-        self.insert_locked(t, &mut tail)
+        self.insert_locked(meta, t, &mut tail)
     }
 
     pub fn last_page_id(&self) -> usize {
@@ -184,6 +229,7 @@ impl TableHeap {
 
     fn insert_locked(
         &self,
+        meta: TupleMeta,
         t: &Tuple,
         tail: &mut MutexGuard<'_, Tail>,
     ) -> Result<RecordId, TableHeapError> {
@@ -198,7 +244,7 @@ impl TableHeap {
             let mut guard = self.bpm.write_page(tail.page_id)?;
             let mut page = TablePageMut::new(guard.data_mut())?;
             if page.can_insert(t.data.len()) {
-                Some(page.insert(&t.data)?)
+                Some(page.insert_with_meta(meta, &t.data)?)
             } else {
                 None
             }
@@ -209,7 +255,8 @@ impl TableHeap {
                 let (new_id, slot_id) = {
                     let mut guard = self.bpm.new_page()?;
                     let page_id = record_page_id(guard.page_id())?;
-                    let slot_id = TablePage::init(guard.data_mut()).insert(&t.data)?;
+                    let slot_id =
+                        TablePage::init(guard.data_mut()).insert_with_meta(meta, &t.data)?;
                     (page_id, slot_id)
                 };
                 {
@@ -226,48 +273,82 @@ impl TableHeap {
         Ok(RecordId { page_id, slot_id })
     }
 
-    /// Marks the tuple as deleted. Its bytes stay on the page and the space is not reused.
+    /// Marks the tuple as deleted, keeping its timestamp. Its bytes stay on the page and the
+    /// space is not reused. Transactional deletes go through [`TableHeap::write_with`].
     pub fn delete(&self, rid: &RecordId) -> Result<(), TableHeapError> {
-        let tail = self.tail.lock();
-        self.delete_locked(rid, &tail)
+        self.write_with(*rid, |meta, _| {
+            if meta.is_deleted {
+                return Err(TableHeapError(format!("record {rid} already deleted")));
+            }
+            Ok(SlotWrite {
+                meta: TupleMeta {
+                    is_deleted: true,
+                    ..meta
+                },
+                data: None,
+            })
+        })
     }
 
-    fn delete_locked(
-        &self,
-        rid: &RecordId,
-        _tail: &MutexGuard<'_, Tail>,
-    ) -> Result<(), TableHeapError> {
-        let mut page_guard = self.bpm.write_page(rid.page_id as usize).map_err(|e| {
-            TableHeapError(format!(
-                "failed to acquire write lock on page {} for delete of {rid}: {e}",
-                rid.page_id
-            ))
-        })?;
-        let mut table_page = TablePageMut::new(page_guard.data_mut())?;
-        let meta = table_page.slot(rid.slot_id).ok_or_else(|| {
-            TableHeapError(format!(
-                "slot {} does not exist on page {} (page has {} slots)",
-                rid.slot_id,
-                rid.page_id,
-                table_page.num_tuples()
-            ))
-        })?;
-        if meta.is_deleted {
-            return Err(TableHeapError(format!("record {rid} already deleted")));
-        }
-        table_page.mark_deleted(rid.slot_id)?;
-        Ok(())
-    }
-
+    /// Returns a tuple whose newest version is not a deletion, ignoring timestamps.
     pub fn get(&self, rid: RecordId) -> Result<(RecordId, Tuple), TableHeapError> {
-        let page_guard = self.bpm.read_page(rid.page_id as usize).map_err(|e| {
+        let (meta, tuple) = self.get_with_meta(rid)?;
+        if meta.is_deleted {
+            return Err(TableHeapError(format!("record {rid} has been deleted")));
+        }
+        Ok((rid, tuple))
+    }
+
+    /// Returns the newest version of a tuple and its metadata, deleted or not.
+    pub fn get_with_meta(&self, rid: RecordId) -> Result<(TupleMeta, Tuple), TableHeapError> {
+        self.read_with(rid, |meta, bytes| {
+            (
+                meta,
+                Tuple {
+                    data: bytes.to_vec(),
+                },
+            )
+        })
+    }
+
+    /// Calls `f` with the slot's metadata and bytes under the page's read latch.
+    pub fn read_with<R>(
+        &self,
+        rid: RecordId,
+        f: impl FnOnce(TupleMeta, &[u8]) -> R,
+    ) -> Result<R, TableHeapError> {
+        Self::read_slot(&self.bpm, rid, f)
+    }
+
+    /// Calls `f` with the slot's metadata and bytes under the page's write latch and applies
+    /// the [`SlotWrite`] it returns before releasing the latch, so a check and the write it
+    /// guards are atomic with respect to every other reader and writer of the slot.
+    pub fn write_with<E>(
+        &self,
+        rid: RecordId,
+        f: impl FnOnce(TupleMeta, &[u8]) -> Result<SlotWrite, E>,
+    ) -> Result<(), E>
+    where
+        E: From<TableHeapError>,
+    {
+        Self::write_slot(&self.bpm, rid, f)
+    }
+
+    /// [`TableHeap::read_with`] for callers that only hold the buffer pool, such as the
+    /// transaction manager. Record ids name pages directly, so no heap handle is needed.
+    pub fn read_slot<R>(
+        bpm: &Arc<BufferPoolManager>,
+        rid: RecordId,
+        f: impl FnOnce(TupleMeta, &[u8]) -> R,
+    ) -> Result<R, TableHeapError> {
+        let page_guard = bpm.read_page(rid.page_id as usize).map_err(|e| {
             TableHeapError(format!(
-                "failed to acquire read lock on page {} for get of {rid}: {e}",
+                "failed to acquire read lock on page {} for read of {rid}: {e}",
                 rid.page_id
             ))
         })?;
         let table_page = TablePageRef::new(page_guard.data())?;
-        let meta = table_page.slot(rid.slot_id).ok_or_else(|| {
+        let slot = table_page.slot(rid.slot_id).ok_or_else(|| {
             TableHeapError(format!(
                 "slot {} does not exist on page {} (page has {} slots)",
                 rid.slot_id,
@@ -275,36 +356,100 @@ impl TableHeap {
                 table_page.num_tuples()
             ))
         })?;
-        if meta.is_deleted {
-            return Err(TableHeapError(format!("record {rid} has been deleted")));
-        }
-
-        let bytes = table_page.tuple_bytes(&meta)?.to_vec();
-
-        let t = Tuple { data: bytes };
-        Ok((rid, t))
+        let bytes = table_page.tuple_bytes(&slot)?;
+        Ok(f(slot.meta, bytes))
     }
 
-    /// Writes `new` as a new record, then marks `rid` deleted, and returns the new record id. If the
-    /// new record cannot be written, the original is left untouched.
-    pub fn update<'a>(
+    /// [`TableHeap::write_with`] for callers that only hold the buffer pool.
+    pub fn write_slot<E>(
+        bpm: &Arc<BufferPoolManager>,
+        rid: RecordId,
+        f: impl FnOnce(TupleMeta, &[u8]) -> Result<SlotWrite, E>,
+    ) -> Result<(), E>
+    where
+        E: From<TableHeapError>,
+    {
+        Self::write_slot_then(bpm, rid, |meta, bytes| Ok((f(meta, bytes)?, ())), |()| ())
+    }
+
+    /// [`TableHeap::write_slot`] with a second step. `f` plans the write and hands a value
+    /// to `then`, which runs only once the slot is overwritten, still under the page write
+    /// latch. Bookkeeping that has to match the slot, such as an undo chain, goes in `then`,
+    /// so a write that fails leaves both untouched.
+    pub fn write_slot_then<T, R, E>(
+        bpm: &Arc<BufferPoolManager>,
+        rid: RecordId,
+        f: impl FnOnce(TupleMeta, &[u8]) -> Result<(SlotWrite, T), E>,
+        then: impl FnOnce(T) -> R,
+    ) -> Result<R, E>
+    where
+        E: From<TableHeapError>,
+    {
+        let mut page_guard = bpm.write_page(rid.page_id as usize).map_err(|e| {
+            TableHeapError(format!(
+                "failed to acquire write lock on page {} for write of {rid}: {e}",
+                rid.page_id
+            ))
+        })?;
+        let mut table_page =
+            TablePageMut::new(page_guard.data_mut()).map_err(TableHeapError::from)?;
+        let slot = table_page.slot(rid.slot_id).ok_or_else(|| {
+            TableHeapError(format!(
+                "slot {} does not exist on page {} (page has {} slots)",
+                rid.slot_id,
+                rid.page_id,
+                table_page.num_tuples()
+            ))
+        })?;
+        let (write, planned) = {
+            let bytes = table_page
+                .tuple_bytes(&slot)
+                .map_err(TableHeapError::from)?;
+            f(slot.meta, bytes)?
+        };
+        match write.data {
+            Some(data) => table_page
+                .update_in_place(rid.slot_id, write.meta, &data)
+                .map_err(TableHeapError::from)?,
+            None => table_page
+                .update_meta(rid.slot_id, write.meta)
+                .map_err(TableHeapError::from)?,
+        }
+        Ok(then(planned))
+    }
+
+    /// [`TableHeap::write_slot_then`] on this heap's buffer pool.
+    pub fn write_with_then<T, R, E>(
         &self,
         rid: RecordId,
-        new: &'a Tuple,
-    ) -> Result<(RecordId, &'a Tuple), TableHeapError> {
-        let mut tail = self.tail.lock();
-        self.get(rid)?;
-        let new_rid = self.insert_locked(new, &mut tail)?;
-        if let Err(err) = self.delete_locked(&rid, &tail) {
-            if let Err(cleanup) = self.delete_locked(&new_rid, &tail) {
-                return Err(TableHeapError(format!(
-                    "update could not delete original: {}; replacement {new_rid} cleanup failed: {}",
-                    err.0, cleanup.0
-                )));
-            }
-            return Err(err);
-        }
-        Ok((new_rid, new))
+        f: impl FnOnce(TupleMeta, &[u8]) -> Result<(SlotWrite, T), E>,
+        then: impl FnOnce(T) -> R,
+    ) -> Result<R, E>
+    where
+        E: From<TableHeapError>,
+    {
+        Self::write_slot_then(&self.bpm, rid, f, then)
+    }
+
+    /// Overwrites a slot's metadata.
+    pub fn update_meta(&self, rid: RecordId, meta: TupleMeta) -> Result<(), TableHeapError> {
+        self.write_with(rid, |_, _| Ok(SlotWrite { meta, data: None }))
+    }
+
+    /// Overwrites a tuple and its metadata in place, keeping its record id. The new tuple
+    /// is the same size as the old one, or the write fails.
+    pub fn update_in_place(
+        &self,
+        rid: RecordId,
+        meta: TupleMeta,
+        new: &Tuple,
+    ) -> Result<(), TableHeapError> {
+        self.write_with(rid, |_, _| {
+            Ok(SlotWrite {
+                meta,
+                data: Some(new.data.clone()),
+            })
+        })
     }
 }
 
@@ -381,25 +526,48 @@ mod tests {
     }
 
     #[test]
-    fn update_replaces_tuple_and_invalidates_old_rid() {
+    fn update_in_place_keeps_rid_and_rejects_size_change() {
         let (heap, _dir) = make_heap();
-        let old_rid = heap
+        let rid = heap
             .insert(&Tuple {
                 data: b"before".to_vec(),
             })
             .expect("insert");
-        let t = Tuple {
-            data: b"after!".to_vec(),
+        let meta = TupleMeta {
+            ts: 9,
+            is_deleted: false,
         };
-        let (new_rid, returned) = heap.update(old_rid, &t).expect("update");
-        assert_eq!(returned.data, b"after!");
-        assert_ne!(new_rid, old_rid, "update should produce a new RID");
-        assert!(
-            heap.get(old_rid).is_err(),
-            "old RID should be tombstoned after update"
-        );
-        let (_, got) = heap.get(new_rid).expect("get new");
+        heap.update_in_place(
+            rid,
+            meta,
+            &Tuple {
+                data: b"after!".to_vec(),
+            },
+        )
+        .expect("update");
+        let (got_meta, got) = heap.get_with_meta(rid).expect("get");
         assert_eq!(got.data, b"after!");
+        assert_eq!(got_meta, meta);
+        assert!(
+            heap.update_in_place(rid, meta, &Tuple { data: vec![0; 3] })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn write_with_error_leaves_slot_untouched() {
+        let (heap, _dir) = make_heap();
+        let rid = heap
+            .insert(&Tuple {
+                data: b"keep".to_vec(),
+            })
+            .unwrap();
+        let res: Result<(), TableHeapError> =
+            heap.write_with(rid, |_, _| Err(TableHeapError("refused".to_string())));
+        assert!(res.is_err());
+        let (meta, t) = heap.get_with_meta(rid).unwrap();
+        assert_eq!(t.data, b"keep");
+        assert_eq!(meta, TupleMeta::default());
     }
 
     #[test]
@@ -423,13 +591,13 @@ mod tests {
 
             if i % 3 == 0 {
                 let (old_rid, _) = live.pop().expect("at least one live tuple");
-                let new_payload = format!("updated-{i:02}").into_bytes();
+                let new_payload = format!("TUPLE-{i:02}").into_bytes();
                 let t = Tuple {
                     data: new_payload.clone(),
                 };
-                let (new_rid, _) = heap.update(old_rid, &t).expect("update");
-                assert!(heap.get(old_rid).is_err());
-                live.push((new_rid, new_payload));
+                heap.update_in_place(old_rid, TupleMeta::default(), &t)
+                    .expect("update");
+                live.push((old_rid, new_payload));
             }
 
             if i % 4 == 0 && !live.is_empty() {
