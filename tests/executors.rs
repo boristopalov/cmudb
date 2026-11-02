@@ -5,9 +5,9 @@ mod common;
 
 use cmudb::catalog::{DataType, Schema, Value};
 use cmudb::processor::plan::{
-    AggType, ColIdx, DropIndexPlanNode, DropTablePlanNode, Expression, ExternalMergeSortPlanNode,
-    HashJoinPlanNode, JoinType, LimitPlanNode, NullOrdering, Plan, SeqScanPlanNode, SortDirection,
-    SortExpr, SortPlanNode, WindowFunctionPlanNode,
+    AggType, ColIdx, CreateIndexPlanNode, DropIndexPlanNode, DropTablePlanNode, Expression,
+    ExternalMergeSortPlanNode, HashJoinPlanNode, JoinType, LimitPlanNode, NullOrdering, Plan,
+    SeqScanPlanNode, SortDirection, SortExpr, SortPlanNode, WindowFunctionPlanNode,
 };
 use common::*;
 
@@ -380,6 +380,44 @@ fn window_without_partition_is_one_partition() {
     let rows = ints(&db.run_plan(&plan).unwrap());
     assert_eq!(rows.len(), 6);
     assert!(rows.iter().all(|r| r[2] == 6));
+}
+
+#[test]
+fn create_index_keys_on_the_columns_its_col_idxs_name() {
+    let db = Db::new(32);
+    db.exec("CREATE TABLE t (id INTEGER, v INTEGER)");
+    db.exec("INSERT INTO t VALUES (1, 10), (2, 20)");
+    let table_oid = db.table_oid("t");
+
+    db.run_plan(&Plan::CreateIndex(CreateIndexPlanNode {
+        index_name: "t_v".to_string(),
+        table_oid,
+        key_columns: vec![ColIdx(1)],
+    }))
+    .unwrap();
+    let index_oid = db.catalog().index_oid("t", "t_v").unwrap();
+    assert_eq!(
+        db.catalog()
+            .get_index(index_oid)
+            .unwrap()
+            .index
+            .indexed_col_idxs,
+        vec![1],
+        "the index keys on column v"
+    );
+
+    let out_of_range = db
+        .run_plan(&Plan::CreateIndex(CreateIndexPlanNode {
+            index_name: "t_bad".to_string(),
+            table_oid,
+            key_columns: vec![ColIdx(2)],
+        }))
+        .unwrap_err();
+    assert!(
+        out_of_range.contains("ColumnOutOfBounds"),
+        "a key column past the table's last column fails: {out_of_range}"
+    );
+    assert!(db.catalog().index_oid("t", "t_bad").is_err());
 }
 
 #[test]

@@ -494,7 +494,7 @@ fn update_and_delete_touch_every_row_once() {
         let update = Plan::Update(UpdatePlanNode {
             schema: s_schema(),
             assignments: vec![ColumnAssignment {
-                col_idx: 1,
+                col_idx: ColIdx(1),
                 value: binary(col(1), Op::Add, Expression::Constant(int(100))),
             }],
             child: scan(env.s_oid, s_schema()),

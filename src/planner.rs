@@ -206,7 +206,7 @@ impl<'a> Planner<'a> {
         let mut assignments = Vec::with_capacity(upd.cols.len());
         for (col, value) in upd.cols.into_iter().zip(upd.new_cols) {
             assignments.push(ColumnAssignment {
-                col_idx: col.0,
+                col_idx: col,
                 value,
             });
         }
@@ -236,7 +236,7 @@ impl<'a> Planner<'a> {
             .map(|col| {
                 ts.schema
                     .col_idx(&col.name)
-                    .map(|i| i as u32)
+                    .map(|i| ColIdx(i as u32))
                     .ok_or_else(|| {
                         PlannerError(format!(
                             "CREATE INDEX references unknown column: {}",

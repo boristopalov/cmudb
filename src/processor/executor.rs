@@ -525,7 +525,7 @@ impl<'a> Executor for UpdateExecutor<'a> {
         for (tuple_to_update, rid) in batch {
             let mut new_values = row_values(schema, &tuple_to_update)?;
             for assignment in &self.plan.assignments {
-                new_values[assignment.col_idx as usize] =
+                new_values[assignment.col_idx.index()] =
                     assignment.value.evaluate(&tuple_to_update, schema)?;
             }
 
@@ -1957,7 +1957,7 @@ impl<'a> Executor for CreateIndexExecutor<'a> {
                 table
                     .schema
                     .cols
-                    .get(*idx as usize)
+                    .get(idx.index())
                     .map(|c| c.name.clone())
                     .ok_or(CatalogError::ColumnOutOfBounds)
             })
