@@ -1,9 +1,10 @@
-use crate::processor::executor::{
-    AggregationExecutor, CreateIndexExecutor, CreateTableExecutor, DEFAULT_BATCH_SIZE,
-    DeleteExecutor, DropIndexExecutor, DropTableExecutor, Executor, ExecutorContext,
-    ExternalMergeSortExecutor, FilterExecutor, HashJoinExecutor, IndexScanExecutor, InsertExecutor,
-    LimitExecutor, NestedIndexJoinExecutor, NestedLoopJoinExecutor, ProjectionExecutor,
-    SeqScanExecutor, SortExecutor, UpdateExecutor, ValuesExecutor, WindowFunctionExecutor,
+use crate::processor::executor::{DEFAULT_BATCH_SIZE, Executor, ExecutorContext};
+use crate::processor::executors::{
+    AggregationExecutor, CreateIndexExecutor, CreateTableExecutor, DeleteExecutor,
+    DropIndexExecutor, DropTableExecutor, ExternalMergeSortExecutor, FilterExecutor,
+    HashJoinExecutor, IndexScanExecutor, InsertExecutor, LimitExecutor, NestedIndexJoinExecutor,
+    NestedLoopJoinExecutor, ProjectionExecutor, SeqScanExecutor, SortExecutor, UpdateExecutor,
+    ValuesExecutor, WindowFunctionExecutor,
 };
 use crate::processor::plan::Plan;
 
