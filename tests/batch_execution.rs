@@ -9,6 +9,7 @@
 use cmudb::buffer_pool::BufferPoolManager;
 use cmudb::catalog::{Catalog, DataType, IndexType, Schema, Value};
 use cmudb::concurrency::{IsolationLevel, TransactionManager};
+use cmudb::ids::{IndexOid, TableOid};
 use cmudb::processor::executor::{
     DEFAULT_SORT_MEMORY_BUDGET_BYTES, ExecutorContext, RowCursor, rows_affected,
 };
@@ -61,10 +62,10 @@ struct Env {
     catalog: Catalog,
     bpm: Arc<BufferPoolManager>,
     txn_mgr: Arc<TransactionManager>,
-    l_oid: u32,
-    r_oid: u32,
-    s_oid: u32,
-    s_index_oid: u32,
+    l_oid: TableOid,
+    r_oid: TableOid,
+    s_oid: TableOid,
+    s_index_oid: IndexOid,
     _dir: TempDir,
 }
 
@@ -148,7 +149,7 @@ fn r_rows() -> Rows {
         .collect()
 }
 
-fn scan(table_oid: u32, schema: Schema) -> Box<Plan> {
+fn scan(table_oid: TableOid, schema: Schema) -> Box<Plan> {
     Box::new(Plan::SeqScan(SeqScanPlanNode { table_oid, schema }))
 }
 

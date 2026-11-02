@@ -14,6 +14,8 @@ use sqlparser::ast::{
 
 use crate::catalog::timestamp::{self, InvalidTimestamp};
 use crate::catalog::{Catalog, CoercionError, Column, DataType, Schema, Value};
+use crate::ids::IndexOid;
+pub use crate::ids::TableOid;
 use crate::processor::plan::{
     AggType, ColIdx, Expression, JoinColumn, JoinPredicate, JoinType, NullOrdering, Op, Side,
     SortDirection, SortExpr,
@@ -2193,7 +2195,7 @@ pub struct BoundDropTable {
 /// A bound `DROP INDEX`. `index_oid` is `None` when the index does not exist and the statement
 /// says `IF EXISTS`.
 pub struct BoundDropIndex {
-    pub index_oid: Option<u32>,
+    pub index_oid: Option<IndexOid>,
     pub if_exists: bool,
 }
 
@@ -2218,7 +2220,6 @@ impl TableScope {
 }
 
 pub type TableAlias = String;
-pub type TableOid = u32;
 
 /// Rewrites an ON predicate bound over the FROM output into one that reads the left and right
 /// rows of the join, given the number of columns the left table contributes.

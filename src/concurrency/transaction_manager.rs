@@ -567,7 +567,7 @@ mod tests {
     #[test]
     fn txn_errors_display_readable_messages() {
         let rid = RecordId {
-            page_id: 1,
+            page_id: crate::testing::pid(1),
             slot_id: 2,
         };
         let stamp = TxnError::UnexpectedStamp {

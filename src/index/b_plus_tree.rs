@@ -1,8 +1,9 @@
 use crate::buffer_pool::{BufferPoolManager, PageMut, PageRef};
 use crate::catalog::index_schema::{IndexKey, IndexValue};
 use crate::disk::PAGE_SIZE;
+use crate::ids::RecordId;
 use crate::index::b_plus_page::{
-    HeaderPage, INVALID_PAGE_ID, InternalPage, LeafPage, NUM_TOMBSTONES, Page, PageId, PageKind,
+    HeaderPage, InternalPage, LeafPage, NUM_TOMBSTONES, Page, PageId, PageKind,
 };
 use crate::index::context::TreeContext;
 use crate::index::page_codec::{KIND_LEAF, PageCodecError, peek_common_header};
@@ -12,7 +13,6 @@ use crate::index::page_view::{
 use crate::index::{
     Index, IndexError, IndexIter, InsertError, InsertResult, RemoveError, RemoveResult,
 };
-use crate::table_heap::RecordId;
 use log::{debug, info, warn};
 
 use std::collections::HashSet;
@@ -27,11 +27,12 @@ const HEADER_LATCH_RELEASED: IndexError =
     IndexError::Structure("the root changed after the header latch was released");
 const EMPTY_SIBLING: IndexError =
     IndexError::Structure("sibling chosen to lend an entry has none to give");
-const UNNUMBERED_FRAME: IndexError = IndexError::Structure("latched frame has no page id");
 const SPLIT_ABOVE_LATCHED_PATH: IndexError =
     IndexError::Structure("a split reached the highest latched page, which is not the root");
 const NO_CHILD_FOR_KEY: IndexError =
     IndexError::Structure("internal page has no child to descend into for the key");
+const ROOT_WITHOUT_FIRST_LEAF: IndexError =
+    IndexError::Structure("the header names a root but no first leaf");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Rebalance {
@@ -76,10 +77,6 @@ fn child_for_key(buf: &[u8], key_len: u32, key: &IndexKey) -> Result<Option<Page
         .map(Some)
 }
 
-fn page_id_of(page: &PageMut<'_>) -> Result<PageId, IndexError> {
-    page.page_id().ok_or(UNNUMBERED_FRAME)
-}
-
 /// Moves `current` down to `child`; `child` is latched before `current` is released.
 fn step_down<'a>(current: &mut PageRef<'a>, child: PageRef<'a>) {
     drop(std::mem::replace(current, child));
@@ -101,7 +98,7 @@ pub struct BPlusTree {
 pub struct LeafPagesIter {
     bpm: Arc<BufferPoolManager>,
     key_len: u32,
-    next_leaf_id: PageId,
+    next_leaf_id: Option<PageId>,
     seen: HashSet<PageId>,
     finished: bool,
 }
@@ -110,12 +107,10 @@ impl Iterator for LeafPagesIter {
     type Item = Result<(PageId, LeafPage), IndexError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.finished || self.next_leaf_id == INVALID_PAGE_ID {
+        let Some(leaf_id) = self.next_leaf_id.filter(|_| !self.finished) else {
             self.finished = true;
             return None;
-        }
-
-        let leaf_id = self.next_leaf_id;
+        };
         if !self.seen.insert(leaf_id) {
             self.finished = true;
             return Some(Err(IndexError::PageError(PageCodecError::Malformed(
@@ -161,7 +156,7 @@ impl BPlusTree {
 
         let header_page_id = {
             let mut page = bpm.new_page()?;
-            let pid = page_id_of(&page)?;
+            let pid = page.page_id();
             HeaderPageView::init(page.data_mut(), key_len)?;
             pid
         };
@@ -221,8 +216,8 @@ impl BPlusTree {
             });
         }
         Ok(HeaderPage {
-            root_page_id: view.root_page_id(),
-            first_leaf_id: view.first_leaf_id(),
+            root_page_id: view.root_page_id()?,
+            first_leaf_id: view.first_leaf_id()?,
             key_len: view.key_len(),
         })
     }
@@ -253,7 +248,7 @@ impl BPlusTree {
 
     fn allocate_page(&self) -> Result<(PageId, PageMut<'_>), IndexError> {
         let page = self.bpm.new_page()?;
-        Ok((page_id_of(&page)?, page))
+        Ok((page.page_id(), page))
     }
 
     fn new_leaf(&self) -> LeafPage {
@@ -290,20 +285,20 @@ impl BPlusTree {
         let mut header_page = self.bpm.write_page(self.header_page_id)?;
         let mut header = self.header_from_bytes(header_page.data())?;
 
-        if header.root_page_id == INVALID_PAGE_ID {
+        let Some(root_page_id) = header.root_page_id else {
             info!("insert into empty tree: creating new tree");
             let (leaf_id, mut leaf_page) = self.allocate_page()?;
             let mut leaf = self.new_leaf();
             leaf.insert(key, record_id)
                 .map_err(|_| IndexError::Insert(InsertError::DuplicateKey))?;
             leaf.encode(leaf_page.data_mut(), self.key_len)?;
-            header.root_page_id = leaf_id;
-            header.first_leaf_id = leaf_id;
+            header.root_page_id = Some(leaf_id);
+            header.first_leaf_id = Some(leaf_id);
             Self::store_header(&mut header_page, &header)?;
             return Ok(());
-        }
+        };
 
-        let mut ctx = TreeContext::new(header_page, header.root_page_id);
+        let mut ctx = TreeContext::new(header_page, root_page_id);
         self.latch_path_to_leaf(&mut ctx, &key, safe_for_insert)?;
         let mut leaf_page = ctx.write_set.pop_back().ok_or(LATCH_NOT_HELD)?;
         if self.insert_in_place(&mut leaf_page, &key, record_id)? {
@@ -323,7 +318,7 @@ impl BPlusTree {
         leaf.encode(leaf_page.data_mut(), self.key_len)?;
         right_leaf.encode(right_page.data_mut(), self.key_len)?;
         let mut split = Split {
-            left_id: page_id_of(&leaf_page)?,
+            left_id: leaf_page.page_id(),
             separator,
             right_id,
         };
@@ -342,7 +337,7 @@ impl BPlusTree {
             parent.encode(parent_page.data_mut(), self.key_len)?;
             right.encode(right_page.data_mut(), self.key_len)?;
             split = Split {
-                left_id: page_id_of(&parent_page)?,
+                left_id: parent_page.page_id(),
                 separator,
                 right_id,
             };
@@ -366,7 +361,7 @@ impl BPlusTree {
         root.children.push(split.left_id);
         root.insert_separator(split.separator, split.right_id);
         root.encode(root_page.data_mut(), self.key_len)?;
-        header.root_page_id = root_id;
+        header.root_page_id = Some(root_id);
         Self::store_header(header_page, header)?;
         Ok(())
     }
@@ -391,11 +386,11 @@ impl BPlusTree {
     fn remove_pessimistic(&self, key: IndexKey) -> RemoveResult {
         let header_page = self.bpm.write_page(self.header_page_id)?;
         let mut header = self.header_from_bytes(header_page.data())?;
-        if header.root_page_id == INVALID_PAGE_ID {
+        let Some(root_page_id) = header.root_page_id else {
             return Err(IndexError::Remove(RemoveError::KeyNotFound));
-        }
+        };
 
-        let mut ctx = TreeContext::new(header_page, header.root_page_id);
+        let mut ctx = TreeContext::new(header_page, root_page_id);
         self.latch_path_to_leaf(&mut ctx, &key, safe_for_remove)?;
         let mut leaf_page = ctx.write_set.pop_back().ok_or(LATCH_NOT_HELD)?;
         if self.remove_in_place_if_final(&mut ctx, &mut header, &mut leaf_page, &key)? {
@@ -414,9 +409,9 @@ impl BPlusTree {
         parent.encode(parent_page.data_mut(), self.key_len)?;
 
         while outcome == Rebalance::Merged {
-            if parent_page.page_id() == Some(ctx.root_page_id) {
+            if parent_page.page_id() == ctx.root_page_id {
                 if parent.children.len() == 1 {
-                    header.root_page_id = parent.children[0];
+                    header.root_page_id = Some(parent.children[0]);
                     let header_page = ctx.header.as_mut().ok_or(HEADER_LATCH_RELEASED)?;
                     Self::store_header(header_page, &header)?;
                 }
@@ -447,7 +442,7 @@ impl BPlusTree {
         leaf_page: &mut PageMut<'_>,
         key: &IndexKey,
     ) -> Result<bool, IndexError> {
-        let leaf_is_root = page_id_of(leaf_page)? == ctx.root_page_id;
+        let leaf_is_root = leaf_page.page_id() == ctx.root_page_id;
         let mut leaf = LeafPageView::new(leaf_page.data_mut(), self.key_len)?;
         if !leaf_is_root {
             if leaf.size() <= leaf.min_size() {
@@ -460,10 +455,10 @@ impl BPlusTree {
         let mut header_view = HeaderPageView::new(header_page.data_mut())?;
         leaf.remove_key(&key.0)?;
         if leaf.size() == 0 {
-            header.root_page_id = INVALID_PAGE_ID;
-            header.first_leaf_id = INVALID_PAGE_ID;
-            header_view.set_root_page_id(INVALID_PAGE_ID);
-            header_view.set_first_leaf_id(INVALID_PAGE_ID);
+            header.root_page_id = None;
+            header.first_leaf_id = None;
+            header_view.set_root_page_id(None);
+            header_view.set_first_leaf_id(None);
         }
         Ok(true)
     }
@@ -591,12 +586,8 @@ impl BPlusTree {
     /// Prints a best-effort view of the tree structure (page ids, levels, counts, and leaf links).
     pub fn print_tree(&self) -> Result<(), IndexError> {
         let header = self.read_header()?;
-        fn fmt_pid(pid: PageId) -> String {
-            if pid == INVALID_PAGE_ID {
-                "INVALID".to_string()
-            } else {
-                pid.to_string()
-            }
+        fn fmt_pid(pid: Option<PageId>) -> String {
+            pid.map_or_else(|| "INVALID".to_string(), |pid| pid.to_string())
         }
         fn fmt_children(children: &[PageId]) -> String {
             let mut s = String::from("[");
@@ -604,7 +595,7 @@ impl BPlusTree {
                 if i != 0 {
                     s.push_str(", ");
                 }
-                s.push_str(&fmt_pid(pid));
+                s.push_str(&pid.to_string());
             }
             s.push(']');
             s
@@ -613,7 +604,7 @@ impl BPlusTree {
         println!(
             "BPlusTree {{ index_name: {}, header_page_id: {}, key_len: {}, leaf_max_size: {}, internal_max_size: {} }}",
             self.index_name,
-            fmt_pid(self.header_page_id),
+            self.header_page_id,
             self.key_len,
             self.leaf_max_size,
             self.internal_max_size
@@ -624,10 +615,10 @@ impl BPlusTree {
             fmt_pid(header.first_leaf_id)
         );
 
-        if header.root_page_id == INVALID_PAGE_ID {
+        let Some(root_page_id) = header.root_page_id else {
             println!("(empty)");
             return Ok(());
-        }
+        };
 
         println!("tree:");
         let mut visited: HashSet<PageId> = HashSet::new();
@@ -657,7 +648,7 @@ impl BPlusTree {
             };
 
             if !visited.insert(page_id) {
-                println!("{prefix}{branch}* cycle/revisit: page {}", fmt_pid(page_id));
+                println!("{prefix}{branch}* cycle/revisit: page {page_id}");
                 return Ok(());
             }
 
@@ -666,7 +657,7 @@ impl BPlusTree {
                 Ok(leaf) => {
                     println!(
                         "{prefix}{branch}leaf page_id={} keys={} next_leaf_id={}",
-                        fmt_pid(page_id),
+                        page_id,
                         leaf.keys.len(),
                         fmt_pid(leaf.next_leaf_id)
                     );
@@ -678,7 +669,7 @@ impl BPlusTree {
                             let children = internal.children.clone();
                             println!(
                                 "{prefix}{branch}internal page_id={} keys={} children={}",
-                                fmt_pid(page_id),
+                                page_id,
                                 internal.keys.len(),
                                 fmt_children(&children)
                             );
@@ -691,12 +682,8 @@ impl BPlusTree {
                                 format!("{prefix}│   ")
                             };
 
-                            let printable_children: Vec<PageId> = children
-                                .into_iter()
-                                .filter(|&c| c != INVALID_PAGE_ID)
-                                .collect();
-                            for (i, child) in printable_children.iter().copied().enumerate() {
-                                let child_is_last = i + 1 == printable_children.len();
+                            for (i, child) in children.iter().copied().enumerate() {
+                                let child_is_last = i + 1 == children.len();
                                 print_node(
                                     tree,
                                     child,
@@ -712,7 +699,7 @@ impl BPlusTree {
                         Err(PageCodecError::WrongPageKind { .. }) => {
                             println!(
                                 "{prefix}{branch}unknown page_id={} (neither leaf nor internal)",
-                                fmt_pid(page_id)
+                                page_id
                             );
                             Ok(())
                         }
@@ -725,7 +712,7 @@ impl BPlusTree {
 
         print_node(
             self,
-            header.root_page_id,
+            root_page_id,
             "",
             true,
             false,
@@ -737,20 +724,20 @@ impl BPlusTree {
         let mut leaf_seen: HashSet<PageId> = HashSet::new();
         let mut leaf_id = header.first_leaf_id;
         let mut idx = 0usize;
-        while leaf_id != INVALID_PAGE_ID {
+        while let Some(current_leaf_id) = leaf_id {
             if idx >= PRINT_TREE_LIMIT {
                 println!("  ... truncated after {idx} leaves");
                 break;
             }
-            if !leaf_seen.insert(leaf_id) {
-                println!("  * cycle/revisit at leaf {}", fmt_pid(leaf_id));
+            if !leaf_seen.insert(current_leaf_id) {
+                println!("  * cycle/revisit at leaf {current_leaf_id}");
                 break;
             }
 
-            let leaf = self.decode_leaf(leaf_id)?;
+            let leaf = self.decode_leaf(current_leaf_id)?;
             println!(
                 "  [{idx}] page_id={} keys={} next_leaf_id={}",
-                fmt_pid(leaf_id),
+                current_leaf_id,
                 leaf.keys.len(),
                 fmt_pid(leaf.next_leaf_id)
             );
@@ -767,15 +754,15 @@ impl BPlusTree {
     fn get_root_page_from_header(&self) -> Result<Option<PageRef<'_>>, IndexError> {
         let mut current = self.bpm.read_page(self.header_page_id)?;
         let header = self.header_from_bytes(current.data())?;
-        if header.root_page_id == INVALID_PAGE_ID {
+        let Some(root_page_id) = header.root_page_id else {
             warn!(
-                "tid={:?} header root_page_id is invalid (empty tree); header={:?}",
+                "tid={:?} header has no root page (empty tree); header={:?}",
                 std::thread::current().id(),
                 header
             );
             return Ok(None);
-        }
-        let root = self.bpm.read_page(header.root_page_id)?;
+        };
+        let root = self.bpm.read_page(root_page_id)?;
         step_down(&mut current, root);
         Ok(Some(current))
     }
@@ -805,7 +792,7 @@ impl BPlusTree {
         _parent_latch: &PageRef<'a>,
         child: PageRef<'a>,
     ) -> Result<PageMut<'a>, IndexError> {
-        let child_id = child.page_id().ok_or(UNNUMBERED_FRAME)?;
+        let child_id = child.page_id();
         drop(child);
         Ok(self.bpm.write_page(child_id)?)
     }
@@ -877,17 +864,20 @@ impl Index for BPlusTree {
 
     fn scan(&self, range: (Bound<IndexKey>, Bound<IndexKey>)) -> Result<IndexIter, IndexError> {
         let header = self.read_header()?;
-        if header.root_page_id == INVALID_PAGE_ID {
+        if header.root_page_id.is_none() {
             return Ok(Box::new(std::iter::empty()));
         }
         let start_page = match range.start_bound() {
-            Bound::Unbounded => Some(self.bpm.read_page(header.first_leaf_id)?),
+            Bound::Unbounded => {
+                let first_leaf_id = header.first_leaf_id.ok_or(ROOT_WITHOUT_FIRST_LEAF)?;
+                Some(self.bpm.read_page(first_leaf_id)?)
+            }
             Bound::Excluded(key) | Bound::Included(key) => self.find_leaf(key)?,
         };
         let Some(start_page) = start_page else {
             return Ok(Box::new(std::iter::empty()));
         };
-        let start_leaf_id = start_page.page_id().ok_or(UNNUMBERED_FRAME)?;
+        let start_leaf_id = start_page.page_id();
         let leaf = LeafPageView::new(start_page.data(), self.key_len)?;
         let start_slot = match range.start_bound() {
             Bound::Unbounded => 0,
@@ -924,10 +914,10 @@ pub struct BPlusTreeIter {
 impl BPlusTreeIter {
     /// Copies leaf `leaf_id` into the iterator's buffer. Returns `Ok(false)` if `leaf_id` is
     /// the end of the chain.
-    fn load_leaf(&mut self, leaf_id: PageId) -> Result<bool, IndexError> {
-        if leaf_id == INVALID_PAGE_ID {
+    fn load_leaf(&mut self, leaf_id: Option<PageId>) -> Result<bool, IndexError> {
+        let Some(leaf_id) = leaf_id else {
             return Ok(false);
-        }
+        };
         if !self.seen.insert(leaf_id) {
             return Err(IndexError::PageError(PageCodecError::Malformed(
                 "leaf chain contains a cycle",
@@ -956,8 +946,8 @@ impl Iterator for BPlusTreeIter {
             };
 
             if self.slot_idx >= leaf.size() as usize {
-                let next_leaf_id = leaf.next_leaf_id();
-                match self.load_leaf(next_leaf_id) {
+                let next_leaf_id = leaf.next_leaf_id().map_err(IndexError::PageError);
+                match next_leaf_id.and_then(|id| self.load_leaf(id)) {
                     Ok(true) => {
                         self.slot_idx = 0;
                         continue;
@@ -1013,6 +1003,7 @@ mod tests {
     };
 
     use crate::table_heap::RecordId;
+    use crate::testing::pid;
 
     const FOUR_ENTRY_LEAF_KEY_LEN: u32 = 2000;
 
@@ -1040,7 +1031,7 @@ mod tests {
         let tree = BPlusTree::new("idx".to_string(), NO_TOMBSTONE_KEY_LEN, bpm.clone()).unwrap();
         for k in 0..15u8 {
             let rid = RecordId {
-                page_id: u32::from(k),
+                page_id: pid(u32::from(k)),
                 slot_id: 0,
             };
             tree.insert(make_key(k, key_len), IndexValue::IndexValue(rid))
@@ -1048,7 +1039,7 @@ mod tests {
         }
         let header = tree.read_header().unwrap();
         let root = InternalPage::decode(
-            bpm.read_page(header.root_page_id).unwrap().data(),
+            bpm.read_page(header.root_page_id.unwrap()).unwrap().data(),
             NO_TOMBSTONE_KEY_LEN,
         )
         .unwrap();
@@ -1097,14 +1088,14 @@ mod tests {
         let tree = BPlusTree::new("idx".to_string(), key_len as u32, bpm.clone()).unwrap();
         for k in 1..=3u8 {
             let rid = RecordId {
-                page_id: u32::from(k),
+                page_id: pid(u32::from(k)),
                 slot_id: 0,
             };
             tree.insert(make_key(k, key_len), IndexValue::IndexValue(rid))
                 .unwrap();
         }
         tree.remove(make_key(2, key_len)).unwrap();
-        let root_leaf = tree.read_header().unwrap().root_page_id;
+        let root_leaf = tree.read_header().unwrap().root_page_id.unwrap();
         let first_tombstone = LEAF_FIXED_HEADER_BYTES
             + 3 * (key_len + RECORD_ID_ENCODED_BYTES)
             + TOMBSTONE_SLOT_ENCODED_BYTES;
@@ -1119,7 +1110,7 @@ mod tests {
         };
         assert!(corrupt(&tree.search(&make_key(1, key_len)).map(|_| ())));
         let rid = RecordId {
-            page_id: 9,
+            page_id: pid(9),
             slot_id: 0,
         };
         assert!(corrupt(
@@ -1139,7 +1130,7 @@ mod tests {
         let tree = BPlusTree::new("idx".to_string(), NO_TOMBSTONE_KEY_LEN, bpm.clone()).unwrap();
         for k in 0..15u8 {
             let rid = RecordId {
-                page_id: u32::from(k),
+                page_id: pid(u32::from(k)),
                 slot_id: 0,
             };
             tree.insert(
@@ -1149,7 +1140,7 @@ mod tests {
             .unwrap();
         }
         let root = InternalPage::decode(
-            bpm.read_page(tree.read_header().unwrap().root_page_id)
+            bpm.read_page(tree.read_header().unwrap().root_page_id.unwrap())
                 .unwrap()
                 .data(),
             NO_TOMBSTONE_KEY_LEN,
@@ -1181,7 +1172,7 @@ mod tests {
         let (bpm, _tmp) = crate::testing::bpm(16);
         let (tree, left, right) = two_leaf_tree(&bpm);
         let mut leaf = tree.decode_leaf(right).unwrap();
-        leaf.next_leaf_id = left;
+        leaf.next_leaf_id = Some(left);
         leaf.encode(
             bpm.write_page(right).unwrap().data_mut(),
             NO_TOMBSTONE_KEY_LEN,
@@ -1201,15 +1192,15 @@ mod tests {
         let (bpm, _tmp) = crate::testing::bpm(8);
         let tree = BPlusTree::new("idx".to_string(), NO_TOMBSTONE_KEY_LEN, bpm).unwrap();
         let rid = RecordId {
-            page_id: 1,
+            page_id: pid(1),
             slot_id: 1,
         };
         tree.insert(make_key(3, key_len), IndexValue::IndexValue(rid))
             .unwrap();
         tree.remove(make_key(3, key_len)).unwrap();
         let header = tree.read_header().unwrap();
-        assert_eq!(header.root_page_id, INVALID_PAGE_ID);
-        assert_eq!(header.first_leaf_id, INVALID_PAGE_ID);
+        assert_eq!(header.root_page_id, None);
+        assert_eq!(header.first_leaf_id, None);
     }
 
     #[test]
@@ -1230,9 +1221,9 @@ mod tests {
         let mut total = 0usize;
         let mut leaf_id = header.first_leaf_id;
         let mut seen = std::collections::HashSet::new();
-        while leaf_id != INVALID_PAGE_ID {
-            assert!(seen.insert(leaf_id), "cycle in leaf chain at {leaf_id}");
-            let leaf = tree.decode_leaf(leaf_id).expect("leaf decode");
+        while let Some(id) = leaf_id {
+            assert!(seen.insert(id), "cycle in leaf chain at {id}");
+            let leaf = tree.decode_leaf(id).expect("leaf decode");
             total += leaf.keys.len();
             leaf_id = leaf.next_leaf_id;
         }
@@ -1244,9 +1235,9 @@ mod tests {
         let mut count = 0usize;
         let mut leaf_id = header.first_leaf_id;
         let mut seen = std::collections::HashSet::new();
-        while leaf_id != INVALID_PAGE_ID {
-            assert!(seen.insert(leaf_id), "cycle in leaf chain at {leaf_id}");
-            let leaf = tree.decode_leaf(leaf_id).expect("leaf decode");
+        while let Some(id) = leaf_id {
+            assert!(seen.insert(id), "cycle in leaf chain at {id}");
+            let leaf = tree.decode_leaf(id).expect("leaf decode");
             count += 1;
             leaf_id = leaf.next_leaf_id;
         }
@@ -1269,7 +1260,7 @@ mod tests {
             tree.insert(
                 make_key(i, key_len as usize),
                 IndexValue::IndexValue(RecordId {
-                    page_id: i as u32,
+                    page_id: pid(i as u32),
                     slot_id: i as u32 + 10,
                 }),
             )
@@ -1283,8 +1274,8 @@ mod tests {
             leaf_count += 1;
             for (k, rid) in leaf.iter() {
                 keys_first_bytes.push(k.0[0]);
-                assert_eq!(rid.page_id as u8, k.0[0]);
-                assert_eq!(rid.slot_id, rid.page_id + 10);
+                assert_eq!(rid.page_id, pid(k.0[0] as u32));
+                assert_eq!(rid.slot_id, rid.page_id.get() + 10);
             }
         }
 
@@ -1305,7 +1296,7 @@ mod tests {
             tree.insert(
                 make_key(i, key_len as usize),
                 IndexValue::IndexValue(RecordId {
-                    page_id: i as u32,
+                    page_id: pid(i as u32),
                     slot_id: 0,
                 }),
             )
@@ -1313,25 +1304,25 @@ mod tests {
         }
 
         let header = tree.read_header().unwrap();
-        assert_ne!(header.root_page_id, INVALID_PAGE_ID);
-        assert_ne!(header.first_leaf_id, INVALID_PAGE_ID);
+        assert_ne!(header.root_page_id, None);
+        assert_ne!(header.first_leaf_id, None);
 
-        let root_page = bpm.read_page(header.root_page_id).unwrap();
+        let root_page = bpm.read_page(header.root_page_id.unwrap()).unwrap();
         let root = InternalPage::decode(root_page.data(), header.key_len).unwrap();
         assert_eq!(root.keys.len(), 1);
         assert_eq!(root.children.len(), 2);
 
         let left_leaf_id = root.get_child(0).unwrap();
         let right_leaf_id = root.get_child(1).unwrap();
-        assert_eq!(header.first_leaf_id, *left_leaf_id);
+        assert_eq!(header.first_leaf_id, Some(*left_leaf_id));
 
         let left_leaf_page = bpm.read_page(*left_leaf_id).unwrap();
         let left_leaf = LeafPage::decode(left_leaf_page.data(), header.key_len).unwrap();
         let right_leaf_page = bpm.read_page(*right_leaf_id).unwrap();
         let right_leaf = LeafPage::decode(right_leaf_page.data(), header.key_len).unwrap();
 
-        assert_eq!(left_leaf.next_leaf_id, *right_leaf_id);
-        assert_eq!(right_leaf.next_leaf_id, INVALID_PAGE_ID);
+        assert_eq!(left_leaf.next_leaf_id, Some(*right_leaf_id));
+        assert_eq!(right_leaf.next_leaf_id, None);
         assert_eq!(left_leaf.keys.len(), 2);
         assert_eq!(right_leaf.keys.len(), 3);
     }
@@ -1346,7 +1337,7 @@ mod tests {
         tree.insert(
             key.clone(),
             IndexValue::IndexValue(RecordId {
-                page_id: 1,
+                page_id: pid(1),
                 slot_id: 1,
             }),
         )
@@ -1356,7 +1347,7 @@ mod tests {
             .insert(
                 key,
                 IndexValue::IndexValue(RecordId {
-                    page_id: 2,
+                    page_id: pid(2),
                     slot_id: 2,
                 }),
             )
@@ -1374,7 +1365,7 @@ mod tests {
             tree.insert(
                 make_key(i, key_len as usize),
                 IndexValue::IndexValue(RecordId {
-                    page_id: i as u32,
+                    page_id: pid(i as u32),
                     slot_id: 0,
                 }),
             )
@@ -1401,7 +1392,7 @@ mod tests {
             tree.insert(
                 make_key(i, key_len as usize),
                 IndexValue::IndexValue(RecordId {
-                    page_id: i as u32,
+                    page_id: pid(i as u32),
                     slot_id: 0,
                 }),
             )
@@ -1436,7 +1427,7 @@ mod tests {
         tree.insert(
             key.clone(),
             IndexValue::IndexValue(RecordId {
-                page_id: 1,
+                page_id: pid(1),
                 slot_id: 1,
             }),
         )
@@ -1463,7 +1454,7 @@ mod tests {
             tree.insert(
                 make_key(i, key_len as usize),
                 IndexValue::IndexValue(RecordId {
-                    page_id: i as u32,
+                    page_id: pid(i as u32),
                     slot_id: 0,
                 }),
             )
@@ -1472,7 +1463,7 @@ mod tests {
 
         let (_left_leaf_id, _right_leaf_id) = {
             let header = tree.read_header().unwrap();
-            let root_page = bpm.read_page(header.root_page_id).unwrap();
+            let root_page = bpm.read_page(header.root_page_id.unwrap()).unwrap();
             let root = InternalPage::decode(root_page.data(), header.key_len).unwrap();
             assert_eq!(root.keys.len(), 1);
             assert_eq!(root.children.len(), 2);
@@ -1483,8 +1474,8 @@ mod tests {
             let right_leaf = tree.decode_leaf(right_leaf_id).unwrap();
             assert_eq!(left_leaf.keys.len(), 2);
             assert_eq!(right_leaf.keys.len(), 3);
-            assert_eq!(left_leaf.next_leaf_id, right_leaf_id);
-            assert_eq!(right_leaf.next_leaf_id, INVALID_PAGE_ID);
+            assert_eq!(left_leaf.next_leaf_id, Some(right_leaf_id));
+            assert_eq!(right_leaf.next_leaf_id, None);
 
             (left_leaf_id, right_leaf_id)
         };
@@ -1511,7 +1502,7 @@ mod tests {
         let tree = BPlusTree::new("idx".to_string(), 8, bpm).unwrap();
         let short = IndexKey(vec![1, 2, 3]);
         let rid = IndexValue::IndexValue(RecordId {
-            page_id: 1,
+            page_id: pid(1),
             slot_id: 1,
         });
         let is_key_length = |e: IndexError| {
@@ -1558,7 +1549,7 @@ mod tests {
             tree.insert(
                 make_key(i, key_len as usize),
                 IndexValue::IndexValue(RecordId {
-                    page_id: i as u32,
+                    page_id: pid(i as u32),
                     slot_id: i as u32 + 10,
                 }),
             )
@@ -1568,7 +1559,7 @@ mod tests {
         for i in 0u8..5u8 {
             let key = make_key(i, key_len as usize);
             let IndexValue::IndexValue(rid) = tree.search(&key).unwrap().expect("key present");
-            assert_eq!(rid.page_id, i as u32);
+            assert_eq!(rid.page_id, pid(i as u32));
             assert_eq!(rid.slot_id, i as u32 + 10);
         }
 
@@ -1593,7 +1584,7 @@ mod tests {
 
         fn rid_for(n: u32) -> RecordId {
             RecordId {
-                page_id: n,
+                page_id: pid(n),
                 slot_id: n.wrapping_mul(7),
             }
         }
@@ -1661,26 +1652,19 @@ mod tests {
 
         fn assert_tree_is_well_formed(tree: &BPlusTree) {
             let header = tree.read_header().unwrap();
-            if header.root_page_id == INVALID_PAGE_ID {
+            let Some(root_page_id) = header.root_page_id else {
                 assert_eq!(
-                    header.first_leaf_id, INVALID_PAGE_ID,
+                    header.first_leaf_id, None,
                     "empty tree still points at a first leaf"
                 );
                 return;
-            }
+            };
             let mut leaves_in_order = Vec::new();
             let unbounded = SubtreeBounds {
                 lower: None,
                 upper: None,
             };
-            walk_subtree(
-                tree,
-                header.root_page_id,
-                unbounded,
-                0,
-                true,
-                &mut leaves_in_order,
-            );
+            walk_subtree(tree, root_page_id, unbounded, 0, true, &mut leaves_in_order);
             let depths: HashSet<usize> = leaves_in_order.iter().map(|&(_, d)| d).collect();
             assert_eq!(
                 depths.len(),
@@ -2124,7 +2108,7 @@ mod tests {
             let insert_prob = if step < 3000 { 0.75 } else { 0.3 };
             if rng.random_bool(insert_prob) {
                 let rid = RecordId {
-                    page_id: step,
+                    page_id: pid(step),
                     slot_id: u32::from(k),
                 };
                 let res = tree.insert(key.clone(), IndexValue::IndexValue(rid));
@@ -2173,5 +2157,39 @@ mod tests {
                 assert_eq!(got, want, "step {step}: range scan");
             }
         }
+    }
+
+    #[test]
+    fn a_header_with_a_root_but_no_first_leaf_fails_a_full_scan() {
+        let key_len = 8usize;
+        let (bpm, _tmp) = crate::testing::bpm(8);
+        let tree = BPlusTree::new("idx".to_string(), key_len as u32, bpm.clone()).unwrap();
+        let rid = RecordId {
+            page_id: pid(1),
+            slot_id: 0,
+        };
+        tree.insert(make_key(1, key_len), IndexValue::IndexValue(rid))
+            .unwrap();
+        let mut header = tree.read_header().unwrap();
+        header.first_leaf_id = None;
+        header
+            .encode(bpm.write_page(tree.header_page_id).unwrap().data_mut())
+            .unwrap();
+
+        let err = tree
+            .scan((Bound::Unbounded, Bound::Unbounded))
+            .err()
+            .unwrap();
+        assert!(
+            matches!(
+                err,
+                IndexError::Structure("the header names a root but no first leaf")
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            tree.search(&make_key(1, key_len)).unwrap().is_some(),
+            "a keyed lookup goes through the root and still works"
+        );
     }
 }

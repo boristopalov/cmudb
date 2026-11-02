@@ -1,6 +1,7 @@
 //! Buffer pool and table heap benchmarks. Run with `cargo bench --features bench --bench storage`.
 
 use cmudb::buffer_pool::BufferPoolManager;
+use cmudb::ids::PageId;
 use cmudb::table_heap::{RecordId, TableHeap, Tuple};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use rand::seq::SliceRandom;
@@ -16,14 +17,9 @@ const COLD_PAGES: usize = POOL_FRAMES * 4;
 const TUPLE_BYTES: usize = 100;
 const HEAP_ROWS: usize = 10_000;
 
-fn allocate_pages(bpm: &Arc<BufferPoolManager>, count: usize) -> Vec<usize> {
+fn allocate_pages(bpm: &Arc<BufferPoolManager>, count: usize) -> Vec<PageId> {
     (0..count)
-        .map(|_| {
-            bpm.new_page()
-                .expect("new page")
-                .page_id()
-                .expect("page id")
-        })
+        .map(|_| bpm.new_page().expect("new page").page_id())
         .collect()
 }
 
@@ -133,7 +129,7 @@ fn table_heap(c: &mut Criterion) {
 
     let (heap, rids, _bpm, _dir) = filled_heap(HEAP_ROWS);
     assert_heap_holds(&heap, &rids);
-    let pages: HashSet<u32> = rids.iter().map(|r| r.page_id).collect();
+    let pages: HashSet<PageId> = rids.iter().map(|r| r.page_id).collect();
     assert!(
         pages.len() > POOL_FRAMES,
         "the heap spans {} pages, more than the {POOL_FRAMES}-frame pool, so scans and gets evict",

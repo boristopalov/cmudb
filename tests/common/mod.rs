@@ -7,6 +7,7 @@ pub mod seed;
 use cmudb::catalog::Value;
 use cmudb::concurrency::TxnError;
 use cmudb::concurrency::mvcc::MvccError;
+use cmudb::ids::TableOid;
 use cmudb::parser::BinderError;
 use cmudb::processor::executor::ExecutorError;
 use cmudb::processor::plan::{
@@ -110,7 +111,7 @@ impl Db {
         plans.remove(0)
     }
 
-    pub fn table_oid(&self, name: &str) -> u32 {
+    pub fn table_oid(&self, name: &str) -> TableOid {
         self.db.catalog().table_oid(name).expect("table")
     }
 }

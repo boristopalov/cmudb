@@ -3,6 +3,7 @@ use std::ops::Bound;
 
 use crate::catalog::Value;
 use crate::catalog::{Catalog, DataType, Schema};
+use crate::ids::{IndexOid, TableOid};
 use crate::parser::{
     BoundCreateIndex, BoundCreateTable, BoundDelete, BoundDropIndex, BoundDropTable, BoundInsert,
     BoundJoin, BoundSelect, BoundStatement, BoundUpdate, BoundValues, BoundWindow, Scope,
@@ -391,7 +392,7 @@ impl<'a> Planner<'a> {
         }
     }
 
-    fn index_for_cols(&self, table_oid: u32, col_idxs: &[usize]) -> Option<u32> {
+    fn index_for_cols(&self, table_oid: TableOid, col_idxs: &[usize]) -> Option<IndexOid> {
         self.catalog
             .get_table_indexes(table_oid)
             .ok()?
@@ -861,7 +862,7 @@ mod tests {
 
     fn table_scope(side: Side, cols: &[&str]) -> TableScope {
         TableScope {
-            oid: 0,
+            oid: TableOid(0),
             side,
             first_col: 0,
             schema: int_schema(cols),

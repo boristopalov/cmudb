@@ -12,35 +12,17 @@
 
 use crate::buf::{get_u32_le, get_u64_le, put_u32_le, put_u64_le};
 use crate::disk::PAGE_SIZE;
+use crate::ids::RecordId;
 use crate::index::b_plus_page::{
-    HEADER_FIXED_HEADER_BYTES, INTERNAL_FIXED_HEADER_BYTES, INVALID_PAGE_ID,
-    LEAF_FIXED_HEADER_BYTES, LeafPage, NUM_TOMBSTONES, PAGE_ID_ENCODED_BYTES, PageId,
-    RECORD_ID_ENCODED_BYTES, TOMBSTONE_SLOT_ENCODED_BYTES,
+    HEADER_FIXED_HEADER_BYTES, INTERNAL_FIXED_HEADER_BYTES, LEAF_FIXED_HEADER_BYTES, LeafPage,
+    NUM_TOMBSTONES, PAGE_ID_ENCODED_BYTES, PageId, RECORD_ID_ENCODED_BYTES,
+    TOMBSTONE_SLOT_ENCODED_BYTES,
 };
 use crate::index::page_codec::{
-    COMMON_HEADER_BYTES, KIND_HEADER, KIND_INTERNAL, KIND_LEAF, PageCodecError, decode_record_id,
-    expect_common_header, peek_common_header, put_common_header,
+    COMMON_HEADER_BYTES, KIND_HEADER, KIND_INTERNAL, KIND_LEAF, PageCodecError, decode_page_id,
+    decode_record_id, encode_page_id, expect_common_header, peek_common_header, put_common_header,
 };
-use crate::table_heap::RecordId;
 use std::cmp::Ordering;
-
-#[inline]
-fn page_id_from_raw(raw: u64) -> PageId {
-    if raw == u64::MAX {
-        INVALID_PAGE_ID
-    } else {
-        raw as PageId
-    }
-}
-
-#[inline]
-fn page_id_to_raw(page_id: PageId) -> u64 {
-    if page_id == INVALID_PAGE_ID {
-        u64::MAX
-    } else {
-        page_id as u64
-    }
-}
 
 fn check_len(buf: &[u8]) -> Result<(), PageCodecError> {
     if buf.len() != PAGE_SIZE {
@@ -95,12 +77,14 @@ impl<B: AsRef<[u8]>> HeaderPageView<B> {
         get_u32_le(self.buf.as_ref(), HDR_KEY_LEN_OFF)
     }
 
-    pub fn root_page_id(&self) -> PageId {
-        page_id_from_raw(get_u64_le(self.buf.as_ref(), HDR_ROOT_OFF))
+    /// The tree's root page, or `None` for an empty tree.
+    pub fn root_page_id(&self) -> Result<Option<PageId>, PageCodecError> {
+        decode_page_id(get_u64_le(self.buf.as_ref(), HDR_ROOT_OFF))
     }
 
-    pub fn first_leaf_id(&self) -> PageId {
-        page_id_from_raw(get_u64_le(self.buf.as_ref(), HDR_FIRST_LEAF_OFF))
+    /// The tree's leftmost leaf, or `None` for an empty tree.
+    pub fn first_leaf_id(&self) -> Result<Option<PageId>, PageCodecError> {
+        decode_page_id(get_u64_le(self.buf.as_ref(), HDR_FIRST_LEAF_OFF))
     }
 }
 
@@ -113,20 +97,20 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> HeaderPageView<B> {
         b[..HEADER_FIXED_HEADER_BYTES].fill(0);
         put_common_header(b, KIND_HEADER);
         put_u32_le(b, HDR_KEY_LEN_OFF, key_len);
-        put_u64_le(b, HDR_ROOT_OFF, page_id_to_raw(INVALID_PAGE_ID));
-        put_u64_le(b, HDR_FIRST_LEAF_OFF, page_id_to_raw(INVALID_PAGE_ID));
+        put_u64_le(b, HDR_ROOT_OFF, encode_page_id(None));
+        put_u64_le(b, HDR_FIRST_LEAF_OFF, encode_page_id(None));
         Ok(Self { buf })
     }
 
-    pub fn set_root_page_id(&mut self, page_id: PageId) {
-        put_u64_le(self.buf.as_mut(), HDR_ROOT_OFF, page_id_to_raw(page_id));
+    pub fn set_root_page_id(&mut self, page_id: Option<PageId>) {
+        put_u64_le(self.buf.as_mut(), HDR_ROOT_OFF, encode_page_id(page_id));
     }
 
-    pub fn set_first_leaf_id(&mut self, page_id: PageId) {
+    pub fn set_first_leaf_id(&mut self, page_id: Option<PageId>) {
         put_u64_le(
             self.buf.as_mut(),
             HDR_FIRST_LEAF_OFF,
-            page_id_to_raw(page_id),
+            encode_page_id(page_id),
         );
     }
 }
@@ -223,12 +207,13 @@ impl<B: AsRef<[u8]>> InternalPageView<B> {
         get_u32_le(self.bytes(), INTERNAL_CHILD_COUNT_OFF) as usize
     }
 
+    /// Child `idx`, or `None` past the last child or for a child that names no page.
     pub fn child(&self, idx: usize) -> Option<PageId> {
         if idx >= self.child_count() {
             return None;
         }
         let off = INTERNAL_FIXED_HEADER_BYTES + idx * PAGE_ID_ENCODED_BYTES;
-        Some(page_id_from_raw(get_u64_le(self.bytes(), off)))
+        decode_page_id(get_u64_le(self.bytes(), off)).ok().flatten()
     }
 
     /// Raw bytes of key `idx`. Panics if `idx >= size()`.
@@ -375,8 +360,9 @@ impl<B: AsRef<[u8]>> LeafPageView<B> {
         self.max_size() / 2
     }
 
-    pub fn next_leaf_id(&self) -> PageId {
-        page_id_from_raw(get_u64_le(self.bytes(), LEAF_NEXT_LEAF_OFF))
+    /// The next leaf to the right, or `None` for the last leaf.
+    pub fn next_leaf_id(&self) -> Result<Option<PageId>, PageCodecError> {
+        decode_page_id(get_u64_le(self.bytes(), LEAF_NEXT_LEAF_OFF))
     }
 
     pub fn is_full(&self) -> bool {
@@ -495,7 +481,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> LeafPageView<B> {
         let off = self.entry_off(idx);
         let b = self.bytes_mut();
         b[off..off + key_len].copy_from_slice(key);
-        put_u64_le(b, off + key_len, u64::from(rid.page_id));
+        put_u64_le(b, off + key_len, u64::from(rid.page_id.get()));
         put_u64_le(b, off + key_len + 8, u64::from(rid.slot_id));
     }
 
@@ -622,12 +608,13 @@ mod tests {
     use super::*;
     use crate::catalog::index_schema::IndexKey;
     use crate::index::b_plus_page::{HeaderPage, InternalPage};
+    use crate::testing::pid;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
     fn rid(n: u32) -> RecordId {
         RecordId {
-            page_id: n,
+            page_id: pid(n),
             slot_id: n.wrapping_mul(7),
         }
     }
@@ -642,16 +629,16 @@ mod tests {
     fn header_view_matches_codec() {
         let mut buf = [0xffu8; PAGE_SIZE];
         let mut view = HeaderPageView::init(&mut buf[..], 8).unwrap();
-        view.set_root_page_id(42);
+        view.set_root_page_id(Some(pid(42)));
         let decoded = HeaderPage::decode(&buf).unwrap();
-        assert_eq!(decoded.root_page_id, 42);
-        assert_eq!(decoded.first_leaf_id, INVALID_PAGE_ID);
+        assert_eq!(decoded.root_page_id, Some(pid(42)));
+        assert_eq!(decoded.first_leaf_id, None);
         assert_eq!(decoded.key_len, 8);
 
         let mut expected = [0u8; PAGE_SIZE];
         HeaderPage {
-            root_page_id: 42,
-            first_leaf_id: INVALID_PAGE_ID,
+            root_page_id: Some(pid(42)),
+            first_leaf_id: None,
             key_len: 8,
         }
         .encode(&mut expected)
@@ -662,8 +649,8 @@ mod tests {
         );
 
         let view = HeaderPageView::new(&expected[..]).unwrap();
-        assert_eq!(view.root_page_id(), 42);
-        assert_eq!(view.first_leaf_id(), INVALID_PAGE_ID);
+        assert_eq!(view.root_page_id(), Ok(Some(pid(42))));
+        assert_eq!(view.first_leaf_id(), Ok(None));
         assert_eq!(view.key_len(), 8);
     }
 
@@ -686,7 +673,7 @@ mod tests {
     fn internal_view_matches_owned_page() {
         let key_len = 2u32;
         let mut internal = InternalPage::new(10);
-        internal.children = vec![11, 22, 33, INVALID_PAGE_ID];
+        internal.children = vec![pid(11), pid(22), pid(33), pid(44)];
         internal.keys = vec![
             IndexKey(vec![1, 2]),
             IndexKey(vec![3, 4]),
@@ -733,13 +720,13 @@ mod tests {
         for k in [10u8, 20, 30, 40, 50] {
             leaf.insert(IndexKey(vec![k]), rid(k as u32)).unwrap();
         }
-        leaf.next_leaf_id = 77;
+        leaf.next_leaf_id = Some(pid(77));
         leaf.remove_key(&IndexKey(vec![30])).unwrap();
         let buf = encode_leaf(&leaf, key_len);
 
         let view = LeafPageView::new(&buf[..], key_len).unwrap();
         assert_eq!(view.size(), 5);
-        assert_eq!(view.next_leaf_id(), 77);
+        assert_eq!(view.next_leaf_id(), Ok(Some(pid(77))));
         assert_eq!(view.tombstone_count(), 1);
         assert!(view.is_tombstoned(2));
         for probe in 0u8..60 {
@@ -823,7 +810,7 @@ mod tests {
     fn differential(key_len: u32, max_size: u32, tombstones: u32, seed: u64, ops: usize) {
         let mut rng = StdRng::seed_from_u64(seed);
         let mut owned = LeafPage::new(max_size, tombstones);
-        owned.next_leaf_id = 5;
+        owned.next_leaf_id = Some(pid(5));
         let mut buf = encode_leaf(&owned, key_len);
         let owned_with_persisted_tombstone_capacity = LeafPage::decode(&buf[..], key_len).unwrap();
         owned = owned_with_persisted_tombstone_capacity;

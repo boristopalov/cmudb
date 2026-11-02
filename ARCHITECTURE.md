@@ -28,6 +28,8 @@ and on close or drop. There is no WAL (BOR-71): the buffer pool also writes page
 them, so a crash or kill between those writes can leave the file unopenable or inconsistent.
 Opening a table whose page links point past the recorded allocation fails with
 `TableHeapError::UnallocatedPageLink`. Page `id` lives at byte `id * PAGE_SIZE` of the data file.
+Page, frame, table, index and record ids are the newtypes in `src/ids.rs`; a missing page
+link is `Option<PageId>`, and only the encode/decode helpers there know its on-disk sentinel.
 
 `cmudb::Database` (`src/database.rs`) runs the whole pipeline and
 owns the session's transaction block (`BEGIN`, `COMMIT`, `ROLLBACK`, autocommit). It returns a

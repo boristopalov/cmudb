@@ -34,7 +34,7 @@ fn growth_preserves_rids_and_order_with_interleaved_pages_and_eviction() {
         let rid = heap.insert(&tuple).unwrap();
         expected.push((rid, tuple.data));
         let mut other = bpm.new_page().unwrap();
-        unrelated.push(other.page_id().unwrap());
+        unrelated.push(other.page_id());
         other.data_mut().fill(0xa5);
     }
     assert!(
@@ -74,11 +74,11 @@ fn exact_fit_accounts_for_header_and_each_slot_including_empty_tuples() {
     let slots = (PAGE_SIZE - TablePageRef::HEADER_SIZE) / TablePageRef::SLOT_SIZE;
     for slot in 0..slots {
         let rid = heap.insert(&Tuple { data: vec![] }).unwrap();
-        assert_eq!(rid.page_id as usize, heap.first_page_id);
+        assert_eq!(rid.page_id, heap.first_page_id);
         assert_eq!(rid.slot_id as usize, slot);
     }
     let next = heap.insert(&Tuple { data: vec![] }).unwrap();
-    assert_ne!(next.page_id as usize, heap.first_page_id);
+    assert_ne!(next.page_id, heap.first_page_id);
     assert_eq!(next.slot_id, 0);
     assert_eq!(rows(heap.iter()).len(), slots + 1);
 }

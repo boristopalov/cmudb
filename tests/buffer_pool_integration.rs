@@ -4,6 +4,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use cmudb::buffer_pool::{BpmError, BufferPoolManager};
+use cmudb::testing::pid;
 use common::seed::{Stream, stream_rng, with_seed};
 use parking_lot::RwLock;
 use rand::Rng;
@@ -20,7 +21,7 @@ fn write_flush_read_roundtrip() {
         let mut page = bpm.new_page().expect("new page");
         page.data_mut()[0..4].copy_from_slice(&[1, 2, 3, 4]);
     }
-    let read = bpm.read_page(0).expect("read flushed page");
+    let read = bpm.read_page(pid(0)).expect("read flushed page");
     assert_eq!(&read.data()[0..4], &[1, 2, 3, 4]);
 }
 
@@ -34,7 +35,7 @@ fn cached_then_io_read_paths() {
     }
 
     {
-        let cached = bpm.read_page(0).unwrap();
+        let cached = bpm.read_page(pid(0)).unwrap();
         assert_eq!(&cached.data()[0..4], &[9, 9, 9, 9]);
     }
 
@@ -42,7 +43,7 @@ fn cached_then_io_read_paths() {
     drop(evicts_page_0);
 
     {
-        let reread = bpm.read_page(0).unwrap();
+        let reread = bpm.read_page(pid(0)).unwrap();
         assert_eq!(&reread.data()[0..4], &[9, 9, 9, 9]);
     }
 }
@@ -53,20 +54,20 @@ fn no_free_frame_when_all_pinned() {
     let mut pinned = bpm.new_page().expect("pin the only frame");
     pinned.data_mut()[0] = 42;
 
-    let err = bpm.read_page(1).unwrap_err();
+    let err = bpm.read_page(pid(1)).unwrap_err();
     assert!(
         matches!(err, BpmError::NoFreeFrame),
         "unexpected error: {err}"
     );
     assert!(matches!(
-        bpm.write_page(1).unwrap_err(),
+        bpm.write_page(pid(1)).unwrap_err(),
         BpmError::NoFreeFrame
     ));
     assert!(matches!(bpm.new_page().unwrap_err(), BpmError::NoFreeFrame));
 
     drop(pinned);
     drop(bpm.new_page().expect("released frame should be evictable"));
-    let reread = bpm.read_page(0).expect("evicted page should persist");
+    let reread = bpm.read_page(pid(0)).expect("evicted page should persist");
     assert_eq!(reread.data()[0], 42);
 }
 
@@ -78,8 +79,8 @@ fn frame_stays_pinned_until_last_read_guard_drops() {
         page.data_mut()[0] = 7;
     }
 
-    let first = bpm.read_page(0).unwrap();
-    let second = bpm.read_page(0).unwrap();
+    let first = bpm.read_page(pid(0)).unwrap();
+    let second = bpm.read_page(pid(0)).unwrap();
     assert!(matches!(bpm.new_page().unwrap_err(), BpmError::NoFreeFrame));
 
     drop(first);
@@ -91,7 +92,7 @@ fn frame_stays_pinned_until_last_read_guard_drops() {
         bpm.new_page()
             .expect("last read guard should release frame"),
     );
-    let reread = bpm.read_page(0).expect("evicted page should persist");
+    let reread = bpm.read_page(pid(0)).expect("evicted page should persist");
     assert_eq!(reread.data()[0], 7);
 }
 
@@ -99,14 +100,14 @@ fn frame_stays_pinned_until_last_read_guard_drops() {
 fn page_not_found_when_not_inserted() {
     let (bpm, _tmp) = make_bpm(1);
 
-    let err = bpm.read_page(1).unwrap_err();
+    let err = bpm.read_page(pid(1)).unwrap_err();
     assert!(
         matches!(err, BpmError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound),
         "unexpected error: {err}"
     );
 
     drop(bpm.new_page().unwrap());
-    let err = bpm.read_page(1).unwrap_err();
+    let err = bpm.read_page(pid(1)).unwrap_err();
     assert!(
         matches!(err, BpmError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound),
         "unexpected error: {err}"
@@ -128,7 +129,9 @@ fn eviction_flushes_and_clears_mapping() {
     }
 
     {
-        let reread = bpm.read_page(0).expect("page 0 re-read after eviction");
+        let reread = bpm
+            .read_page(pid(0))
+            .expect("page 0 re-read after eviction");
         assert_eq!(&reread.data()[0..3], &[5, 6, 7]);
     }
 }
@@ -138,7 +141,7 @@ fn io_error_restores_free_frame() {
     let (bpm, _tmp) = make_bpm(1);
 
     assert!(matches!(
-        bpm.read_page(99).unwrap_err(),
+        bpm.read_page(pid(99)).unwrap_err(),
         BpmError::Io(_) | BpmError::ChannelClosed
     ));
 
@@ -168,7 +171,7 @@ fn concurrent_writer_and_blocked_reader_respect_pins() {
             writer_unpinned.clone(),
         );
         thread::spawn(move || {
-            let mut page = bpm.write_page(0).unwrap();
+            let mut page = bpm.write_page(pid(0)).unwrap();
             page.data_mut()[0] = 22;
             pinned.wait();
             tried.wait();
@@ -200,13 +203,13 @@ fn concurrent_writer_and_blocked_reader_respect_pins() {
         bpm.new_page()
             .expect("page 0 is unpinned and can be evicted"),
     );
-    let reread = bpm.read_page(0).unwrap();
+    let reread = bpm.read_page(pid(0)).unwrap();
     assert_eq!(reread.data()[0], 22, "write survives eviction");
 }
 
 fn bpm_read_missing_page(bpm: &Arc<BufferPoolManager>) -> BpmError {
     const NEVER_ALLOCATED: usize = 1;
-    bpm.read_page(NEVER_ALLOCATED).unwrap_err()
+    bpm.read_page(pid(NEVER_ALLOCATED)).unwrap_err()
 }
 
 #[test]
@@ -229,7 +232,7 @@ fn duplicate_miss_does_not_leak_frames() {
             thread::spawn(move || {
                 both_started.wait();
                 loop {
-                    match bpm.read_page(0) {
+                    match bpm.read_page(pid(0)) {
                         Ok(p) => return p.data()[0],
                         Err(BpmError::NoFreeFrame) => thread::yield_now(),
                         Err(e) => panic!("unexpected error on concurrent miss: {e}"),
@@ -266,7 +269,7 @@ fn test_eviction() {
             for i in 0..NUM_PAGES {
                 let val = 42;
                 {
-                    match bpm_clone.write_page(i) {
+                    match bpm_clone.write_page(pid(i)) {
                         Ok(mut p) => {
                             p.data_mut()[0] = val;
                         }
@@ -321,7 +324,7 @@ fn run_buffer_pool_soak(seed: u64) {
                 let page_id = rng.random_range(0..NUM_PAGES);
                 let should_read = rng.random_bool(0.5);
                 if should_read {
-                    match bpm.read_page(page_id) {
+                    match bpm.read_page(pid(page_id)) {
                         Ok(page) => {
                             let expected_val = *expected[page_id].read();
                             assert_eq!(page.data()[0], expected_val);
@@ -330,7 +333,7 @@ fn run_buffer_pool_soak(seed: u64) {
                         Err(e) => panic!("unexpected read error: {e}"),
                     }
                 } else {
-                    match bpm.write_page(page_id) {
+                    match bpm.write_page(pid(page_id)) {
                         Ok(mut page) => {
                             let mut expected_val = expected[page_id].write();
                             let new_val = expected_val.wrapping_add(1).wrapping_add(t as u8);
@@ -350,13 +353,13 @@ fn run_buffer_pool_soak(seed: u64) {
         h.join().unwrap();
     }
 
-    for pid in 0..NUM_PAGES {
-        let expected_val = *expected[pid].read();
+    for page_id in 0..NUM_PAGES {
+        let expected_val = *expected[page_id].read();
         let page_val = {
-            let page = bpm.read_page(pid).unwrap();
+            let page = bpm.read_page(pid(page_id)).unwrap();
             page.data()[0]
         };
-        assert_eq!(page_val, expected_val, "page {} mismatch", pid);
+        assert_eq!(page_val, expected_val, "page {} mismatch", page_id);
     }
 
     drop(
@@ -375,7 +378,7 @@ fn read_hot_page(
     bpm: &Arc<BufferPoolManager>,
     page_id: usize,
 ) -> Option<cmudb::buffer_pool::PageRef<'_>> {
-    match bpm.read_page(page_id) {
+    match bpm.read_page(pid(page_id)) {
         Ok(page) => {
             assert_eq!(
                 page.data()[..8],

@@ -1,6 +1,7 @@
 use crate::disk;
 use crate::disk::DiskRequest;
 use crate::disk::PAGE_SIZE;
+use crate::ids::{FrameId, PageId, PageIdOutOfRange};
 use crate::replacer;
 use log::{info, warn};
 #[cfg(feature = "deadlock_detection")]
@@ -28,46 +29,50 @@ type Page = [u8; disk::PAGE_SIZE];
 
 #[derive(Debug)]
 struct FrameHeader {
-    frame_id: usize,
-    page_id: Option<usize>,
+    frame_id: FrameId,
+    page_id: Option<PageId>,
     buf: Page,
     dirty: AtomicBool,
 }
 
 #[derive(Debug)]
 struct EvictedPage {
-    page_id: usize,
+    page_id: PageId,
     data: Page,
 }
 
 #[derive(Debug)]
 struct FrameReservation {
-    frame_id: usize,
+    frame_id: FrameId,
     evicted: Option<EvictedPage>,
 }
 
 #[derive(Debug)]
 struct Meta {
     replacer: replacer::ArcReplacer,
-    free_list: Vec<usize>,
-    page_table: HashMap<usize, usize>,
+    free_list: Vec<FrameId>,
+    page_table: HashMap<PageId, FrameId>,
     /// Pins per frame. Kept beside the replacer under one lock, so a frame is marked
     /// evictable only while nothing pins it.
     pins: Vec<u32>,
     /// One past the highest page id handed out.
     next_page_id: usize,
     /// Deleted page ids below `next_page_id`, handed out again lowest first.
-    free_page_ids: BTreeSet<usize>,
+    free_page_ids: BTreeSet<PageId>,
 }
 
 impl Meta {
-    fn allocate_page_id(&mut self) -> usize {
+    fn allocate_page_id(&mut self) -> Result<PageId, BpmError> {
         if let Some(page_id) = self.free_page_ids.pop_first() {
-            return page_id;
+            return Ok(page_id);
         }
-        let page_id = self.next_page_id;
+        let page_id = PageId::try_from(self.next_page_id).map_err(BpmError::PageIdsExhausted)?;
         self.next_page_id += 1;
-        page_id
+        Ok(page_id)
+    }
+
+    fn pins(&mut self, frame_id: FrameId) -> &mut u32 {
+        &mut self.pins[frame_id.0]
     }
 }
 
@@ -76,7 +81,7 @@ impl Meta {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageAllocation {
     pub next_page_id: usize,
-    pub free_page_ids: Vec<usize>,
+    pub free_page_ids: Vec<PageId>,
 }
 
 #[derive(Debug)]
@@ -114,18 +119,20 @@ fn start_deadlock_detector() {
 #[derive(Debug)]
 pub struct PageRef<'a> {
     frame_guard: ManuallyDrop<RwLockReadGuard<'a, FrameHeader>>,
-    frame_id: usize,
+    frame_id: FrameId,
+    page_id: PageId,
     bpm: Arc<BufferPoolManager>,
 }
 
 #[derive(Debug)]
 pub struct PageMut<'a> {
     frame_guard: ManuallyDrop<RwLockWriteGuard<'a, FrameHeader>>,
+    page_id: PageId,
     bpm: Arc<BufferPoolManager>,
 }
 
 impl<'a> PageRef<'a> {
-    pub fn frame_id(&self) -> usize {
+    pub fn frame_id(&self) -> FrameId {
         self.frame_id
     }
 
@@ -133,8 +140,8 @@ impl<'a> PageRef<'a> {
         &self.frame_guard.buf
     }
 
-    pub fn page_id(&self) -> Option<usize> {
-        self.frame_guard.page_id
+    pub fn page_id(&self) -> PageId {
+        self.page_id
     }
 }
 
@@ -148,12 +155,12 @@ impl<'a> Drop for PageRef<'a> {
 }
 
 impl<'a> PageMut<'a> {
-    pub fn frame_id(&self) -> usize {
+    pub fn frame_id(&self) -> FrameId {
         self.frame_guard.frame_id
     }
 
-    pub fn page_id(&self) -> Option<usize> {
-        self.frame_guard.page_id
+    pub fn page_id(&self) -> PageId {
+        self.page_id
     }
 
     pub fn data(&self) -> &[u8] {
@@ -179,25 +186,27 @@ pub enum BpmError {
     NoFreeFrame,
     /// The frame id is past the end of the pool's frames.
     FrameOutOfRange {
-        frame_id: usize,
+        frame_id: FrameId,
     },
     /// A flush asked for a page that is not in any frame.
     PageNotCached {
-        page_id: usize,
+        page_id: PageId,
     },
     ChannelClosed,
     Io(io::Error),
     FrameInUse,
     /// A delete asked for a page that a live guard still pins.
     PagePinned {
-        page_id: usize,
+        page_id: PageId,
     },
     /// A delete asked for a page that is in no frame and not on disk.
     NoSuchPage {
-        page_id: usize,
+        page_id: PageId,
     },
     /// [`BufferPoolManager::resume_allocation`] on a pool that already handed out pages.
     PoolInUse,
+    /// Every page id up to [`PageId::MAX`] is in use.
+    PageIdsExhausted(PageIdOutOfRange),
 }
 
 impl fmt::Display for BpmError {
@@ -226,6 +235,7 @@ impl fmt::Display for BpmError {
             BpmError::PoolInUse => {
                 write!(f, "the buffer pool already handed out pages")
             }
+            BpmError::PageIdsExhausted(e) => write!(f, "no page id left to hand out: {e}"),
         }
     }
 }
@@ -262,12 +272,12 @@ impl BufferPoolManager {
 
         for i in 0..num_frames {
             frames.push(RwLock::new(FrameHeader {
-                frame_id: i,
+                frame_id: FrameId(i),
                 page_id: None,
                 buf: [0u8; disk::PAGE_SIZE],
                 dirty: AtomicBool::new(false),
             }));
-            free_list.push(i);
+            free_list.push(FrameId(i));
         }
 
         Self {
@@ -289,18 +299,25 @@ impl BufferPoolManager {
         let mut meta = self.meta.lock();
         let reservation = self.get_free_frame(&mut meta)?;
         let frame_id = reservation.frame_id;
-        let page_id = meta.allocate_page_id();
+        let page_id = match meta.allocate_page_id() {
+            Ok(page_id) => page_id,
+            Err(e) => {
+                self.restore_frame(&mut meta, reservation);
+                return Err(e);
+            }
+        };
         let mut frame = self.frame(frame_id)?.write();
         frame.clear();
         frame.page_id = Some(page_id);
         frame.dirty.store(true, Ordering::Release);
-        meta.pins[frame_id] = 1;
+        *meta.pins(frame_id) = 1;
         meta.page_table.insert(page_id, frame_id);
         meta.replacer.record_access(frame_id, page_id);
         meta.replacer.set_evictable(frame_id, false);
 
         Ok(PageMut {
             frame_guard: ManuallyDrop::new(frame),
+            page_id,
             bpm: Arc::clone(self),
         })
     }
@@ -309,10 +326,10 @@ impl BufferPoolManager {
     /// frees its slot on disk for a later page. Fails with [`BpmError::PagePinned`] while a
     /// guard holds the page, and with [`BpmError::NoSuchPage`] for a page that is unallocated
     /// or already deleted. [`BufferPoolManager::new_page`] hands the id out again.
-    pub(crate) fn delete_page(&self, page_id: usize) -> Result<(), BpmError> {
+    pub(crate) fn delete_page(&self, page_id: PageId) -> Result<(), BpmError> {
         let mut meta = self.meta.lock();
         let resident = match meta.page_table.get(&page_id).copied() {
-            Some(frame_id) if meta.pins[frame_id] > 0 => {
+            Some(frame_id) if meta.pins[frame_id.0] > 0 => {
                 return Err(BpmError::PagePinned { page_id });
             }
             Some(frame_id) => {
@@ -343,7 +360,7 @@ impl BufferPoolManager {
         meta.next_page_id - meta.free_page_ids.len()
     }
 
-    pub fn write_page(self: &Arc<Self>, page_id: usize) -> PageMutResult<'_> {
+    pub fn write_page(self: &Arc<Self>, page_id: PageId) -> PageMutResult<'_> {
         let mut meta = loop {
             let mut meta = self.meta.lock();
             let Some(frame_id) = meta.page_table.get(&page_id).copied() else {
@@ -354,7 +371,7 @@ impl BufferPoolManager {
                 Self::tid()
             );
             meta.replacer.record_access(frame_id, page_id);
-            meta.pins[frame_id] += 1;
+            meta.pins[frame_id.0] += 1;
             meta.replacer.set_evictable(frame_id, false);
             drop(meta);
 
@@ -368,6 +385,7 @@ impl BufferPoolManager {
             frame.dirty.store(true, Ordering::Release);
             return Ok(PageMut {
                 frame_guard: ManuallyDrop::new(frame),
+                page_id,
                 bpm: Arc::clone(self),
             });
         };
@@ -379,11 +397,12 @@ impl BufferPoolManager {
         let frame = self.load_into_free_frame(&mut meta, page_id, true)?;
         Ok(PageMut {
             frame_guard: ManuallyDrop::new(frame),
+            page_id,
             bpm: Arc::clone(self),
         })
     }
 
-    pub fn read_page(self: &Arc<Self>, page_id: usize) -> PageRefResult<'_> {
+    pub fn read_page(self: &Arc<Self>, page_id: PageId) -> PageRefResult<'_> {
         info!("tid={} read_page page_id={page_id}", Self::tid());
         let mut meta = loop {
             let mut meta = self.meta.lock();
@@ -395,7 +414,7 @@ impl BufferPoolManager {
                 Self::tid()
             );
             meta.replacer.record_access(frame_id, page_id);
-            meta.pins[frame_id] += 1;
+            meta.pins[frame_id.0] += 1;
             meta.replacer.set_evictable(frame_id, false);
             drop(meta);
 
@@ -409,6 +428,7 @@ impl BufferPoolManager {
             return Ok(PageRef {
                 frame_guard: ManuallyDrop::new(frame),
                 frame_id,
+                page_id,
                 bpm: Arc::clone(self),
             });
         };
@@ -419,20 +439,21 @@ impl BufferPoolManager {
         Ok(PageRef {
             frame_guard: ManuallyDrop::new(RwLockWriteGuard::downgrade(frame)),
             frame_id,
+            page_id,
             bpm: Arc::clone(self),
         })
     }
 
-    fn frame(&self, frame_id: usize) -> Result<&RwLock<FrameHeader>, BpmError> {
+    fn frame(&self, frame_id: FrameId) -> Result<&RwLock<FrameHeader>, BpmError> {
         self.frames
-            .get(frame_id)
+            .get(frame_id.0)
             .ok_or(BpmError::FrameOutOfRange { frame_id })
     }
 
     fn load_into_free_frame(
         &self,
         meta: &mut Meta,
-        page_id: usize,
+        page_id: PageId,
         dirty: bool,
     ) -> Result<RwLockWriteGuard<'_, FrameHeader>, BpmError> {
         let reservation = self.get_free_frame(meta)?;
@@ -454,7 +475,7 @@ impl BufferPoolManager {
 
         frame.buf = *page_data;
         frame.page_id = Some(page_id);
-        meta.pins[frame_id] = 1;
+        *meta.pins(frame_id) = 1;
         frame.dirty.store(dirty, Ordering::Release);
         meta.page_table.insert(page_id, frame_id);
         meta.replacer.record_access(frame_id, page_id);
@@ -462,18 +483,18 @@ impl BufferPoolManager {
         Ok(frame)
     }
 
-    fn read_from_disk(&self, page_id: usize) -> Result<disk::PageData, BpmError> {
+    fn read_from_disk(&self, page_id: PageId) -> Result<disk::PageData, BpmError> {
         self.run_disk_request(page_id, false, Box::new([0u8; PAGE_SIZE]))
     }
 
-    fn write_to_disk(&self, page_id: usize, page: &Page) -> Result<(), BpmError> {
+    fn write_to_disk(&self, page_id: PageId, page: &Page) -> Result<(), BpmError> {
         self.run_disk_request(page_id, true, Box::new(*page))
             .map(drop)
     }
 
     fn run_disk_request(
         &self,
-        page_id: usize,
+        page_id: PageId,
         is_write: bool,
         data: disk::PageData,
     ) -> Result<disk::PageData, BpmError> {
@@ -520,7 +541,7 @@ impl BufferPoolManager {
             Self::tid()
         );
 
-        if meta.pins[frame_id] > 0 {
+        if meta.pins[frame_id.0] > 0 {
             warn!(
                 "tid={} get_free_frame: attempted to evict pinned frame_id={frame_id}",
                 Self::tid()
@@ -590,11 +611,11 @@ impl BufferPoolManager {
         meta.replacer.set_evictable(frame_id, true);
     }
 
-    fn release_pin(&self, frame_id: usize) {
+    fn release_pin(&self, frame_id: FrameId) {
         let mut meta = self.meta.lock();
-        match meta.pins[frame_id].checked_sub(1) {
+        match meta.pins(frame_id).checked_sub(1) {
             Some(remaining) => {
-                meta.pins[frame_id] = remaining;
+                *meta.pins(frame_id) = remaining;
                 if remaining == 0 {
                     meta.replacer.set_evictable(frame_id, true);
                 }
@@ -611,7 +632,7 @@ impl BufferPoolManager {
     }
 
     /// Reports whether `page_id` currently sits in a frame, so a read of it would not touch disk.
-    pub fn is_resident(&self, page_id: usize) -> bool {
+    pub fn is_resident(&self, page_id: PageId) -> bool {
         self.meta.lock().page_table.contains_key(&page_id)
     }
 
@@ -633,9 +654,9 @@ impl BufferPoolManager {
 
     /// Whether `page_id` was handed out by [`BufferPoolManager::new_page`] and not deleted
     /// since.
-    pub fn page_is_allocated(&self, page_id: usize) -> bool {
+    pub fn page_is_allocated(&self, page_id: PageId) -> bool {
         let meta = self.meta.lock();
-        page_id < meta.next_page_id && !meta.free_page_ids.contains(&page_id)
+        page_id.as_usize() < meta.next_page_id && !meta.free_page_ids.contains(&page_id)
     }
 
     /// Resumes handing out page ids where `allocation` left off, for a pool over a data file
@@ -681,7 +702,7 @@ impl BufferPoolManager {
         Ok(written)
     }
 
-    pub fn flush_page(&self, page_id: usize) -> Result<(), BpmError> {
+    pub fn flush_page(&self, page_id: PageId) -> Result<(), BpmError> {
         info!("flush_page: flushing page page_id={page_id}");
         let Some(frame_id) = self.meta.lock().page_table.get(&page_id).copied() else {
             warn!("tried to flush page with page_id={page_id} but could not find its frame");
@@ -704,6 +725,7 @@ mod tests {
     use super::*;
     use crate::disk::{DiskManager, DiskScheduler};
     use crate::replacer::ArcReplacer;
+    use crate::testing::pid;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
@@ -722,7 +744,7 @@ mod tests {
         for fill in 0..3u8 {
             bpm.new_page().unwrap().data_mut().fill(fill + 1);
         }
-        bpm.delete_page(1).unwrap();
+        bpm.delete_page(pid(1)).unwrap();
         assert_eq!(
             bpm.flush_all().unwrap(),
             2,
@@ -738,19 +760,19 @@ mod tests {
             allocation,
             PageAllocation {
                 next_page_id: 3,
-                free_page_ids: vec![1],
+                free_page_ids: vec![pid(1)],
             }
         );
 
         let reopened = pool(4);
         reopened.resume_allocation(&allocation).unwrap();
-        assert_eq!(reopened.read_page(0).unwrap().data()[0], 1);
-        assert_eq!(reopened.read_page(2).unwrap().data()[0], 3);
+        assert_eq!(reopened.read_page(pid(0)).unwrap().data()[0], 1);
+        assert_eq!(reopened.read_page(pid(2)).unwrap().data()[0], 3);
         assert!(
-            matches!(reopened.read_page(1), Err(BpmError::Io(e)) if e.kind() == io::ErrorKind::NotFound),
+            matches!(reopened.read_page(pid(1)), Err(BpmError::Io(e)) if e.kind() == io::ErrorKind::NotFound),
             "a page freed before the restart stays unreadable"
         );
-        assert_eq!(reopened.new_page().unwrap().page_id(), Some(1));
+        assert_eq!(reopened.new_page().unwrap().page_id(), pid(1));
         assert!(matches!(
             reopened.resume_allocation(&allocation),
             Err(BpmError::PoolInUse)
@@ -764,18 +786,14 @@ mod tests {
     #[test]
     fn a_deleted_page_id_is_handed_out_again_before_a_new_one() {
         let (bpm, _dir) = crate::testing::bpm(2);
-        let ids: Vec<usize> = (0..4)
-            .map(|_| bpm.new_page().unwrap().page_id().unwrap())
-            .collect();
-        bpm.delete_page(ids[2]).unwrap();
-        bpm.delete_page(ids[1]).unwrap();
+        let ids: Vec<PageId> = (0..4).map(|_| bpm.new_page().unwrap().page_id()).collect();
+        bpm.delete_page(pid(ids[2])).unwrap();
+        bpm.delete_page(pid(ids[1])).unwrap();
         assert_eq!(bpm.live_page_count(), 2);
         assert_eq!(bpm.allocated_page_count(), 4);
 
-        let reused: Vec<usize> = (0..3)
-            .map(|_| bpm.new_page().unwrap().page_id().unwrap())
-            .collect();
-        assert_eq!(reused, vec![ids[1], ids[2], 4], "lowest free id first");
+        let reused: Vec<PageId> = (0..3).map(|_| bpm.new_page().unwrap().page_id()).collect();
+        assert_eq!(reused, vec![ids[1], ids[2], pid(4)], "lowest free id first");
         assert_eq!(bpm.allocated_page_count(), 5);
         assert_eq!(bpm.live_page_count(), 5);
     }
@@ -786,22 +804,25 @@ mod tests {
         let deleted = {
             let mut page = bpm.new_page().unwrap();
             page.data_mut().fill(1);
-            page.page_id().unwrap()
+            page.page_id()
         };
         drop(bpm.new_page().unwrap());
-        assert!(!bpm.is_resident(deleted), "setup expected an eviction");
-        bpm.delete_page(deleted).unwrap();
+        assert!(!bpm.is_resident(pid(deleted)), "setup expected an eviction");
+        bpm.delete_page(pid(deleted)).unwrap();
 
         let reused = {
             let mut page = bpm.new_page().unwrap();
             page.data_mut().fill(2);
-            page.page_id().unwrap()
+            page.page_id()
         };
         assert_eq!(reused, deleted);
         drop(bpm.new_page().unwrap());
-        assert!(!bpm.is_resident(reused), "setup expected a second eviction");
         assert!(
-            bpm.read_page(reused)
+            !bpm.is_resident(pid(reused)),
+            "setup expected a second eviction"
+        );
+        assert!(
+            bpm.read_page(pid(reused))
                 .unwrap()
                 .data()
                 .iter()
@@ -813,12 +834,12 @@ mod tests {
     #[test]
     fn a_flush_that_finds_its_frame_given_to_another_page_reports_the_page_as_not_cached() {
         let (bpm, _dir) = crate::testing::bpm(1);
-        let page_id = bpm.new_page().unwrap().page_id().unwrap();
+        let page_id = bpm.new_page().unwrap().page_id();
         let frame_id = bpm.meta.lock().page_table[&page_id];
-        bpm.frames[frame_id].write().page_id = Some(page_id + 1);
+        bpm.frames[frame_id.0].write().page_id = Some(pid(page_id.get() + 1));
 
         assert!(matches!(
-            bpm.flush_page(page_id),
+            bpm.flush_page(pid(page_id)),
             Err(BpmError::PageNotCached { page_id: p }) if p == page_id
         ));
     }
@@ -834,27 +855,32 @@ mod tests {
                     for round in 0..2_000 {
                         let page_id = {
                             let mut page = bpm.new_page().unwrap();
-                            let page_id = page.page_id().unwrap();
-                            page.data_mut()[..8].copy_from_slice(&(page_id as u64).to_le_bytes());
+                            let page_id = page.page_id();
+                            page.data_mut()[..8]
+                                .copy_from_slice(&u64::from(page_id.get()).to_le_bytes());
                             page_id
                         };
                         owned.push(page_id);
                         if round % 2 == 1 {
                             let victim = owned.swap_remove(round % owned.len());
                             let stored = u64::from_le_bytes(
-                                bpm.read_page(victim).unwrap().data()[..8]
+                                bpm.read_page(pid(victim)).unwrap().data()[..8]
                                     .try_into()
                                     .unwrap(),
                             );
-                            assert_eq!(stored, victim as u64, "page {victim} was handed out twice");
-                            bpm.delete_page(victim).unwrap();
+                            assert_eq!(
+                                stored,
+                                u64::from(victim.get()),
+                                "page {victim} was handed out twice"
+                            );
+                            bpm.delete_page(pid(victim)).unwrap();
                         }
                     }
                     owned
                 })
             })
             .collect();
-        let mut live: Vec<usize> = workers
+        let mut live: Vec<PageId> = workers
             .into_iter()
             .flat_map(|w| w.join().unwrap())
             .collect();
@@ -873,18 +899,18 @@ mod tests {
     #[test]
     fn deleting_a_resident_page_frees_its_frame_without_writing_it() {
         let (bpm, _dir) = crate::testing::bpm(1);
-        let page_id = bpm.new_page().unwrap().page_id().unwrap();
+        let page_id = bpm.new_page().unwrap().page_id();
         assert_eq!(bpm.live_page_count(), 1);
 
-        bpm.delete_page(page_id).unwrap();
+        bpm.delete_page(pid(page_id)).unwrap();
 
         assert_eq!(bpm.live_page_count(), 0);
-        assert!(!bpm.is_resident(page_id));
+        assert!(!bpm.is_resident(pid(page_id)));
         {
             let meta = bpm.meta.lock();
             assert_eq!(
                 meta.free_list,
-                vec![0],
+                vec![FrameId(0)],
                 "the frame went back to the free list"
             );
             assert_eq!(
@@ -894,43 +920,43 @@ mod tests {
             );
         }
         assert!(
-            matches!(bpm.read_page(page_id), Err(BpmError::Io(_))),
+            matches!(bpm.read_page(pid(page_id)), Err(BpmError::Io(_))),
             "a deleted page that was never written has nothing on disk to read"
         );
-        let next = bpm.new_page().unwrap().page_id().unwrap();
+        let next = bpm.new_page().unwrap().page_id();
         assert_eq!(next, page_id, "the deleted id is handed out again");
     }
 
     #[test]
     fn deleting_an_evicted_page_frees_it_on_disk() {
         let (bpm, _dir) = crate::testing::bpm(1);
-        let evicted = bpm.new_page().unwrap().page_id().unwrap();
-        let resident = bpm.new_page().unwrap().page_id().unwrap();
-        assert!(!bpm.is_resident(evicted), "setup expected an eviction");
+        let evicted = bpm.new_page().unwrap().page_id();
+        let resident = bpm.new_page().unwrap().page_id();
+        assert!(!bpm.is_resident(pid(evicted)), "setup expected an eviction");
 
-        bpm.delete_page(evicted).unwrap();
+        bpm.delete_page(pid(evicted)).unwrap();
 
         assert_eq!(bpm.live_page_count(), 1);
-        assert!(bpm.is_resident(resident));
-        assert!(matches!(bpm.read_page(evicted), Err(BpmError::Io(_))));
+        assert!(bpm.is_resident(pid(resident)));
+        assert!(matches!(bpm.read_page(pid(evicted)), Err(BpmError::Io(_))));
     }
 
     #[test]
     fn deleting_a_pinned_or_unknown_page_fails_and_changes_nothing() {
         let (bpm, _dir) = crate::testing::bpm(2);
         let guard = bpm.new_page().unwrap();
-        let pinned = guard.page_id().unwrap();
+        let pinned = guard.page_id();
         assert!(matches!(
-            bpm.delete_page(pinned),
+            bpm.delete_page(pid(pinned)),
             Err(BpmError::PagePinned { page_id }) if page_id == pinned
         ));
         drop(guard);
-        assert!(bpm.is_resident(pinned));
+        assert!(bpm.is_resident(pid(pinned)));
 
-        bpm.delete_page(pinned).unwrap();
-        for missing in [pinned, 99] {
+        bpm.delete_page(pid(pinned)).unwrap();
+        for missing in [pinned, pid(99)] {
             assert!(matches!(
-                bpm.delete_page(missing),
+                bpm.delete_page(pid(missing)),
                 Err(BpmError::NoSuchPage { page_id }) if page_id == missing
             ));
         }
@@ -951,16 +977,16 @@ mod tests {
     #[test]
     fn a_page_stops_being_resident_once_it_is_evicted() {
         let (bpm, _dir) = crate::testing::bpm(2);
-        let first = bpm.new_page().unwrap().page_id().unwrap();
-        assert!(bpm.is_resident(first));
-        assert!(!bpm.is_resident(first + 100));
-        let second = bpm.new_page().unwrap().page_id().unwrap();
-        let third = bpm.new_page().unwrap().page_id().unwrap();
-        assert!(bpm.is_resident(second));
-        assert!(bpm.is_resident(third));
-        assert!(!bpm.is_resident(first));
-        drop(bpm.read_page(first).unwrap());
-        assert!(bpm.is_resident(first));
+        let first = bpm.new_page().unwrap().page_id();
+        assert!(bpm.is_resident(pid(first)));
+        assert!(!bpm.is_resident(pid(first.get() + 100)));
+        let second = bpm.new_page().unwrap().page_id();
+        let third = bpm.new_page().unwrap().page_id();
+        assert!(bpm.is_resident(pid(second)));
+        assert!(bpm.is_resident(pid(third)));
+        assert!(!bpm.is_resident(pid(first)));
+        drop(bpm.read_page(pid(first)).unwrap());
+        assert!(bpm.is_resident(pid(first)));
     }
 
     fn finishes_within(limit: Duration, work: impl FnOnce() + Send + 'static) -> bool {
@@ -976,12 +1002,12 @@ mod tests {
     fn dropping_a_guard_with_zero_pins_still_releases_the_frame_lock() {
         let (bpm, _dir) = crate::testing::bpm(1);
         let page = bpm.new_page().unwrap();
-        let page_id = page.page_id().unwrap();
-        bpm.meta.lock().pins[page.frame_id()] = 0;
+        let page_id = page.page_id();
+        bpm.meta.lock().pins[page.frame_id().0] = 0;
         drop(page);
 
         let finished = finishes_within(Duration::from_secs(5), move || {
-            drop(bpm.write_page(page_id).unwrap());
+            drop(bpm.write_page(pid(page_id)).unwrap());
         });
         assert!(finished, "frame write lock was leaked by the guard drop");
     }
@@ -1011,12 +1037,12 @@ mod tests {
                         let page_id = (worker * 7 + round) % page_count;
                         let reported_missing = if worker % 3 == 0 {
                             matches!(
-                                bpm.write_page(page_id),
+                                bpm.write_page(pid(page_id)),
                                 Err(BpmError::FrameOutOfRange { .. })
                             )
                         } else {
                             matches!(
-                                bpm.read_page(page_id),
+                                bpm.read_page(pid(page_id)),
                                 Err(BpmError::FrameOutOfRange { .. })
                             )
                         };
@@ -1040,32 +1066,34 @@ mod tests {
     #[test]
     fn flushing_a_page_that_is_not_cached_reports_it() {
         let (bpm, _dir) = crate::testing::bpm(1);
-        let first = bpm.new_page().unwrap().page_id().unwrap();
-        let second = bpm.new_page().unwrap().page_id().unwrap();
-        assert!(!bpm.is_resident(first));
+        let first = bpm.new_page().unwrap().page_id();
+        let second = bpm.new_page().unwrap().page_id();
+        assert!(!bpm.is_resident(pid(first)));
         assert!(matches!(
-            bpm.flush_page(first),
+            bpm.flush_page(pid(first)),
             Err(BpmError::PageNotCached { page_id }) if page_id == first
         ));
-        assert!(bpm.flush_page(second).is_ok());
+        assert!(bpm.flush_page(pid(second)).is_ok());
     }
 
     #[test]
     fn a_frame_id_past_the_pool_is_out_of_range() {
         let (bpm, _dir) = crate::testing::bpm(2);
-        assert!(bpm.frame(1).is_ok());
+        assert!(bpm.frame(FrameId(1)).is_ok());
         assert!(matches!(
-            bpm.frame(2),
-            Err(BpmError::FrameOutOfRange { frame_id: 2 })
+            bpm.frame(FrameId(2)),
+            Err(BpmError::FrameOutOfRange {
+                frame_id: FrameId(2)
+            })
         ));
     }
 
     #[test]
     fn last_guard_drop_makes_the_frame_evictable_again() {
         let (bpm, _dir) = crate::testing::bpm(1);
-        let page_id = bpm.new_page().unwrap().page_id().unwrap();
-        let first = bpm.read_page(page_id).unwrap();
-        let second = bpm.read_page(page_id).unwrap();
+        let page_id = bpm.new_page().unwrap().page_id();
+        let first = bpm.read_page(pid(page_id)).unwrap();
+        let second = bpm.read_page(pid(page_id)).unwrap();
         drop(first);
         assert!(matches!(
             bpm.new_page(),
@@ -1089,16 +1117,16 @@ mod tests {
 
     fn assert_a_failed_victim_flush_keeps_the_victim_cached(request: FrameRequest) {
         let (bpm, _dir) = crate::testing::bpm(2);
-        let on_disk = bpm.new_page().unwrap().page_id().unwrap();
-        bpm.flush_page(on_disk).unwrap();
+        let on_disk = bpm.new_page().unwrap().page_id();
+        bpm.flush_page(pid(on_disk)).unwrap();
         let victim = {
             let mut page = bpm.new_page().unwrap();
             page.data_mut().fill(VICTIM_FILL);
-            page.page_id().unwrap()
+            page.page_id()
         };
-        let other = bpm.new_page().unwrap().page_id().unwrap();
+        let other = bpm.new_page().unwrap().page_id();
         assert!(
-            !bpm.is_resident(on_disk),
+            !bpm.is_resident(pid(on_disk)),
             "setup expected the first page to be evicted"
         );
         let victim_frame = bpm.meta.lock().page_table[&victim];
@@ -1107,8 +1135,8 @@ mod tests {
         bpm.fail_next_disk_writes(1);
         let result = match request {
             FrameRequest::NewPage => bpm.new_page().map(drop),
-            FrameRequest::ReadMiss => bpm.read_page(on_disk).map(drop),
-            FrameRequest::WriteMiss => bpm.write_page(on_disk).map(drop),
+            FrameRequest::ReadMiss => bpm.read_page(pid(on_disk)).map(drop),
+            FrameRequest::WriteMiss => bpm.write_page(pid(on_disk)).map(drop),
         };
         match result {
             Err(BpmError::Io(e)) => assert_eq!(e.to_string(), disk::INJECTED_WRITE_FAILURE),
@@ -1124,7 +1152,7 @@ mod tests {
             );
             assert_eq!(meta.page_table.len(), 2, "page table entries");
             assert!(meta.free_list.is_empty(), "the victim frame was freed");
-            assert_eq!(meta.pins[victim_frame], 0, "victim pins");
+            assert_eq!(meta.pins[victim_frame.0], 0, "victim pins");
             assert_eq!(
                 meta.replacer.size(),
                 2,
@@ -1132,7 +1160,7 @@ mod tests {
             );
         }
         {
-            let frame = bpm.frames[victim_frame].read();
+            let frame = bpm.frames[victim_frame.0].read();
             assert_eq!(frame.page_id, Some(victim));
             assert!(
                 frame.dirty.load(Ordering::Acquire),
@@ -1140,15 +1168,15 @@ mod tests {
             );
             assert!(frame.buf.iter().all(|&b| b == VICTIM_FILL));
         }
-        assert!(bpm.is_resident(other));
-        assert!(!bpm.is_resident(on_disk));
+        assert!(bpm.is_resident(pid(other)));
+        assert!(!bpm.is_resident(pid(on_disk)));
         assert_eq!(
             bpm.allocated_page_count(),
             allocated,
             "a failed request handed out a page id"
         );
 
-        bpm.flush_page(victim).unwrap();
+        bpm.flush_page(pid(victim)).unwrap();
         assert!(
             bpm.read_from_disk(victim)
                 .unwrap()
@@ -1156,13 +1184,13 @@ mod tests {
                 .all(|&b| b == VICTIM_FILL),
             "the later flush wrote different bytes"
         );
-        drop(bpm.read_page(on_disk).unwrap());
+        drop(bpm.read_page(pid(on_disk)).unwrap());
         assert!(
-            !bpm.is_resident(victim),
+            !bpm.is_resident(pid(victim)),
             "the retried miss picked a different victim"
         );
         assert!(
-            bpm.read_page(victim)
+            bpm.read_page(pid(victim))
                 .unwrap()
                 .data()
                 .iter()
@@ -1185,9 +1213,9 @@ mod tests {
         assert_a_failed_victim_flush_keeps_the_victim_cached(FrameRequest::WriteMiss);
     }
 
-    fn mark_pinned_frame_evictable(bpm: &BufferPoolManager, frame_id: usize) {
+    fn mark_pinned_frame_evictable(bpm: &BufferPoolManager, frame_id: FrameId) {
         let mut meta = bpm.meta.lock();
-        assert!(meta.pins[frame_id] > 0, "setup expected a pinned frame");
+        assert!(meta.pins[frame_id.0] > 0, "setup expected a pinned frame");
         meta.replacer.set_evictable(frame_id, true);
     }
 
@@ -1195,7 +1223,7 @@ mod tests {
     fn a_pinned_victim_stays_in_the_pool_after_frame_in_use() {
         let (bpm, _dir) = crate::testing::bpm(1);
         let pinned = bpm.new_page().unwrap();
-        let pinned_id = pinned.page_id().unwrap();
+        let pinned_id = pinned.page_id();
         let frame_id = pinned.frame_id();
         mark_pinned_frame_evictable(&bpm, frame_id);
 
@@ -1204,7 +1232,7 @@ mod tests {
             let meta = bpm.meta.lock();
             assert_eq!(meta.page_table.get(&pinned_id), Some(&frame_id));
             assert!(meta.free_list.is_empty(), "the pinned frame was freed");
-            assert_eq!(meta.pins[frame_id], 1, "pins changed");
+            assert_eq!(meta.pins[frame_id.0], 1, "pins changed");
         }
 
         drop(pinned);
@@ -1213,17 +1241,17 @@ mod tests {
             1,
             "the frame did not become evictable once unpinned"
         );
-        let replacement = bpm.new_page().unwrap().page_id().unwrap();
-        assert!(bpm.is_resident(replacement));
-        assert!(!bpm.is_resident(pinned_id));
+        let replacement = bpm.new_page().unwrap().page_id();
+        assert!(bpm.is_resident(pid(replacement)));
+        assert!(!bpm.is_resident(pid(pinned_id)));
     }
 
     #[test]
     fn eviction_after_frame_in_use_picks_another_victim() {
         let (bpm, _dir) = crate::testing::bpm(2);
         let pinned = bpm.new_page().unwrap();
-        let pinned_id = pinned.page_id().unwrap();
-        let unpinned = bpm.new_page().unwrap().page_id().unwrap();
+        let pinned_id = pinned.page_id();
+        let unpinned = bpm.new_page().unwrap().page_id();
         mark_pinned_frame_evictable(&bpm, pinned.frame_id());
 
         assert!(matches!(bpm.new_page(), Err(BpmError::FrameInUse)));
@@ -1233,10 +1261,10 @@ mod tests {
             "the pinned victim was left evictable"
         );
 
-        let replacement = bpm.new_page().unwrap().page_id().unwrap();
-        assert!(bpm.is_resident(pinned_id));
-        assert!(bpm.is_resident(replacement));
-        assert!(!bpm.is_resident(unpinned));
+        let replacement = bpm.new_page().unwrap().page_id();
+        assert!(bpm.is_resident(pid(pinned_id)));
+        assert!(bpm.is_resident(pid(replacement)));
+        assert!(!bpm.is_resident(pid(unpinned)));
         drop(pinned);
     }
 
@@ -1262,15 +1290,15 @@ mod tests {
 
     fn assert_a_hit_waits_while_a_miss_is_stalled_on(stalled: StalledDiskRequest) {
         let (bpm, _dir) = crate::testing::bpm(2);
-        let evicted = bpm.new_page().unwrap().page_id().unwrap();
-        let victim = bpm.new_page().unwrap().page_id().unwrap();
-        let resident = bpm.new_page().unwrap().page_id().unwrap();
+        let evicted = bpm.new_page().unwrap().page_id();
+        let victim = bpm.new_page().unwrap().page_id();
+        let resident = bpm.new_page().unwrap().page_id();
         if stalled == StalledDiskRequest::PageRead {
-            bpm.flush_page(victim).unwrap();
+            bpm.flush_page(pid(victim)).unwrap();
         }
         let victim_frame = bpm.meta.lock().page_table[&victim];
         assert_eq!(
-            bpm.frames[victim_frame]
+            bpm.frames[victim_frame.0]
                 .read()
                 .dirty
                 .load(Ordering::Acquire),
@@ -1278,15 +1306,15 @@ mod tests {
             "setup expected the victim to be dirty only when the write-back is the stalled request"
         );
         assert!(
-            !bpm.is_resident(evicted),
+            !bpm.is_resident(pid(evicted)),
             "setup expected the first page to be evicted"
         );
-        let resident_pin = bpm.read_page(resident).unwrap();
+        let resident_pin = bpm.read_page(pid(resident)).unwrap();
 
         let disk_stalled = bpm.scheduler.lock();
         let miss = {
             let bpm = Arc::clone(&bpm);
-            thread::spawn(move || bpm.read_page(evicted).is_ok())
+            thread::spawn(move || bpm.read_page(pid(evicted)).is_ok())
         };
         assert!(
             wait_until(UNBLOCKED_LIMIT, || bpm.meta.is_locked()),
@@ -1297,7 +1325,7 @@ mod tests {
         {
             let bpm = Arc::clone(&bpm);
             thread::spawn(move || {
-                let hit = bpm.read_page(resident).is_ok();
+                let hit = bpm.read_page(pid(resident)).is_ok();
                 let _ = hit_done_tx.send(hit);
             });
         }
@@ -1328,5 +1356,29 @@ mod tests {
     #[test]
     fn a_hit_waits_while_a_miss_holds_the_meta_lock_through_the_page_read() {
         assert_a_hit_waits_while_a_miss_is_stalled_on(StalledDiskRequest::PageRead);
+    }
+
+    #[test]
+    fn new_page_fails_once_page_ids_run_out_and_keeps_the_frame() {
+        let (bpm, _dir) = crate::testing::bpm(1);
+        bpm.resume_allocation(&PageAllocation {
+            next_page_id: PageId::MAX.as_usize() + 1,
+            free_page_ids: vec![],
+        })
+        .unwrap();
+        let err = bpm.new_page().err().unwrap();
+        assert!(matches!(err, BpmError::PageIdsExhausted(_)), "got {err}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "no page id left to hand out: page id {} is past the largest page id, {}",
+                u64::from(PageId::MAX.get()) + 1,
+                PageId::MAX
+            )
+        );
+        assert!(
+            matches!(bpm.new_page(), Err(BpmError::PageIdsExhausted(_))),
+            "the failed allocation gave its frame back instead of leaking it"
+        );
     }
 }
