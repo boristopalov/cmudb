@@ -373,9 +373,7 @@ impl<C: Copy> Expression<C> {
             },
         })
     }
-}
 
-impl<C: Copy> Expression<C> {
     /// The same expression with every column reference replaced by `f(col)`.
     pub fn map_columns<D>(self, f: impl Fn(C) -> D) -> Expression<D> {
         match self.try_map_columns(&|col| Ok::<D, Infallible>(f(col))) {

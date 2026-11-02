@@ -330,6 +330,34 @@ fn inner_and_left_joins_without_index_use_nested_loop_join() {
 }
 
 #[test]
+fn group_by_and_order_by_read_right_side_join_columns() {
+    let db = emp_db();
+    db.exec("CREATE TABLE dept (id INTEGER, name INTEGER)");
+    db.exec("INSERT INTO dept VALUES (10, 1000), (20, 2000), (40, 4000)");
+    assert_eq!(
+        ints(&db.exec(
+            "SELECT emp.id FROM emp JOIN dept ON emp.dept = dept.id \
+             ORDER BY dept.name DESC, emp.id DESC"
+        )),
+        vec![[3], [2], [1]]
+    );
+    assert_eq!(
+        ints(&db.exec(
+            "SELECT dept.name, COUNT(*), SUM(emp.salary) FROM emp JOIN dept ON emp.dept = dept.id \
+             GROUP BY dept.name ORDER BY dept.name DESC"
+        )),
+        vec![[2000, 1, 300], [1000, 2, 300]]
+    );
+    assert_eq!(
+        ints(&db.exec(
+            "SELECT dept.id, COUNT(*) FROM emp LEFT JOIN dept ON emp.dept = dept.id \
+             WHERE dept.id > 0 GROUP BY dept.id ORDER BY dept.id"
+        )),
+        vec![[10, 2], [20, 1]]
+    );
+}
+
+#[test]
 fn inner_join_with_index_on_inner_side_uses_nested_index_join() {
     let db = Db::new(64);
     db.exec("CREATE TABLE t (id INTEGER, v INTEGER)");
