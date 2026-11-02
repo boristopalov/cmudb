@@ -369,6 +369,22 @@ impl TableHeap {
     where
         E: From<TableHeapError>,
     {
+        Self::write_slot_then(bpm, rid, |meta, bytes| Ok((f(meta, bytes)?, ())), |()| ())
+    }
+
+    /// [`TableHeap::write_slot`] with a second step. `f` plans the write and hands a value
+    /// to `then`, which runs only once the slot is overwritten, still under the page write
+    /// latch. Bookkeeping that has to match the slot, such as an undo chain, goes in `then`,
+    /// so a write that fails leaves both untouched.
+    pub fn write_slot_then<T, R, E>(
+        bpm: &Arc<BufferPoolManager>,
+        rid: RecordId,
+        f: impl FnOnce(TupleMeta, &[u8]) -> Result<(SlotWrite, T), E>,
+        then: impl FnOnce(T) -> R,
+    ) -> Result<R, E>
+    where
+        E: From<TableHeapError>,
+    {
         let mut page_guard = bpm.write_page(rid.page_id as usize).map_err(|e| {
             TableHeapError(format!(
                 "failed to acquire write lock on page {} for write of {rid}: {e}",
@@ -385,7 +401,7 @@ impl TableHeap {
                 table_page.num_tuples()
             ))
         })?;
-        let write = {
+        let (write, planned) = {
             let bytes = table_page
                 .tuple_bytes(&slot)
                 .map_err(TableHeapError::from)?;
@@ -399,7 +415,20 @@ impl TableHeap {
                 .update_meta(rid.slot_id, write.meta)
                 .map_err(TableHeapError::from)?,
         }
-        Ok(())
+        Ok(then(planned))
+    }
+
+    /// [`TableHeap::write_slot_then`] on this heap's buffer pool.
+    pub fn write_with_then<T, R, E>(
+        &self,
+        rid: RecordId,
+        f: impl FnOnce(TupleMeta, &[u8]) -> Result<(SlotWrite, T), E>,
+        then: impl FnOnce(T) -> R,
+    ) -> Result<R, E>
+    where
+        E: From<TableHeapError>,
+    {
+        Self::write_slot_then(&self.bpm, rid, f, then)
     }
 
     /// Overwrites a slot's metadata.

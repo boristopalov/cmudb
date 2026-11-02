@@ -214,8 +214,8 @@ impl TransactionManager {
     ///
     /// While this transaction owns a slot nobody else can push onto its chain, and GC keeps
     /// the chain of every slot holding an uncommitted write, so the chain's head is the entry
-    /// this transaction pushed. Restoring it cannot fail: the slot is valid and the undo image
-    /// has the slot's size.
+    /// this transaction pushed. The head is popped only after its image is written back,
+    /// under the same page latch, so a failed write leaves the chain whole for the retry.
     pub fn abort(&self, txn: &Transaction) -> Result<(), TxnError> {
         match txn.state() {
             TransactionState::Running | TransactionState::Tainted => {}
@@ -223,38 +223,48 @@ impl TransactionManager {
         }
         txn.set_tainted();
         for (rid, pushed_undo) in txn.write_entries() {
-            TableHeap::write_slot(&self.bpm, rid, |meta, _| {
-                if meta.ts != txn.id() {
-                    return Err(TxnError::Storage(format!(
-                        "aborting slot ({rid}) stamped {} rather than this txn",
-                        meta.ts
-                    )));
-                }
-                if !pushed_undo {
-                    return Ok::<_, TxnError>(SlotWrite {
+            TableHeap::write_slot_then(
+                &self.bpm,
+                rid,
+                |meta, _| {
+                    if meta.ts != txn.id() {
+                        return Err(TxnError::Storage(format!(
+                            "aborting slot ({rid}) stamped {} rather than this txn",
+                            meta.ts
+                        )));
+                    }
+                    if !pushed_undo {
+                        let write = SlotWrite {
+                            meta: TupleMeta {
+                                ts: 0,
+                                is_deleted: true,
+                            },
+                            data: None,
+                        };
+                        return Ok::<_, TxnError>((write, None));
+                    }
+                    let head = self.version_head(rid).ok_or_else(|| {
+                        TxnError::Storage(format!("undo chain of ({rid}) vanished before abort"))
+                    })?;
+                    let write = SlotWrite {
                         meta: TupleMeta {
-                            ts: 0,
-                            is_deleted: true,
+                            ts: head.ts,
+                            is_deleted: head.is_deleted,
                         },
-                        data: None,
-                    });
-                }
-                let mut versions = self.versions.write();
-                let head = versions.get(&rid).cloned().ok_or_else(|| {
-                    TxnError::Storage(format!("undo chain of ({rid}) vanished before abort"))
-                })?;
-                match head.prev() {
-                    Some(prev) => versions.insert(rid, prev),
-                    None => versions.remove(&rid),
-                };
-                Ok(SlotWrite {
-                    meta: TupleMeta {
-                        ts: head.ts,
-                        is_deleted: head.is_deleted,
-                    },
-                    data: Some(head.data.clone()),
-                })
-            })?;
+                        data: Some(head.data.clone()),
+                    };
+                    Ok((write, Some(head)))
+                },
+                |popped| {
+                    if let Some(head) = popped {
+                        let mut versions = self.versions.write();
+                        match head.prev() {
+                            Some(prev) => versions.insert(rid, prev),
+                            None => versions.remove(&rid),
+                        };
+                    }
+                },
+            )?;
             txn.forget_write(rid);
         }
         txn.finish(TransactionState::Aborted, None);
@@ -268,9 +278,9 @@ impl TransactionManager {
         self.versions.read().get(&rid).cloned()
     }
 
-    /// Pushes an older version of `rid` onto its chain. Call only under the slot's page write
-    /// latch, right before overwriting the slot.
-    pub(crate) fn push_version(&self, rid: RecordId, meta: TupleMeta, data: &[u8]) {
+    /// Pushes an older version of `rid` onto its chain, from under the slot's page write
+    /// latch once the slot is overwritten.
+    pub(crate) fn push_version(&self, rid: RecordId, meta: TupleMeta, data: Vec<u8>) {
         debug_assert!(
             !is_txn_id(meta.ts),
             "undo entries hold committed versions only"
@@ -282,7 +292,7 @@ impl TransactionManager {
             Arc::new(UndoLog {
                 ts: meta.ts,
                 is_deleted: meta.is_deleted,
-                data: data.to_vec(),
+                data,
                 prev: Mutex::new(prev),
             }),
         );
@@ -352,4 +362,145 @@ fn chain_len(mut cur: Option<Arc<UndoLog>>) -> usize {
         cur = log.prev();
     }
     len
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::create_buffer_pool_manager;
+    use crate::disk::{DiskManager, DiskScheduler};
+    use crate::replacer::ArcReplacer;
+    use crate::table_heap::Tuple;
+    use tempfile::{TempDir, tempdir};
+
+    fn setup() -> (Arc<TransactionManager>, TableHeap, TempDir) {
+        let dir = tempdir().unwrap();
+        let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).unwrap();
+        let bpm = Arc::new(create_buffer_pool_manager(
+            8,
+            ArcReplacer::new(8),
+            DiskScheduler::new(dm),
+        ));
+        let mgr = Arc::new(TransactionManager::new(bpm.clone()));
+        (mgr, TableHeap::new(bpm).unwrap(), dir)
+    }
+
+    fn insert_committed(heap: &TableHeap, data: &[u8]) -> RecordId {
+        heap.insert(&Tuple {
+            data: data.to_vec(),
+        })
+        .unwrap()
+    }
+
+    /// The first write of `rid` in `txn`, as the MVCC layer makes it.
+    fn overwrite(mgr: &TransactionManager, heap: &TableHeap, txn: &Transaction, rid: RecordId) {
+        heap.write_with_then(
+            rid,
+            |meta, bytes| {
+                let write = SlotWrite {
+                    meta: TupleMeta {
+                        ts: txn.id(),
+                        is_deleted: false,
+                    },
+                    data: Some(vec![b'x'; bytes.len()]),
+                };
+                Ok::<_, TableHeapError>((write, (meta, bytes.to_vec())))
+            },
+            |(meta, bytes)| mgr.push_version(rid, meta, bytes),
+        )
+        .unwrap();
+        txn.record_write(rid, true);
+    }
+
+    fn slot(heap: &TableHeap, rid: RecordId) -> (Timestamp, Vec<u8>) {
+        let (meta, t) = heap.get_with_meta(rid).unwrap();
+        (meta.ts, t.data)
+    }
+
+    #[test]
+    fn a_commit_that_fails_midway_stays_invisible_and_abort_resumes() {
+        let (mgr, heap, _dir) = setup();
+        let rids: Vec<_> = [b"aaaa", b"bbbb", b"cccc"]
+            .iter()
+            .map(|d| insert_committed(&heap, *d))
+            .collect();
+        let txn = mgr.begin(IsolationLevel::SnapshotIsolation);
+        for rid in &rids {
+            overwrite(&mgr, &heap, &txn, *rid);
+        }
+        let stray = TupleMeta {
+            ts: 7,
+            is_deleted: false,
+        };
+        heap.update_meta(rids[1], stray).unwrap();
+
+        assert!(mgr.commit(&txn).is_err());
+        assert_eq!(txn.state(), TransactionState::Tainted);
+        assert_eq!(mgr.last_commit_ts(), 0);
+        assert_eq!(slot(&heap, rids[0]).0, txn.id());
+        assert_eq!(slot(&heap, rids[1]).0, 7);
+        assert_eq!(slot(&heap, rids[2]).0, txn.id());
+
+        assert!(mgr.abort(&txn).is_err());
+        assert_eq!(slot(&heap, rids[0]), (0, b"aaaa".to_vec()));
+        assert_eq!(mgr.num_version_chains(), 2);
+
+        heap.update_meta(
+            rids[1],
+            TupleMeta {
+                ts: txn.id(),
+                ..stray
+            },
+        )
+        .unwrap();
+        mgr.abort(&txn).unwrap();
+        assert_eq!(txn.state(), TransactionState::Aborted);
+        assert_eq!(mgr.num_version_chains(), 0);
+        assert_eq!(slot(&heap, rids[1]), (0, b"bbbb".to_vec()));
+        assert_eq!(slot(&heap, rids[2]), (0, b"cccc".to_vec()));
+    }
+
+    #[test]
+    fn a_failed_restore_keeps_the_undo_chain_for_the_retry() {
+        let (mgr, heap, _dir) = setup();
+        let rid = insert_committed(&heap, b"abcd");
+        let txn = mgr.begin(IsolationLevel::SnapshotIsolation);
+        overwrite(&mgr, &heap, &txn, rid);
+        mgr.push_version(rid, TupleMeta::default(), vec![0; 3]);
+        assert_eq!(mgr.version_chain_len(rid), 2);
+
+        assert!(mgr.abort(&txn).is_err());
+        assert_eq!(mgr.version_chain_len(rid), 2);
+        assert_eq!(slot(&heap, rid), (txn.id(), b"xxxx".to_vec()));
+
+        let bad = mgr.version_head(rid).unwrap();
+        mgr.versions.write().insert(rid, bad.prev().unwrap());
+        mgr.abort(&txn).unwrap();
+        assert_eq!(slot(&heap, rid), (0, b"abcd".to_vec()));
+        assert_eq!(mgr.num_version_chains(), 0);
+    }
+
+    #[test]
+    fn a_failed_first_write_pushes_no_undo_entry() {
+        let (mgr, heap, _dir) = setup();
+        let rid = insert_committed(&heap, b"abcd");
+        let txn = mgr.begin(IsolationLevel::SnapshotIsolation);
+        let res = heap.write_with_then(
+            rid,
+            |meta, bytes| {
+                let write = SlotWrite {
+                    meta: TupleMeta {
+                        ts: txn.id(),
+                        is_deleted: false,
+                    },
+                    data: Some(vec![0; bytes.len() + 1]),
+                };
+                Ok::<_, TableHeapError>((write, (meta, bytes.to_vec())))
+            },
+            |(meta, bytes)| mgr.push_version(rid, meta, bytes),
+        );
+        assert!(res.is_err());
+        assert_eq!(mgr.num_version_chains(), 0);
+        assert_eq!(slot(&heap, rid), (0, b"abcd".to_vec()));
+    }
 }

@@ -130,10 +130,9 @@ fn check_write(txn: &Transaction, rid: RecordId, meta: TupleMeta) -> Result<(), 
 /// Writes a new version of `rid`: `Some(tuple)` to update it, `None` to delete it.
 ///
 /// A deleted slot is only reachable if a caller writes a tuple it cannot see, and is refused.
-/// A size change is refused before the undo push, so a failing write leaves no orphan undo
-/// entry, and with the slot validated and the size equal the overwrite itself cannot fail.
 /// The first write of a tuple in a transaction keeps the version it replaces on the undo
-/// chain.
+/// chain. That push happens only after the slot is overwritten, under the same page latch,
+/// so a failed write leaves no orphan undo entry.
 fn write_version(
     txn: &Transaction,
     txn_mgr: &TransactionManager,
@@ -141,36 +140,34 @@ fn write_version(
     rid: RecordId,
     new: Option<&Tuple>,
 ) -> Result<(), MvccError> {
-    let mut pushed_undo = false;
-    heap.write_with(rid, |meta, bytes| {
-        check_write(txn, rid, meta)?;
-        if meta.is_deleted {
-            return Err(MvccError::Txn(TxnError::Storage(format!(
-                "record ({rid}) is deleted"
-            ))));
-        }
-        if let Some(t) = new
-            && t.data.len() != bytes.len()
-        {
-            return Err(MvccError::Txn(TxnError::Storage(format!(
-                "in-place update of ({rid}) changes its size from {} to {}",
-                bytes.len(),
-                t.data.len()
-            ))));
-        }
-        let first_write_in_txn = meta.ts != txn.id();
-        if first_write_in_txn {
-            txn_mgr.push_version(rid, meta, bytes);
-            pushed_undo = true;
-        }
-        Ok(SlotWrite {
-            meta: TupleMeta {
-                ts: txn.id(),
-                is_deleted: new.is_none(),
-            },
-            data: new.map(|t| t.data.clone()),
-        })
-    })?;
+    let pushed_undo = heap.write_with_then(
+        rid,
+        |meta, bytes| {
+            check_write(txn, rid, meta)?;
+            if meta.is_deleted {
+                return Err(MvccError::Txn(TxnError::Storage(format!(
+                    "record ({rid}) is deleted"
+                ))));
+            }
+            let first_write_in_txn = meta.ts != txn.id();
+            let undo = first_write_in_txn.then(|| (meta, bytes.to_vec()));
+            let write = SlotWrite {
+                meta: TupleMeta {
+                    ts: txn.id(),
+                    is_deleted: new.is_none(),
+                },
+                data: new.map(|t| t.data.clone()),
+            };
+            Ok((write, undo))
+        },
+        |undo| match undo {
+            Some((meta, bytes)) => {
+                txn_mgr.push_version(rid, meta, bytes);
+                true
+            }
+            None => false,
+        },
+    )?;
     txn.record_write(rid, pushed_undo);
     Ok(())
 }
