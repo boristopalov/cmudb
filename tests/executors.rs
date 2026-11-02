@@ -414,7 +414,7 @@ fn create_index_keys_on_the_columns_its_col_idxs_name() {
         }))
         .unwrap_err();
     assert!(
-        out_of_range.contains("ColumnOutOfBounds"),
+        out_of_range.contains("the column index is past the schema's last column"),
         "a key column past the table's last column fails: {out_of_range}"
     );
     assert!(db.catalog().index_oid("t", "t_bad").is_err());

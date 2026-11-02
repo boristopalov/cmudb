@@ -86,7 +86,7 @@ impl fmt::Display for IndexError {
             IndexError::BpmError(e) => write!(f, "BPM error: {e}"),
             IndexError::PageError(e) => write!(f, "page decode/encode error: {e}"),
             IndexError::Structure(msg) => write!(f, "b+ tree structure violated: {msg}"),
-            IndexError::Catalog(e) => write!(f, "cannot read the key from the tuple: {e:?}"),
+            IndexError::Catalog(e) => write!(f, "cannot read the key from the tuple: {e}"),
         }
     }
 }
@@ -122,7 +122,7 @@ mod tests {
         let e: IndexError = CatalogError::TupleSchemaMismatch.into();
         assert_eq!(
             e.to_string(),
-            "cannot read the key from the tuple: TupleSchemaMismatch"
+            "cannot read the key from the tuple: the tuple does not match the table's schema"
         );
         let cases = [
             (

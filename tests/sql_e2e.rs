@@ -686,7 +686,7 @@ fn select_over_a_stored_tuple_shorter_than_its_schema_is_an_error_not_a_panic() 
             .try_exec("SELECT * FROM t")
             .expect_err("decoding a short tuple fails the query");
         assert!(
-            err.contains("TupleSchemaMismatch"),
+            err.contains("the tuple does not match the table's schema"),
             "tuple {short:?} gave {err}"
         );
     }

@@ -306,7 +306,7 @@ impl ColumnSource<ColIdx> for InputRow<'_> {
     fn column_value(&self, col: ColIdx) -> Result<Option<Value>, ExecutorError> {
         self.schema
             .get_value(self.tuple, col.index())
-            .map_err(|e| ExecutorError(format!("cannot read column {}: {e:?}", col.0)))
+            .map_err(|e| ExecutorError(format!("cannot read column {}: {e}", col.0)))
     }
 }
 
