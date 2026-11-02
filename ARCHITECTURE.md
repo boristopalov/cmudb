@@ -64,7 +64,7 @@ typed `StatementResult` per statement. The shell (`src/main.rs`) only prints tho
    `tests/batch_execution.rs` checks this across batch sizes.
 3. Add its arm to `create_executor_with_batch_size` in `executor_factory.rs`.
 4. Have `src/planner.rs` emit it, or, until it does, build its plan by hand in
-   `tests/executors.rs`, as hash join, window functions and `DROP` do today.
+   `tests/executors.rs`, as window functions and `DROP` do today.
 5. Reach it through SQL in tests, through `Database` (or `tests/common`, which wraps it).
 
 ## Tests

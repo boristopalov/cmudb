@@ -405,6 +405,7 @@ fn hash_join_fan_out_spans_batches() {
             right: scan(env.r_oid, r_schema()),
             left_exprs: vec![col(1)],
             right_exprs: vec![col(0)],
+            residual: None,
             join_type,
         });
         assert_all_batch_sizes(&env, &plan, &expected_join(&r_rows(), left_outer), false);

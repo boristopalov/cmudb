@@ -1,14 +1,14 @@
-//! Executor tests for plan nodes the planner does not emit yet (hash join,
-//! external merge sort, window functions, DROP TABLE/INDEX). Plans are built
-//! by hand on top of tables created through SQL.
+//! Executor tests on hand-built plans: hash join, and the plan nodes the planner
+//! does not emit yet (external merge sort, window functions, DROP TABLE/INDEX).
+//! Plans are built by hand on top of tables created through SQL.
 mod common;
 
 use cmudb::catalog::{DataType, Schema, Value};
 use cmudb::parser::BinderError;
 use cmudb::processor::plan::{
     AggType, ColIdx, CreateIndexPlanNode, DropIndexPlanNode, DropTablePlanNode, Expression,
-    ExternalMergeSortPlanNode, HashJoinPlanNode, JoinType, LimitPlanNode, NullOrdering, Plan,
-    SeqScanPlanNode, SortDirection, SortExpr, SortPlanNode, WindowFunctionPlanNode,
+    ExternalMergeSortPlanNode, HashJoinPlanNode, JoinColumn, JoinType, LimitPlanNode, NullOrdering,
+    Op, Plan, SeqScanPlanNode, Side, SortDirection, SortExpr, SortPlanNode, WindowFunctionPlanNode,
 };
 use common::*;
 
@@ -55,6 +55,7 @@ fn hash_join(db: &Db, join_type: JoinType) -> Plan {
         right: Box::new(scan(db, "r", &["k", "b"])),
         left_exprs: vec![col(0)],
         right_exprs: vec![col(0)],
+        residual: None,
         join_type,
     })
 }
@@ -91,6 +92,48 @@ fn hash_join_left_pads_unmatched_rows_with_nulls() {
         "NULL keys never match"
     );
     assert!(unmatched.iter().all(|r| r[3].is_none()));
+}
+
+#[test]
+fn hash_join_residual_decides_which_equal_key_pairs_match() {
+    let db = two_tables();
+    let join_col = |side, col_idx| Expression::Column {
+        col: JoinColumn {
+            side,
+            col: ColIdx(col_idx),
+        },
+        dtype: DataType::INT,
+    };
+    let b_above_200 = Expression::Binary {
+        left: Box::new(join_col(Side::Right, 1)),
+        right: Box::new(Expression::Constant(Some(Value::INT(200)))),
+        op: Op::Gt,
+    };
+    let with_residual = |join_type| {
+        let Plan::HashJoin(mut p) = hash_join(&db, join_type) else {
+            unreachable!("hash_join builds a hash join");
+        };
+        p.residual = Some(b_above_200.clone());
+        Plan::HashJoin(p)
+    };
+    let mut inner = ints(&db.run_plan(&with_residual(JoinType::Inner)).unwrap());
+    inner.sort();
+    assert_eq!(inner, vec![vec![3, 30, 3, 300], vec![3, 30, 3, 301]]);
+
+    let mut left = nullable_ints(&db.run_plan(&with_residual(JoinType::Left)).unwrap());
+    left.sort();
+    assert_eq!(
+        left,
+        vec![
+            vec![None, Some(99), None, None],
+            vec![Some(1), Some(10), None, None],
+            vec![Some(2), Some(20), None, None],
+            vec![Some(2), Some(21), None, None],
+            vec![Some(3), Some(30), Some(3), Some(300)],
+            vec![Some(3), Some(30), Some(3), Some(301)],
+        ],
+        "k=2 rows match only b=200, which the residual rejects, so they are NULL-padded"
+    );
 }
 
 #[test]

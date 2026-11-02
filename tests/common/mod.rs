@@ -6,7 +6,10 @@ pub mod seed;
 
 use cmudb::catalog::Value;
 use cmudb::parser::BinderError;
-use cmudb::processor::plan::Plan;
+use cmudb::processor::plan::{
+    ColIdx, Expression, HashJoinPlanNode, JoinColumn, JoinPredicate, NestedLoopJoinPlanNode, Op,
+    Plan, Side,
+};
 use cmudb::{Database, QueryError, StatementResult};
 use std::ops::Deref;
 
@@ -92,6 +95,85 @@ impl Db {
     pub fn table_oid(&self, name: &str) -> u32 {
         self.db.catalog().table_oid(name).expect("table")
     }
+}
+
+/// Whether `wanted` matches `plan` or a node under its filters, projections, aggregations,
+/// sorts and limits.
+pub fn plan_contains(plan: &Plan, wanted: fn(&Plan) -> bool) -> bool {
+    wanted(plan)
+        || match plan {
+            Plan::Filter(p) => plan_contains(&p.child, wanted),
+            Plan::Projection(p) => plan_contains(&p.child, wanted),
+            Plan::Aggregation(p) => plan_contains(&p.child, wanted),
+            Plan::Sort(p) => plan_contains(&p.child, wanted),
+            Plan::ExternalMergeSort(p) => plan_contains(&p.child, wanted),
+            Plan::Limit(p) => plan_contains(&p.child, wanted),
+            _ => false,
+        }
+}
+
+/// `plan` with each hash join under its filters, projections, aggregations, sorts and limits
+/// replaced by a nested loop join on the same condition, as a reference result for the hash
+/// join.
+pub fn with_nested_loop_joins(plan: Plan) -> Plan {
+    let below = |child: Box<Plan>| Box::new(with_nested_loop_joins(*child));
+    match plan {
+        Plan::HashJoin(p) => Plan::NestedLoopJoin(NestedLoopJoinPlanNode {
+            predicate: hash_join_condition(&p),
+            schema: p.schema,
+            left: p.left,
+            right: p.right,
+            join_type: p.join_type,
+        }),
+        Plan::Filter(mut p) => {
+            p.child = below(p.child);
+            Plan::Filter(p)
+        }
+        Plan::Projection(mut p) => {
+            p.child = below(p.child);
+            Plan::Projection(p)
+        }
+        Plan::Aggregation(mut p) => {
+            p.child = below(p.child);
+            Plan::Aggregation(p)
+        }
+        Plan::Sort(mut p) => {
+            p.child = below(p.child);
+            Plan::Sort(p)
+        }
+        Plan::ExternalMergeSort(mut p) => {
+            p.child = below(p.child);
+            Plan::ExternalMergeSort(p)
+        }
+        Plan::Limit(mut p) => {
+            p.child = below(p.child);
+            Plan::Limit(p)
+        }
+        other => other,
+    }
+}
+
+/// A hash join's key equalities and residual ANDed into one join condition.
+fn hash_join_condition(p: &HashJoinPlanNode) -> JoinPredicate {
+    let on = |side: Side| move |col: ColIdx| JoinColumn { side, col };
+    let binary = |left: JoinPredicate, right: JoinPredicate, op: Op| Expression::Binary {
+        left: Box::new(left),
+        right: Box::new(right),
+        op,
+    };
+    p.left_exprs
+        .iter()
+        .zip(&p.right_exprs)
+        .map(|(l, r)| {
+            binary(
+                l.clone().map_columns(on(Side::Left)),
+                r.clone().map_columns(on(Side::Right)),
+                Op::Eq,
+            )
+        })
+        .chain(p.residual.clone())
+        .reduce(|l, r| binary(l, r, Op::And))
+        .expect("a hash join has at least one key")
 }
 
 /// A statement's result as rows: a query's rows, one row holding a DML count, or none.

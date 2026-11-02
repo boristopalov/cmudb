@@ -3,7 +3,7 @@
 //! a benchmark.
 #![allow(dead_code)]
 
-use crate::common::{Db, Row, int, ints};
+use crate::common::{Db, Row, int, ints, plan_contains};
 use cmudb::processor::plan::Plan;
 
 pub const POOL_FRAMES: usize = 1024;
@@ -80,19 +80,6 @@ pub fn plan_of(db: &Db, sql: &str) -> Plan {
     db.plan_of(sql)
 }
 
-pub fn plan_contains(plan: &Plan, wanted: fn(&Plan) -> bool) -> bool {
-    wanted(plan)
-        || match plan {
-            Plan::Filter(p) => plan_contains(&p.child, wanted),
-            Plan::Projection(p) => plan_contains(&p.child, wanted),
-            Plan::Aggregation(p) => plan_contains(&p.child, wanted),
-            Plan::Sort(p) => plan_contains(&p.child, wanted),
-            Plan::ExternalMergeSort(p) => plan_contains(&p.child, wanted),
-            Plan::Limit(p) => plan_contains(&p.child, wanted),
-            _ => false,
-        }
-}
-
 pub fn check_case(db: &Db, case: &Case) {
     if let Some(wanted) = case.plan {
         assert!(
@@ -146,11 +133,11 @@ pub fn cases() -> Vec<Case> {
             plan: None,
         },
         Case {
-            name: "nested_loop_join_10k_x_100",
+            name: "hash_join_10k_x_100",
             sql: "SELECT COUNT(*) FROM t JOIN u ON t.id = u.tid",
             elements: ROWS,
             expect: Expect::Count(JOIN_ROWS as i32),
-            plan: Some(|p| matches!(p, Plan::NestedLoopJoin(_))),
+            plan: Some(|p| matches!(p, Plan::HashJoin(_))),
         },
         Case {
             name: "index_join_100_into_10k",
