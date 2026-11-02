@@ -7,8 +7,8 @@ use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, CreateIndex as SqlCreateIndex,
     CreateTable as SqlCreateTable, DataType as SqlDataType, Delete, Expr, FromTable, Function,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Insert, JoinConstraint,
-    JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderByExpr, OrderByKind, Query,
-    SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins, Update,
+    JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderByExpr, OrderByKind,
+    Query, SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins, Update,
     Value as SqlValue,
 };
 
@@ -92,6 +92,12 @@ pub enum BinderError {
     UnsupportedLiteral { literal: String },
     /// An expression form the binder does not handle, such as `IN (...)`.
     UnsupportedExpression { expr: String },
+    /// No table has an index with this name.
+    IndexNotFound { index: String },
+    /// `DROP INDEX` without `ON` names an index that more than one table has.
+    AmbiguousIndex { index: String },
+    /// A DROP of an object other than a table or an index, such as a view.
+    UnsupportedDropObject { object_type: String },
     /// A statement shape or clause the binder does not handle.
     Unsupported(Unsupported),
 }
@@ -155,6 +161,15 @@ impl fmt::Display for BinderError {
             BinderError::UnsupportedExpression { expr } => {
                 write!(f, "unsupported expression: {expr}")
             }
+            BinderError::IndexNotFound { index } => write!(f, "index not found: {index}"),
+            BinderError::AmbiguousIndex { index } => write!(
+                f,
+                "index name {index} is ambiguous: more than one table has an index with that \
+                 name, so name the table with DROP INDEX {index} ON <table>"
+            ),
+            BinderError::UnsupportedDropObject { object_type } => {
+                write!(f, "DROP {object_type} is not supported")
+            }
             BinderError::Unsupported(feature) => write!(f, "{feature}"),
         }
     }
@@ -171,8 +186,8 @@ impl From<Unsupported> for BinderError {
 /// A statement shape or clause the binder does not handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unsupported {
-    /// A statement other than SELECT, VALUES, INSERT, DELETE, UPDATE, CREATE TABLE or
-    /// CREATE INDEX.
+    /// A statement other than SELECT, VALUES, INSERT, DELETE, UPDATE, CREATE TABLE,
+    /// CREATE INDEX, DROP TABLE or DROP INDEX.
     Statement,
     /// A query body other than SELECT, VALUES or a parenthesized query.
     QueryBody,
@@ -230,6 +245,18 @@ pub enum Unsupported {
     UnnamedIndex,
     /// An index key that is not a plain column name.
     IndexKeyExpression,
+    /// `DROP ... CASCADE`.
+    DropCascade,
+    /// `DROP ... RESTRICT`.
+    DropRestrict,
+    /// `DROP ... PURGE`.
+    DropPurge,
+    /// A DROP with the MySQL keyword for session-scoped tables.
+    DropTemporary,
+    /// A DROP that names more than one object.
+    DropManyObjects,
+    /// `DROP TABLE ... ON <table>`.
+    DropTableOn,
 }
 
 impl fmt::Display for Unsupported {
@@ -274,6 +301,12 @@ impl fmt::Display for Unsupported {
             Unsupported::TupleAssignment => "tuple UPDATE assignment not supported",
             Unsupported::UnnamedIndex => "CREATE INDEX without a name",
             Unsupported::IndexKeyExpression => "index columns must be plain identifiers",
+            Unsupported::DropCascade => "DROP ... CASCADE is not supported",
+            Unsupported::DropRestrict => "DROP ... RESTRICT is not supported",
+            Unsupported::DropPurge => "DROP ... PURGE is not supported",
+            Unsupported::DropTemporary => "DROP TEMPORARY is not supported",
+            Unsupported::DropManyObjects => "DROP of more than one object is not supported",
+            Unsupported::DropTableOn => "DROP TABLE ... ON is not supported",
         })
     }
 }
@@ -857,6 +890,59 @@ impl<'a> Binder<'a> {
         }))
     }
 
+    fn resolve_drop_table(
+        &self,
+        name: &ObjectName,
+        if_exists: bool,
+    ) -> Result<BoundStatement, BinderError> {
+        let table_name = ident_name(name)?;
+        let table_oid = match self.catalog.table_oid(&table_name).ok() {
+            None if !if_exists => {
+                return Err(BinderError::TableNotFound { table: table_name });
+            }
+            oid => oid,
+        };
+        Ok(BoundStatement::DropTable(BoundDropTable {
+            table_oid,
+            if_exists,
+        }))
+    }
+
+    /// Binds `DROP INDEX name [ON table]`. Without `ON`, the index is looked up across every
+    /// table, and a name that more than one table uses is an error.
+    fn resolve_drop_index(
+        &self,
+        name: &ObjectName,
+        table: Option<&ObjectName>,
+        if_exists: bool,
+    ) -> Result<BoundStatement, BinderError> {
+        let index_name = ident_name(name)?;
+        let candidates = match table {
+            Some(table) => {
+                let table_name = ident_name(table)?;
+                if self.catalog.table_oid(&table_name).is_err() && !if_exists {
+                    return Err(BinderError::TableNotFound { table: table_name });
+                }
+                self.catalog
+                    .index_oid(&table_name, &index_name)
+                    .ok()
+                    .into_iter()
+                    .collect()
+            }
+            None => self.catalog.index_oids_named(&index_name),
+        };
+        let index_oid = match candidates.as_slice() {
+            [] if if_exists => None,
+            [] => return Err(BinderError::IndexNotFound { index: index_name }),
+            [oid] => Some(*oid),
+            _ => return Err(BinderError::AmbiguousIndex { index: index_name }),
+        };
+        Ok(BoundStatement::DropIndex(BoundDropIndex {
+            index_oid,
+            if_exists,
+        }))
+    }
+
     /// Binds every statement against the catalog as it is now. A statement that depends on an
     /// earlier one in the same batch (such as an INSERT into a table created just before it) fails
     /// to bind; run statements one at a time with [`Binder::bind_statement`] instead.
@@ -873,6 +959,37 @@ impl<'a> Binder<'a> {
             Statement::Update(u) => self.resolve_update(u),
             Statement::CreateTable(c) => self.resolve_create_table(c),
             Statement::CreateIndex(c) => self.resolve_create_index(c),
+            Statement::Drop {
+                object_type,
+                if_exists,
+                names,
+                cascade,
+                restrict,
+                purge,
+                temporary,
+                table,
+            } => {
+                let modifiers = [
+                    (Unsupported::DropCascade, *cascade),
+                    (Unsupported::DropRestrict, *restrict),
+                    (Unsupported::DropPurge, *purge),
+                    (Unsupported::DropTemporary, *temporary),
+                ];
+                if let Some((modifier, _)) = modifiers.iter().find(|(_, set)| *set) {
+                    return Err((*modifier).into());
+                }
+                let [name] = names.as_slice() else {
+                    return Err(Unsupported::DropManyObjects.into());
+                };
+                match object_type {
+                    ObjectType::Table if table.is_some() => Err(Unsupported::DropTableOn.into()),
+                    ObjectType::Table => self.resolve_drop_table(name, *if_exists),
+                    ObjectType::Index => self.resolve_drop_index(name, table.as_ref(), *if_exists),
+                    other => Err(BinderError::UnsupportedDropObject {
+                        object_type: other.to_string(),
+                    }),
+                }
+            }
             _ => Err(Unsupported::Statement.into()),
         }
     }
@@ -1030,6 +1147,8 @@ pub enum BoundStatement {
     Update(BoundUpdate),
     CreateTable(BoundCreateTable),
     CreateIndex(BoundCreateIndex),
+    DropTable(BoundDropTable),
+    DropIndex(BoundDropIndex),
 }
 
 /// A bound SELECT: the tables in scope, an optional two-way join, projections, filters, grouping,
@@ -1088,6 +1207,20 @@ pub struct BoundCreateIndex {
     pub index_schema: Schema,
 }
 
+/// A bound `DROP TABLE`. `table_oid` is `None` when the table does not exist and the statement
+/// says `IF EXISTS`.
+pub struct BoundDropTable {
+    pub table_oid: Option<TableOid>,
+    pub if_exists: bool,
+}
+
+/// A bound `DROP INDEX`. `index_oid` is `None` when the index does not exist and the statement
+/// says `IF EXISTS`.
+pub struct BoundDropIndex {
+    pub index_oid: Option<u32>,
+    pub if_exists: bool,
+}
+
 /// The tables a statement can reference, keyed by the alias (or table name) used in the SQL.
 pub type Scope = HashMap<TableAlias, TableScope>;
 pub struct TableScope {
@@ -1132,8 +1265,8 @@ mod tests {
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
-    use super::{Binder, BinderError, BoundStatement, Unsupported};
-    use crate::catalog::{Catalog, DataType, Schema};
+    use super::{Binder, BinderError, BoundDropIndex, BoundDropTable, BoundStatement, Unsupported};
+    use crate::catalog::{Catalog, DataType, IndexType, Schema};
     use crate::processor::plan::{ColIdx, Expression, JoinColumn, JoinPredicate, Side};
 
     fn catalog_with_tables(tables: &[(&str, &[&str])]) -> (Catalog, tempfile::TempDir) {
@@ -1437,5 +1570,74 @@ mod tests {
             .err()
             .expect("INSERT cannot see t yet");
         assert_eq!(err, BinderError::TableNotFound { table: "t".into() });
+    }
+
+    #[test]
+    fn drop_table_binds_to_the_tables_oid_or_to_none_under_if_exists() {
+        let (catalog, _dir) = catalog_with_tables(&[("t", &["a"])]);
+        let oid = catalog.table_oid("t").unwrap();
+        let Ok(BoundStatement::DropTable(BoundDropTable {
+            table_oid: Some(bound),
+            if_exists: false,
+        })) = bind_one(&catalog, "DROP TABLE t")
+        else {
+            panic!("expected DROP TABLE t to bind to t's oid");
+        };
+        assert_eq!(bound, oid);
+        let Ok(BoundStatement::DropTable(BoundDropTable {
+            table_oid: None,
+            if_exists: true,
+        })) = bind_one(&catalog, "DROP TABLE IF EXISTS gone")
+        else {
+            panic!("expected DROP TABLE IF EXISTS gone to bind with no target");
+        };
+        assert_eq!(
+            bind_error(&catalog, "DROP TABLE gone"),
+            BinderError::TableNotFound {
+                table: "gone".into()
+            }
+        );
+        assert_eq!(
+            bind_error(&catalog, "DROP TABLE s.t"),
+            BinderError::QualifiedName { name: "s.t".into() }
+        );
+    }
+
+    #[test]
+    fn drop_index_finds_the_index_by_name_across_tables() {
+        let (catalog, bpm, _dir) = crate::testing::catalog(16);
+        let int_col = |name: &str| Schema::new(vec![(DataType::INT, name.to_string())]);
+        let t_oid = catalog.create_table("t".into(), int_col("a")).unwrap();
+        catalog.create_table("u".into(), int_col("b")).unwrap();
+        let index_oid = catalog
+            .create_index(bpm, t_oid, "t_a".into(), &["a"], IndexType::BPlusTree)
+            .unwrap();
+        for sql in ["DROP INDEX t_a", "DROP INDEX t_a ON t"] {
+            let Ok(BoundStatement::DropIndex(BoundDropIndex {
+                index_oid: Some(bound),
+                if_exists: false,
+            })) = bind_one(&catalog, sql)
+            else {
+                panic!("expected {sql} to bind to t_a's oid");
+            };
+            assert_eq!(bound, index_oid, "{sql}");
+        }
+        assert_eq!(
+            bind_error(&catalog, "DROP INDEX t_a ON u"),
+            BinderError::IndexNotFound {
+                index: "t_a".into()
+            }
+        );
+        assert_eq!(
+            bind_error(&catalog, "DROP TABLE t ON u"),
+            Unsupported::DropTableOn.into()
+        );
+        let Ok(BoundStatement::DropIndex(BoundDropIndex {
+            index_oid: None,
+            if_exists: true,
+        })) = bind_one(&catalog, "DROP INDEX IF EXISTS t_a ON u")
+        else {
+            panic!("expected IF EXISTS to bind with no target");
+        };
     }
 }

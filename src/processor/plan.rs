@@ -234,8 +234,10 @@ pub struct CreateTablePlanNode {
     pub if_not_exists: bool,
 }
 
+/// Drops a table and its indexes. `table_oid` is `None` when the table did not exist when the
+/// statement was bound; the drop then succeeds only under `if_exists`.
 pub struct DropTablePlanNode {
-    pub table_oid: u32,
+    pub table_oid: Option<u32>,
     pub if_exists: bool,
 }
 
@@ -245,8 +247,10 @@ pub struct CreateIndexPlanNode {
     pub key_columns: Vec<ColIdx>,
 }
 
+/// Drops an index. `index_oid` is `None` when the index did not exist when the statement was
+/// bound; the drop then succeeds only under `if_exists`.
 pub struct DropIndexPlanNode {
-    pub index_oid: u32,
+    pub index_oid: Option<u32>,
     pub if_exists: bool,
 }
 

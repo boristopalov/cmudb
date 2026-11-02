@@ -2056,11 +2056,14 @@ impl<'a> Executor for DropTableExecutor<'a> {
             return Ok(None);
         }
         self.done = true;
-        let dropped = self.catalog.drop_table(self.plan.table_oid)?;
+        let dropped = match self.plan.table_oid {
+            Some(oid) => self.catalog.drop_table(oid)?,
+            None => false,
+        };
         if !dropped && !self.plan.if_exists {
-            return Err(ExecutorError(format!(
-                "table with oid {} does not exist",
-                self.plan.table_oid
+            return Err(ExecutorError(missing_drop_target(
+                "table",
+                self.plan.table_oid,
             )));
         }
         let tup = self
@@ -2177,11 +2180,14 @@ impl<'a> Executor for DropIndexExecutor<'a> {
             return Ok(None);
         }
         self.done = true;
-        let dropped = self.catalog.drop_index(self.plan.index_oid)?;
+        let dropped = match self.plan.index_oid {
+            Some(oid) => self.catalog.drop_index(oid)?,
+            None => false,
+        };
         if !dropped && !self.plan.if_exists {
-            return Err(ExecutorError(format!(
-                "index with oid {} does not exist",
-                self.plan.index_oid
+            return Err(ExecutorError(missing_drop_target(
+                "index",
+                self.plan.index_oid,
             )));
         }
         let tup = self
@@ -2196,6 +2202,14 @@ impl<'a> Executor for DropIndexExecutor<'a> {
 
     fn close(&mut self) -> Result<(), ExecutorError> {
         Ok(())
+    }
+}
+
+/// The error message for a DROP whose `kind` of object (table or index) does not exist.
+fn missing_drop_target(kind: &str, oid: Option<u32>) -> String {
+    match oid {
+        Some(oid) => format!("{kind} with oid {oid} does not exist"),
+        None => format!("{kind} does not exist"),
     }
 }
 
