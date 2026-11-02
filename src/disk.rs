@@ -1,3 +1,4 @@
+use crate::wal::{Recovery, TxnRecord, Wal};
 use log::{info, warn};
 use parking_lot::Mutex;
 use std::{
@@ -133,8 +134,11 @@ impl Drop for DiskScheduler {
 #[derive(Debug)]
 struct PageStore {
     db_file: File,
-    /// Pages written and not deallocated since. Page `id` lives at [`offset_of`]`(id)`.
+    /// Pages written and not deallocated since. Page `id` lives at [`offset_of`]`(id)`, or in
+    /// the log when it was written since the last checkpoint.
     live: HashSet<PageId>,
+    /// The write-ahead log of a manager from [`DiskManager::open_logged`].
+    wal: Option<Wal>,
 }
 
 /// The byte offset in the data file where page `id` is stored.
@@ -193,12 +197,60 @@ impl DiskManager {
             .collect::<Result<_, _>>()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        Ok(Self {
+        Ok(Self::with_store(PageStore {
+            db_file,
+            live,
+            wal: None,
+        }))
+    }
+
+    /// Opens the data file at `db_path` behind the write-ahead log at `log_path`, creating
+    /// either if it is missing. The log is replayed into the data file first (see
+    /// [`Wal::open`]); the returned [`Recovery`] names the transactions left to roll back.
+    /// Page writes then go to the log, and [`DiskManager::sync`] makes them durable.
+    pub fn open_logged<P: AsRef<Path>>(db_path: P, log_path: P) -> io::Result<(Self, Recovery)> {
+        let db_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(db_path)?;
+        let (wal, recovery) = Wal::open(log_path.as_ref(), &db_file)?;
+        let pages_in_file = db_file.metadata()?.len() / PAGE_SIZE as u64;
+        let live = (0..pages_in_file)
+            .map(PageId::try_from)
+            .collect::<Result<_, _>>()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let dm = Self::with_store(PageStore {
+            db_file,
+            live,
+            wal: Some(wal),
+        });
+        Ok((dm, recovery))
+    }
+
+    fn with_store(store: PageStore) -> Self {
+        Self {
             num_writes: AtomicU32::new(0),
-            store: Mutex::new(PageStore { db_file, live }),
+            store: Mutex::new(store),
             #[cfg(any(test, feature = "testing"))]
             injected_write_failures: AtomicU32::new(0),
-        })
+        }
+    }
+
+    /// Logs a transaction record, if this manager has a log; see [`Wal::log_txn`].
+    pub fn log_txn(&self, record: &TxnRecord) {
+        if let Some(wal) = &mut self.store.lock().wal {
+            wal.log_txn(record);
+        }
+    }
+
+    /// Checkpoints at durable points once the log is longer than `bytes`.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_checkpoint_log_bytes(&self, bytes: u64) {
+        if let Some(wal) = &mut self.store.lock().wal {
+            wal.set_checkpoint_bytes(bytes);
+        }
     }
 
     /// Makes the next `count` calls to [`DiskManager::write_page`] fail with an
@@ -229,6 +281,14 @@ impl DiskManager {
     pub fn read_page(&self, id: PageId, mut buf: PageData) -> io::Result<PageData> {
         let store = self.store.lock();
         let offset = store.live_offset(id)?;
+        if let Some(read) = store
+            .wal
+            .as_ref()
+            .and_then(|wal| wal.read_page(id, &mut buf))
+        {
+            info!("read_page: page_id={id} from the log");
+            return read.map(|()| buf);
+        }
         info!("read_page: page_id={id} offset={offset}");
         if let Err(e) = store.db_file.read_exact_at(&mut *buf, offset) {
             warn!("read_page error page_id={id} offset={offset} err={e}");
@@ -241,6 +301,13 @@ impl DiskManager {
         self.take_injected_write_failure()?;
         let mut store = self.store.lock();
         let offset = offset_of(id);
+        if let Some(wal) = &mut store.wal {
+            wal.log_page(id, &data)?;
+            store.live.insert(id);
+            info!("write_page: logged page_id={id}");
+            self.num_writes.fetch_add(1, Ordering::AcqRel);
+            return Ok(data);
+        }
         if let Err(e) = store.db_file.write_all_at(&*data, offset) {
             warn!("write_page error page_id={id} offset={offset} err={e}");
             return Err(e);
@@ -261,9 +328,27 @@ impl DiskManager {
         freed
     }
 
-    /// Waits until every page written so far is on the storage device.
+    /// Waits until every page written so far is on the storage device. With a log, pages
+    /// become durable only together with the metadata that describes them, at
+    /// [`DiskManager::make_durable`], so this does nothing.
     pub fn sync(&self) -> io::Result<()> {
-        self.store.lock().db_file.sync_data()
+        let store = self.store.lock();
+        match &store.wal {
+            Some(_) => Ok(()),
+            None => store.db_file.sync_data(),
+        }
+    }
+
+    /// Makes everything logged so far the state the next open recovers to (see
+    /// [`Wal::durable_point`]). Without a log it syncs the data file, like
+    /// [`DiskManager::sync`].
+    pub fn make_durable(&self) -> io::Result<()> {
+        let mut store = self.store.lock();
+        let PageStore { db_file, wal, .. } = &mut *store;
+        match wal {
+            Some(wal) => wal.durable_point(db_file),
+            None => db_file.sync_data(),
+        }
     }
 }
 

@@ -62,7 +62,8 @@ storage error) taints the transaction, since there are no statement-level savepo
 
 For each written slot: if we pushed an undo entry, restore the slot from the chain head
 and pop it; if we inserted the tuple, mark it deleted at timestamp 0 (invisible to all).
-Both happen under the page write latch.
+Both happen under the page write latch. Abort also holds the commit latch, as commit does, so
+a durable point in the write-ahead log sees either outcome whole.
 
 ## Failure handling
 
@@ -80,6 +81,19 @@ Both happen under the page write latch.
 - In the shell, a failed statement aborts its transaction immediately. Inside `BEGIN`, later
   statements are refused until `ROLLBACK` (or `COMMIT`, which rolls back), as in Postgres. A
   GC failure after a commit is only logged; it never turns a commit into an error.
+
+## Recovery
+
+Undo chains live only in memory: after a reopen nothing is running, so only the newest
+version of each row matters. Pages can reach the write-ahead log while a transaction that
+wrote them is still running, so the log also carries what rolling it back needs (see
+`src/wal.rs`): `Writes` before the transaction's first write, an `Undo` record with the
+committed version each first update replaces, logged under the page latch before the slot
+changes, and `End` once commit or abort has stamped or restored every slot. A transaction
+with no durable `End` is rolled back by `Database::open`: every slot of every table stamped
+with its id gets the version from its `Undo` record, or, with none, becomes a deletion at
+timestamp 0, as abort does for inserts. Commit timestamps and transaction ids resume from
+the metadata, past every recovered id.
 
 ## Garbage collection
 
@@ -137,14 +151,6 @@ Changed:
 - Removing dead index entries and reclaiming deleted heap slots during GC. Until then,
   every key-changing update, delete and aborted insert leaves a B+ tree entry behind, and
   the uniqueness check scans all entries for a key, so heavy churn on one key gets slower.
-- Recovery of versions left uncommitted on disk. `Database::open` resumes `last_commit_ts`
-  and the transaction id counter from the data file, and closing a database rolls back the
-  block `BEGIN` left open, so committed rows are visible after a reopen and rolled-back ones
-  are not. Undo chains are not stored: after a reopen nothing is running, so only the newest
-  version of each row matters. A transaction still running on the transaction manager when the
-  database is written (or a process killed mid-commit) leaves its versions stamped with its
-  id; no new transaction gets that id, so they stay invisible, but their rows stay locked
-  against writers. Undoing them needs a WAL.
 - `CREATE`/`DROP` are not transactional. `CREATE INDEX` fills the new index from the
   newest version of each row, outside any transaction. If another transaction has an
   uncommitted update or delete open at that moment, the index can miss the row once that

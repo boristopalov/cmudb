@@ -15,6 +15,7 @@ pub mod table_heap;
 pub mod table_page;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+pub mod wal;
 
 pub use database::{Database, DdlOp, DmlOp, QueryError, StatementResult, TxnOp};
 

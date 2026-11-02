@@ -2,9 +2,11 @@ use super::transaction::{
     IsolationLevel, TXN_START_ID, Timestamp, Transaction, TransactionState, TxnId, is_txn_id,
 };
 use crate::buffer_pool::BufferPoolManager;
+use crate::disk::DiskManager;
 use crate::table_heap::{RecordId, SlotWrite, TableHeap, TableHeapError};
 use crate::table_page::TupleMeta;
-use parking_lot::{Mutex, RwLock};
+use crate::wal::{RecoveredTxn, TxnRecord};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::Arc;
@@ -103,9 +105,12 @@ pub struct GcStats {
 /// Every transaction from [`TransactionManager::begin`] ends in `commit` or `abort`. Until it
 /// does, its snapshot pins the GC watermark.
 ///
-/// Lock order: page latch, then `versions`. The commit latch is taken before page latches.
+/// Lock order: page latch, then `versions`. The commit latch is taken before page latches;
+/// commits, aborts and [`TransactionManager::pause_outcomes`] all hold it.
 pub struct TransactionManager {
     bpm: Arc<BufferPoolManager>,
+    /// Where writes, undo images and outcomes are logged when the pool has a write-ahead log.
+    log: Arc<DiskManager>,
     next_txn_id: AtomicU64,
     last_commit_ts: AtomicU64,
     /// Serializes commits so commit timestamps are published in order.
@@ -120,6 +125,7 @@ pub struct TransactionManager {
 impl TransactionManager {
     pub fn new(bpm: Arc<BufferPoolManager>) -> Self {
         Self {
+            log: bpm.disk_manager(),
             bpm,
             next_txn_id: AtomicU64::new(TXN_START_ID),
             last_commit_ts: AtomicU64::new(0),
@@ -239,8 +245,93 @@ impl TransactionManager {
         }
         self.last_commit_ts.store(commit_ts, Ordering::Release);
         txn.finish(TransactionState::Committed, Some(commit_ts));
+        self.log_end(txn);
         self.unregister(txn);
         Ok(commit_ts)
+    }
+
+    /// Holds off commits and aborts until the guard drops, so a durable point taken under it
+    /// holds each transaction either wholly before or wholly after its outcome was applied.
+    pub(crate) fn pause_outcomes(&self) -> MutexGuard<'_, ()> {
+        self.commit_latch.lock()
+    }
+
+    /// Logs that `txn` is about to write its first tuple. Its uncommitted versions can reach
+    /// the log only after this record, so recovery knows to look for them.
+    pub(crate) fn log_first_write(&self, txn: &Transaction) {
+        if !txn.mark_writes_logged() {
+            self.log.log_txn(&TxnRecord::Writes(txn.id()));
+        }
+    }
+
+    /// Logs the committed version `meta` / `data` that `txn` is about to overwrite in `rid`,
+    /// from under the slot's page write latch, so the record precedes every image of the page
+    /// that holds the overwrite.
+    pub(crate) fn log_undo(&self, txn: &Transaction, rid: RecordId, meta: TupleMeta, data: &[u8]) {
+        self.log.log_txn(&TxnRecord::Undo {
+            txn: txn.id(),
+            rid,
+            meta,
+            data: data.to_vec(),
+        });
+    }
+
+    fn log_end(&self, txn: &Transaction) {
+        if txn.writes_logged() {
+            self.log.log_txn(&TxnRecord::End(txn.id()));
+        }
+    }
+
+    /// Rolls back what the transactions in `unfinished` left in `heaps` before a crash: each
+    /// slot stamped with one of their ids gets the version their undo image holds, or becomes
+    /// a deletion at timestamp 0 when they inserted it. Then logs each one as ended. Returns
+    /// how many slots it rolled back.
+    pub fn roll_back_recovered(
+        &self,
+        heaps: &[&TableHeap],
+        unfinished: &[RecoveredTxn],
+    ) -> Result<usize, TxnError> {
+        let by_id: HashMap<TxnId, &RecoveredTxn> = unfinished.iter().map(|t| (t.id, t)).collect();
+        let mut rolled_back = 0;
+        for heap in heaps {
+            let mut stamped = Vec::new();
+            let mut slots = heap.iter();
+            while let Some(found) = slots
+                .next_with(|rid, meta, _| by_id.contains_key(&meta.ts).then_some((rid, meta.ts)))
+            {
+                stamped.push(found?);
+            }
+            for (rid, txn_id) in stamped {
+                let image = by_id[&txn_id].undo.get(&rid);
+                TableHeap::write_slot(&self.bpm, rid, |meta, _| {
+                    if meta.ts != txn_id {
+                        return Err(TxnError::UnexpectedStamp {
+                            rid,
+                            expected: txn_id,
+                            found: meta.ts,
+                        });
+                    }
+                    Ok(match image {
+                        Some(image) => SlotWrite {
+                            meta: image.meta,
+                            data: Some(image.data.clone()),
+                        },
+                        None => SlotWrite {
+                            meta: TupleMeta {
+                                ts: 0,
+                                is_deleted: true,
+                            },
+                            data: None,
+                        },
+                    })
+                })?;
+                rolled_back += 1;
+            }
+        }
+        for txn in unfinished {
+            self.log.log_txn(&TxnRecord::End(txn.id));
+        }
+        Ok(rolled_back)
     }
 
     /// Re-stamps `rid` from timestamp `from` to `to`, keeping its deleted flag.
@@ -277,6 +368,7 @@ impl TransactionManager {
             TransactionState::Running | TransactionState::Tainted => {}
             s => return Err(TxnError::InvalidState(s)),
         }
+        let _outcomes = self.commit_latch.lock();
         txn.set_tainted();
         for (rid, pushed_undo) in txn.write_entries() {
             TableHeap::write_slot_then(
@@ -325,6 +417,7 @@ impl TransactionManager {
             txn.forget_write(rid);
         }
         txn.finish(TransactionState::Aborted, None);
+        self.log_end(txn);
         self.unregister(txn);
         Ok(())
     }

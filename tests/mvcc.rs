@@ -699,13 +699,13 @@ mod failure_paths {
         let mgr = TransactionManager::new(bpm.clone());
 
         let t0 = mgr.begin(IsolationLevel::SnapshotIsolation);
-        let a = mvcc::insert_tuple(&t0, &heap, &[], &tuple(1)).unwrap();
+        let a = mvcc::insert_tuple(&t0, &mgr, &heap, &[], &tuple(1)).unwrap();
         mgr.commit(&t0).unwrap();
         let committed = mgr.last_commit_ts();
 
         let t1 = mgr.begin(IsolationLevel::SnapshotIsolation);
         mvcc::update_tuple(&t1, &mgr, &heap, &[], a, &tuple(1), &tuple(2)).unwrap();
-        let c = mvcc::insert_tuple(&t1, &heap, &[], &tuple(3)).unwrap();
+        let c = mvcc::insert_tuple(&t1, &mgr, &heap, &[], &tuple(3)).unwrap();
 
         let pin = bpm.new_page().unwrap();
         let no_frame = |e: &TxnError| {
@@ -750,7 +750,7 @@ mod failure_paths {
         let db = Db::new();
         let heap = TableHeap::new(db.bpm.clone()).unwrap();
         let t0 = db.begin();
-        let a = mvcc::insert_tuple(&t0, &heap, &[], &tuple(1)).unwrap();
+        let a = mvcc::insert_tuple(&t0, &db.mgr, &heap, &[], &tuple(1)).unwrap();
         db.commit(&t0);
         let t1 = db.begin();
         mvcc::delete_tuple(&t1, &db.mgr, &heap, a).unwrap();
@@ -814,8 +814,8 @@ mod failure_paths {
         let db = Db::new();
         let heap = TableHeap::new(db.bpm.clone()).unwrap();
         let t0 = db.begin();
-        let a = mvcc::insert_tuple(&t0, &heap, &[], &tuple(1)).unwrap();
-        mvcc::insert_tuple(&t0, &heap, &[], &tuple(2)).unwrap();
+        let a = mvcc::insert_tuple(&t0, &db.mgr, &heap, &[], &tuple(1)).unwrap();
+        mvcc::insert_tuple(&t0, &db.mgr, &heap, &[], &tuple(2)).unwrap();
         db.commit(&t0);
 
         let t1 = db.begin();

@@ -1,5 +1,6 @@
 //! End-to-end tests for the `cmudb` SQL shell binary: SQL goes in on stdin,
 //! results come out on stdout and errors on stderr.
+use cmudb::StatementResult;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -192,4 +193,61 @@ fn the_shell_rejects_extra_arguments_and_a_foreign_data_file() {
     assert!(!out.status.success());
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(err.contains("cannot open the database in"), "{err}");
+}
+
+/// Reads the shell's stdout until a line equal to `line` comes out.
+fn read_until_line(out: &mut impl std::io::BufRead, line: &str) {
+    let mut seen = Vec::new();
+    loop {
+        let mut next = String::new();
+        let n = out.read_line(&mut next).expect("read the shell's stdout");
+        assert!(
+            n > 0,
+            "the shell stopped before printing {line:?}: {seen:?}"
+        );
+        if next.trim_end().ends_with(line) {
+            return;
+        }
+        seen.push(next);
+    }
+}
+
+#[test]
+fn killing_the_shell_after_a_commit_keeps_the_commit_and_drops_the_open_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cmudb"))
+        .arg(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn cmudb");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+
+    stdin
+        .write_all(
+            b"CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2);\n\
+              BEGIN; UPDATE t SET a = 20 WHERE a = 2; INSERT INTO t VALUES (3); COMMIT;\n",
+        )
+        .unwrap();
+    read_until_line(&mut stdout, "COMMIT");
+    stdin
+        .write_all(b"BEGIN; DELETE FROM t WHERE a = 1; INSERT INTO t VALUES (4);\n")
+        .unwrap();
+    read_until_line(&mut stdout, "INSERT 1");
+    child.kill().expect("kill the shell");
+    child.wait().unwrap();
+
+    let db = cmudb::Database::open(dir.path(), 16).expect("reopen after the kill");
+    let results = db.execute("SELECT a FROM t ORDER BY a;").unwrap();
+    let Some(StatementResult::Rows { rows, .. }) = results.into_iter().last() else {
+        panic!("no rows");
+    };
+    let a: Vec<_> = rows.into_iter().map(|r| r[0].clone()).collect();
+    assert_eq!(
+        a,
+        [1, 3, 20].map(|v| Some(cmudb::catalog::Value::INT(v))),
+        "the commit survived the kill and the open block did not"
+    );
 }

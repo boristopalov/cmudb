@@ -1222,6 +1222,7 @@ fn select_over_a_stored_tuple_shorter_than_its_schema_is_an_error_not_a_panic() 
         let txn = db.txn_mgr().begin(IsolationLevel::SnapshotIsolation);
         mvcc::insert_tuple(
             &txn,
+            db.txn_mgr(),
             &table.heap,
             &[],
             &Tuple {

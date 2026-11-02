@@ -59,7 +59,13 @@ impl<'a> Executor for InsertExecutor<'a> {
         let mut count: u64 = 0;
         while let Some(batch) = self.child.next_batch()? {
             for (tuple, _) in batch {
-                mvcc::insert_tuple(&self.ctx.txn, &table.heap, &indexes, &tuple)?;
+                mvcc::insert_tuple(
+                    &self.ctx.txn,
+                    &self.ctx.txn_mgr,
+                    &table.heap,
+                    &indexes,
+                    &tuple,
+                )?;
                 count += 1;
             }
         }

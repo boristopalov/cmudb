@@ -21,6 +21,7 @@ use crate::processor::executor_factory::create_executor;
 use crate::processor::plan::Plan;
 use crate::replacer::ArcReplacer;
 use crate::table_heap::TableHeapError;
+use crate::wal::RecoveredTxn;
 use parking_lot::Mutex;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
@@ -320,13 +321,14 @@ impl Database {
     /// Opens the database stored in directory `dir` with a `frames`-frame buffer pool, or
     /// creates an empty one there, creating the directory too, if it holds no data file.
     ///
-    /// The data file is written after every commit made through [`Database::execute`] (or
-    /// [`Database::execute_plan`]) and when the database closes, by [`Database::close`] or
-    /// by being dropped. A transaction committed directly on [`Database::txn_mgr`] is written
-    /// at the next of those. Pages evicted from the buffer pool are written in between, and
-    /// there is no log to undo them, so a crash or kill can leave the data file unopenable or
-    /// inconsistent. The data file is locked while the database is open, so a second open of
-    /// the same directory fails with [`PersistError::InUse`].
+    /// Pages go to a write-ahead log, [`LOG_FILE`], which is replayed on open (see
+    /// [`crate::wal`]). Every commit made through [`Database::execute`] (or
+    /// [`Database::execute_plan`]) is durable once it returns, and so is the database when it
+    /// closes, by [`Database::close`] or by being dropped; a transaction committed directly on
+    /// [`Database::txn_mgr`] is durable at the next of those. After a crash or kill, opening
+    /// the database brings back every durable commit and rolls back the writes of every
+    /// transaction that had not committed. The data file is locked while the database is
+    /// open, so a second open of the same directory fails with [`PersistError::InUse`].
     pub fn open(dir: impl AsRef<Path>, frames: usize) -> Result<Self, PersistError> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
@@ -341,8 +343,8 @@ impl Database {
             std::fs::TryLockError::WouldBlock => PersistError::InUse,
             std::fs::TryLockError::Error(e) => PersistError::Io(e),
         })?;
+        let (dm, recovery) = DiskManager::open_logged(data_path, dir.join(LOG_FILE))?;
         let is_new = lock.metadata()?.len() == 0;
-        let dm = DiskManager::new(data_path, dir.join(LOG_FILE))?;
         let bpm = Arc::new(create_buffer_pool_manager(
             frames,
             ArcReplacer::new(frames),
@@ -351,10 +353,35 @@ impl Database {
         let mut db = if is_new {
             Self::create_persisted(bpm)?
         } else {
-            Self::load_persisted(bpm)?
+            Self::load_persisted(bpm, &recovery.unfinished)?
         };
         db._lock = Some(lock);
+        if !recovery.unfinished.is_empty() {
+            db.roll_back_recovered(&recovery.unfinished)?;
+        }
         Ok(db)
+    }
+
+    /// Rolls back the writes the transactions in `unfinished` left in the tables before a
+    /// crash, then writes the database.
+    fn roll_back_recovered(&self, unfinished: &[RecoveredTxn]) -> Result<(), PersistError> {
+        let tables = self
+            .catalog
+            .snapshot()
+            .tables
+            .iter()
+            .map(|t| self.catalog.get_table(t.oid))
+            .collect::<Result<Vec<_>, _>>()?;
+        let heaps: Vec<_> = tables.iter().map(|t| &t.heap).collect();
+        let rolled_back = self
+            .txn_mgr
+            .roll_back_recovered(&heaps, unfinished)
+            .map_err(|e| PersistError::Recovery(e.to_string()))?;
+        log::info!(
+            "recovery rolled back {rolled_back} slot(s) of {} unfinished transaction(s)",
+            unfinished.len()
+        );
+        self.checkpoint()
     }
 
     fn create_persisted(bpm: Arc<BufferPoolManager>) -> Result<Self, PersistError> {
@@ -374,16 +401,20 @@ impl Database {
         Ok(db)
     }
 
-    fn load_persisted(bpm: Arc<BufferPoolManager>) -> Result<Self, PersistError> {
+    fn load_persisted(
+        bpm: Arc<BufferPoolManager>,
+        unfinished: &[RecoveredTxn],
+    ) -> Result<Self, PersistError> {
         let (chain, payload) = read_chain(&bpm, read_header(&bpm)?)?;
         let meta = DatabaseMeta::decode(&payload)?;
         bpm.resume_allocation(&meta.allocation)?;
         let mut db = Self::new(bpm.clone());
         db.catalog = Catalog::restore(bpm.clone(), &meta.catalog)?;
+        let after_unfinished = unfinished.iter().map(|t| t.id + 1).max().unwrap_or(0);
         db.txn_mgr = Arc::new(TransactionManager::resume(
             bpm,
             meta.last_commit_ts,
-            meta.next_txn_id,
+            meta.next_txn_id.max(after_unfinished),
         ));
         db.persisted = Some(Mutex::new(Persisted {
             chain,
@@ -401,8 +432,8 @@ impl Database {
         result
     }
 
-    /// Lets go of the database the way a killed process does: nothing is rolled back or
-    /// written, and the lock on the data file is released. For crash tests.
+    /// Lets go of the database the way a killed process does: nothing is rolled back, written
+    /// or made durable, and the lock on the data file is released. For crash tests.
     #[cfg(any(test, feature = "testing"))]
     pub fn abandon(mut self) {
         drop(self._lock.take());
@@ -426,12 +457,14 @@ impl Database {
     }
 
     /// Writes the catalog, the page allocation and the transaction clocks to the metadata
-    /// chain, then every dirty page to the data file. Does nothing for a database that was
-    /// not opened with [`Database::open`].
+    /// chain, then every dirty page to the log, and makes it all durable. Commits and aborts
+    /// wait meanwhile, so the durable state holds each transaction's outcome whole or not at
+    /// all. Does nothing for a database that was not opened with [`Database::open`].
     pub fn checkpoint(&self) -> Result<(), PersistError> {
         let Some(persisted) = &self.persisted else {
             return Ok(());
         };
+        let _outcomes = self.txn_mgr.pause_outcomes();
         let mut persisted = persisted.lock();
         let payload = loop {
             let payload = self.meta().encode();
@@ -448,6 +481,7 @@ impl Database {
             persisted.written = payload;
         }
         self.bpm.flush_all()?;
+        self.bpm.disk_manager().make_durable()?;
         Ok(())
     }
 
