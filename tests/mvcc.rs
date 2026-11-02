@@ -606,8 +606,11 @@ fn null_to_value_update_stays_in_place() {
 
 mod failure_paths {
     use super::*;
-    use cmudb::concurrency::mvcc;
-    use cmudb::table_heap::{TableHeap, Tuple};
+    use cmudb::buffer_pool::BpmError;
+    use cmudb::concurrency::TxnError;
+    use cmudb::concurrency::mvcc::{self, MvccError};
+    use cmudb::table_heap::{TableHeap, TableHeapError, Tuple};
+    use cmudb::table_page::TablePageError;
 
     fn tuple(b: u8) -> Tuple {
         Tuple { data: vec![b; 16] }
@@ -644,10 +647,18 @@ mod failure_paths {
         let c = mvcc::insert_tuple(&t1, &heap, &[], &tuple(3)).unwrap();
 
         let pin = bpm.new_page().unwrap();
-        assert!(mgr.commit(&t1).is_err());
+        let no_frame = |e: &TxnError| {
+            matches!(
+                e,
+                TxnError::Storage(TableHeapError::Bpm(BpmError::NoFreeFrame))
+            )
+        };
+        let err = mgr.commit(&t1).unwrap_err();
+        assert!(no_frame(&err), "{err:?}");
         assert_eq!(t1.state(), TransactionState::Tainted);
         assert_eq!(mgr.last_commit_ts(), committed, "nothing was published");
-        assert!(mgr.abort(&t1).is_err());
+        let err = mgr.abort(&t1).unwrap_err();
+        assert!(no_frame(&err), "{err:?}");
         assert_eq!(
             t1.write_set().len(),
             2,
@@ -674,6 +685,27 @@ mod failure_paths {
     }
 
     #[test]
+    fn writing_a_committed_deletion_is_a_storage_error() {
+        let db = Db::new();
+        let heap = TableHeap::new(db.bpm.clone()).unwrap();
+        let t0 = db.begin();
+        let a = mvcc::insert_tuple(&t0, &heap, &[], &tuple(1)).unwrap();
+        db.commit(&t0);
+        let t1 = db.begin();
+        mvcc::delete_tuple(&t1, &db.mgr, &heap, a).unwrap();
+        db.commit(&t1);
+
+        let t2 = db.begin();
+        let err = mvcc::delete_tuple(&t2, &db.mgr, &heap, a).unwrap_err();
+        assert!(
+            matches!(err, MvccError::Txn(TxnError::Storage(TableHeapError::Deleted { rid })) if rid == a),
+            "{err:?}"
+        );
+        assert_eq!(t2.state(), TransactionState::Tainted);
+        db.abort(&t2);
+    }
+
+    #[test]
     fn rejected_write_leaves_no_undo_entry() {
         let db = Db::new();
         let heap = TableHeap::new(db.bpm.clone()).unwrap();
@@ -683,7 +715,17 @@ mod failure_paths {
 
         let t1 = db.begin();
         let wider = Tuple { data: vec![9; 17] };
-        assert!(mvcc::update_tuple(&t1, &db.mgr, &heap, &[], a, &tuple(1), &wider).is_err());
+        let err = mvcc::update_tuple(&t1, &db.mgr, &heap, &[], a, &tuple(1), &wider).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MvccError::Txn(TxnError::Storage(TableHeapError::Page {
+                    source: TablePageError::SizeChange { .. },
+                    ..
+                }))
+            ),
+            "{err:?}"
+        );
         assert_eq!(t1.state(), TransactionState::Tainted);
         assert_eq!(db.mgr.num_version_chains(), 0);
         assert!(t1.write_set().is_empty());

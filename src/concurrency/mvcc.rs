@@ -148,9 +148,7 @@ fn write_version(
         |meta, bytes| {
             check_write(txn, rid, meta)?;
             if meta.is_deleted {
-                return Err(MvccError::Txn(TxnError::Storage(format!(
-                    "record ({rid}) is deleted"
-                ))));
+                return Err(MvccError::from(TableHeapError::Deleted { rid }));
             }
             let first_write_in_txn = meta.ts != txn.id();
             let undo = first_write_in_txn.then(|| (meta, bytes.to_vec()));
