@@ -1149,3 +1149,212 @@ fn drop_if_exists_skips_a_missing_table_or_index() {
     db.exec("DROP TABLE IF EXISTS emp");
     assert!(db.catalog().table_oid("emp").is_err());
 }
+
+fn distinct_db() -> Db {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE t (a INTEGER, b INTEGER)");
+    db.exec(
+        "INSERT INTO t VALUES \
+         (1, 10), (1, 10), (1, 20), (2, 10), (2, 10), \
+         (NULL, 10), (NULL, 10), (NULL, NULL), (NULL, NULL), (3, NULL)",
+    );
+    db
+}
+
+#[test]
+fn select_distinct_removes_duplicate_rows_over_one_or_more_columns() {
+    let db = distinct_db();
+    assert_eq!(
+        sorted_nullable(nullable_ints(&db.exec("SELECT DISTINCT a FROM t"))),
+        vec![vec![None], vec![Some(1)], vec![Some(2)], vec![Some(3)]]
+    );
+    assert_eq!(
+        sorted_nullable(nullable_ints(&db.exec("SELECT DISTINCT a, b FROM t"))),
+        vec![
+            vec![None, None],
+            vec![None, Some(10)],
+            vec![Some(1), Some(10)],
+            vec![Some(1), Some(20)],
+            vec![Some(2), Some(10)],
+            vec![Some(3), None],
+        ]
+    );
+    assert_eq!(
+        sorted_nullable(nullable_ints(&db.exec("SELECT DISTINCT * FROM t"))),
+        sorted_nullable(nullable_ints(&db.exec("SELECT DISTINCT a, b FROM t")))
+    );
+}
+
+#[test]
+fn select_distinct_keeps_every_null_in_one_group() {
+    let db = emp_db();
+    db.exec("INSERT INTO emp VALUES (5, 10, 500, 5.0, NULL), (6, 10, 600, 6.0, true)");
+    let mut active: Vec<Option<bool>> = db
+        .exec("SELECT DISTINCT active FROM emp")
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [Some(Value::BOOLEAN(b))] => Some(*b),
+            [None] => None,
+            other => panic!("expected one BOOLEAN or NULL column, got {other:?}"),
+        })
+        .collect();
+    active.sort();
+    assert_eq!(active, vec![None, Some(false), Some(true)]);
+}
+
+#[test]
+fn select_distinct_sorts_and_limits_the_distinct_rows() {
+    let db = distinct_db();
+    assert_eq!(
+        nullable_ints(&db.exec("SELECT DISTINCT a FROM t ORDER BY a")),
+        vec![vec![Some(1)], vec![Some(2)], vec![Some(3)], vec![None]]
+    );
+    assert_eq!(
+        nullable_ints(&db.exec("SELECT DISTINCT a FROM t ORDER BY a DESC LIMIT 3")),
+        vec![vec![None], vec![Some(3)], vec![Some(2)]]
+    );
+    assert_eq!(
+        nullable_ints(&db.exec("SELECT DISTINCT b, a FROM t ORDER BY a NULLS FIRST, b LIMIT 4")),
+        vec![
+            vec![Some(10), None],
+            vec![None, None],
+            vec![Some(10), Some(1)],
+            vec![Some(20), Some(1)],
+        ]
+    );
+    assert_eq!(
+        nullable_ints(&db.exec("SELECT DISTINCT a FROM t ORDER BY a LIMIT 0")),
+        Vec::<Vec<Option<i32>>>::new()
+    );
+}
+
+#[test]
+fn select_distinct_applies_to_computed_and_aggregated_columns() {
+    let db = distinct_db();
+    assert_eq!(
+        ints(&db.exec("SELECT DISTINCT b * 0 + 1 FROM t WHERE b > 0")),
+        vec![[1]]
+    );
+    let emp = emp_db();
+    assert_eq!(
+        ints(&emp.exec("SELECT DISTINCT COUNT(*) FROM emp GROUP BY dept ORDER BY COUNT(*)")),
+        vec![[1], [2]]
+    );
+}
+
+#[test]
+fn select_all_keeps_duplicate_rows() {
+    let db = distinct_db();
+    assert_eq!(db.exec("SELECT ALL a FROM t").len(), 10);
+}
+
+#[test]
+fn select_distinct_plans_an_aggregation_between_the_projection_and_the_sort() {
+    let db = distinct_db();
+    let Plan::Limit(limit) = db.plan_of("SELECT DISTINCT a FROM t ORDER BY a LIMIT 2") else {
+        panic!("expected LIMIT at the top");
+    };
+    let Plan::ExternalMergeSort(sort) = *limit.child else {
+        panic!("expected the sort under LIMIT");
+    };
+    let Plan::Aggregation(distinct) = *sort.child else {
+        panic!("expected DISTINCT's aggregation under the sort");
+    };
+    assert!(
+        distinct.aggregates.is_empty() && distinct.group_bys.len() == 1,
+        "DISTINCT groups on its one projected column and computes no aggregates"
+    );
+    assert!(
+        matches!(*distinct.child, Plan::Projection(_)),
+        "DISTINCT reads the projection's output"
+    );
+}
+
+#[test]
+fn select_distinct_rejects_distinct_on_and_order_by_keys_outside_the_select_list() {
+    let db = distinct_db();
+    assert_eq!(
+        db.bind_error("SELECT DISTINCT ON (a) a, b FROM t"),
+        BinderError::Unsupported(Unsupported::DistinctOn)
+    );
+    for sql in [
+        "SELECT DISTINCT a FROM t ORDER BY b",
+        "SELECT DISTINCT a FROM t ORDER BY a + 1",
+    ] {
+        assert_eq!(
+            db.bind_error(sql),
+            BinderError::DistinctOrderByNotInSelectList,
+            "{sql}"
+        );
+    }
+    assert!(
+        db.query_error("SELECT DISTINCT ON (a) a FROM t")
+            .to_string()
+            .contains("DISTINCT ON"),
+        "the error names DISTINCT ON"
+    );
+}
+
+#[test]
+fn identical_aggregate_calls_read_one_aggregation_column() {
+    let db = emp_db();
+    let Plan::Projection(projection) =
+        db.plan_of("SELECT COUNT(*), COUNT(*) + 1, SUM(salary) FROM emp")
+    else {
+        panic!("expected a projection at the top");
+    };
+    let Plan::Aggregation(aggregation) = *projection.child else {
+        panic!("expected an aggregation under the projection");
+    };
+    assert_eq!(
+        aggregation.aggregates.len(),
+        2,
+        "COUNT(*) is computed once and SUM once"
+    );
+    assert_eq!(
+        ints(&db.exec("SELECT COUNT(*), COUNT(*) + 1, SUM(salary) FROM emp")),
+        vec![[4, 5, 1000]]
+    );
+    assert_eq!(
+        ints(&db.exec(
+            "SELECT dept, COUNT(*), COUNT(*) * 10 FROM emp GROUP BY dept ORDER BY COUNT(*) DESC, dept"
+        )),
+        vec![[10, 2, 20], [20, 1, 10], [30, 1, 10]]
+    );
+}
+
+#[test]
+fn select_distinct_removes_duplicate_window_function_rows() {
+    let db = emp_db();
+    assert_eq!(
+        ints(&db.exec(
+            "SELECT DISTINCT dept, COUNT(*) OVER (PARTITION BY dept) FROM emp ORDER BY dept"
+        )),
+        vec![[10, 2], [20, 1], [30, 1]]
+    );
+    assert_eq!(
+        ints(&db.exec(
+            "SELECT DISTINCT dept, COUNT(*) OVER (PARTITION BY dept) FROM emp \
+             ORDER BY COUNT(*) OVER (PARTITION BY dept) DESC, dept"
+        )),
+        vec![[10, 2], [20, 1], [30, 1]]
+    );
+}
+
+#[test]
+fn identical_window_calls_read_one_window_column() {
+    let db = emp_db();
+    let sql = "SELECT id, RANK() OVER (ORDER BY salary DESC), RANK() OVER (ORDER BY salary DESC) * 10 \
+               FROM emp ORDER BY RANK() OVER (ORDER BY salary DESC)";
+    assert_eq!(
+        ints(&db.exec(sql)),
+        vec![[4, 1, 10], [3, 2, 20], [2, 3, 30], [1, 4, 40]]
+    );
+    assert!(
+        plan_contains(&db.plan_of(sql), |plan| matches!(
+            plan,
+            Plan::WindowFunction(w) if w.aggregates.len() == 1
+        )),
+        "RANK() over the same window is computed once"
+    );
+}

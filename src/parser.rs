@@ -5,8 +5,8 @@ use std::fmt;
 use ordered_float::OrderedFloat;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, CreateIndex as SqlCreateIndex,
-    CreateTable as SqlCreateTable, DataType as SqlDataType, Delete, Expr, FromTable, Function,
-    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Insert, JoinConstraint,
+    CreateTable as SqlCreateTable, DataType as SqlDataType, Delete, Distinct, Expr, FromTable,
+    Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Insert, JoinConstraint,
     JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderByExpr, OrderByKind,
     Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
     Update, Value as SqlValue, WindowSpec, WindowType,
@@ -144,6 +144,8 @@ pub enum BinderError {
     UntypedGroupBy,
     /// A SELECT projection is a bare NULL, whose output column has no type.
     BareNullProjection,
+    /// A `SELECT DISTINCT` ORDER BY key that is not one of the select list's expressions.
+    DistinctOrderByNotInSelectList,
     /// A numeric literal fits neither an INT nor a FLOAT.
     InvalidNumber { literal: String },
     /// A LIMIT literal is not a non-negative integer that fits a `u32`.
@@ -226,6 +228,9 @@ impl fmt::Display for BinderError {
             BinderError::InvalidNumber { literal } => {
                 write!(f, "invalid numeric literal: {literal}")
             }
+            BinderError::DistinctOrderByNotInSelectList => f.write_str(
+                "for SELECT DISTINCT, ORDER BY expressions must appear in the select list",
+            ),
             BinderError::InvalidLimit { limit } => write!(f, "invalid LIMIT: {limit}"),
             BinderError::QualifiedName { name } => {
                 write!(f, "qualified name not supported: {name}")
@@ -274,6 +279,8 @@ pub enum Unsupported {
     QueryBody,
     /// A select item other than an unaliased expression or `*`.
     SelectItem,
+    /// `SELECT DISTINCT ON (...)`.
+    DistinctOn,
     /// A column reference with other than two parts, such as `a.b.c`.
     CompoundIdentifier,
     /// More than one comma-separated table in FROM.
@@ -376,6 +383,7 @@ impl fmt::Display for Unsupported {
             Unsupported::Statement => "unsupported statement",
             Unsupported::QueryBody => "unsupported query body",
             Unsupported::SelectItem => "unsupported select item",
+            Unsupported::DistinctOn => "SELECT DISTINCT ON (...) is not supported",
             Unsupported::CompoundIdentifier => "only `table.column` references are supported",
             Unsupported::CommaSeparatedFrom => "comma-separated FROM tables not supported",
             Unsupported::FromTarget => "FROM target must be a plain table",
@@ -631,8 +639,15 @@ impl<'a> Binder<'a> {
         let ctx = ctx_mut
             .as_mut()
             .ok_or(BinderError::AggregateOutsideProjection)?;
-        let col_idx = ctx.group_bys.len() + ctx.aggregates.len();
-        ctx.aggregates.push((arg_expr, agg_type));
+        let aggregate = (arg_expr, agg_type);
+        let agg_idx = match ctx.aggregates.iter().position(|a| *a == aggregate) {
+            Some(existing) => existing,
+            None => {
+                ctx.aggregates.push(aggregate);
+                ctx.aggregates.len() - 1
+            }
+        };
+        let col_idx = ctx.group_bys.len() + agg_idx;
         Ok(Expression::Column {
             col: ColIdx(col_idx as u32),
             dtype: result_dtype,
@@ -727,13 +742,23 @@ impl<'a> Binder<'a> {
         let ctx = ctx_mut
             .as_mut()
             .ok_or(BinderError::WindowOutsideProjection)?;
-        let placeholder = ctx.input_width + ctx.calls.len();
-        ctx.calls.push((window, ctx.windows[window].calls.len()));
-        ctx.windows[window].calls.push(BoundWindowCall {
-            arg,
-            agg_type,
-            dtype,
+        let existing = ctx.calls.iter().position(|&(w, pos)| {
+            let call = &ctx.windows[w].calls[pos];
+            w == window && call.arg == arg && call.agg_type == agg_type
         });
+        let call = match existing {
+            Some(call) => call,
+            None => {
+                ctx.calls.push((window, ctx.windows[window].calls.len()));
+                ctx.windows[window].calls.push(BoundWindowCall {
+                    arg,
+                    agg_type,
+                    dtype,
+                });
+                ctx.calls.len() - 1
+            }
+        };
+        let placeholder = ctx.input_width + call;
         Ok(Expression::Column {
             col: ColIdx(placeholder as u32),
             dtype,
@@ -802,6 +827,7 @@ impl<'a> Binder<'a> {
 
             SetExpr::Select(s) => {
                 reject_unsupported_select_clauses(s)?;
+                let distinct = is_distinct(s.distinct.as_ref())?;
                 let (scope, join) = self.build_select_scope(&s.from)?;
                 let filters = s
                     .selection
@@ -861,6 +887,10 @@ impl<'a> Binder<'a> {
                     }
                     _ => vec![],
                 };
+                let sort = match sort {
+                    Some(keys) if distinct => Some(sort_by_select_list(keys, &projections)?),
+                    other => other,
+                };
                 let limit = resolve_limit(q.limit_clause.as_ref())?;
                 let (group_bys, aggregates) = agg_ctx
                     .map(|ctx| (ctx.group_bys, ctx.aggregates))
@@ -870,6 +900,7 @@ impl<'a> Binder<'a> {
                     scope,
                     join,
                     projections,
+                    distinct,
                     filters,
                     group_bys,
                     aggregates,
@@ -1355,6 +1386,37 @@ fn reject_unsupported_select_clauses(s: &Select) -> Result<(), BinderError> {
     }
 }
 
+/// Whether a SELECT removes duplicate rows; `DISTINCT ON (...)` is rejected.
+fn is_distinct(distinct: Option<&Distinct>) -> Result<bool, BinderError> {
+    match distinct {
+        None | Some(Distinct::All) => Ok(false),
+        Some(Distinct::Distinct) => Ok(true),
+        Some(Distinct::On(_)) => Err(Unsupported::DistinctOn.into()),
+    }
+}
+
+/// Rewrites ORDER BY keys to read the projection output: each key becomes a reference to the
+/// first select-list expression equal to it.
+fn sort_by_select_list(
+    keys: Vec<SortExpr>,
+    projections: &[Expression],
+) -> Result<Vec<SortExpr>, BinderError> {
+    keys.into_iter()
+        .map(|key| {
+            let (col, projection) = projections
+                .iter()
+                .enumerate()
+                .find(|(_, p)| **p == key.expr)
+                .ok_or(BinderError::DistinctOrderByNotInSelectList)?;
+            let expr = Expression::Column {
+                col: ColIdx(col as u32),
+                dtype: projection.dtype().unwrap_or(DataType::INT),
+            };
+            Ok(SortExpr { expr, ..key })
+        })
+        .collect()
+}
+
 fn resolve_limit(clause: Option<&LimitClause>) -> Result<Option<u32>, BinderError> {
     match clause {
         None => Ok(None),
@@ -1530,6 +1592,8 @@ pub struct BoundSelect {
     pub scope: Scope,
     pub join: Option<BoundJoin>,
     pub projections: Vec<Expression>,
+    /// `SELECT DISTINCT`: duplicate projected rows are removed before ORDER BY and LIMIT.
+    pub distinct: bool,
     pub filters: Option<Vec<Expression>>,
     /// GROUP BY expressions (resolved against the child scope). Empty when
     /// the query has no GROUP BY clause. When `aggregates` is also empty,
@@ -1544,6 +1608,8 @@ pub struct BoundSelect {
     /// ORDER BY read call `j` of window `k` at column `from_width + c + j`, where `from_width` is
     /// the FROM output's width and `c` counts the calls of windows `0..k`.
     pub windows: Vec<BoundWindow>,
+    /// ORDER BY keys. They read the aggregation output (or the FROM output, widened by any window
+    /// calls, when nothing is aggregated), or the projection output when `distinct` is set.
     pub sort: Option<Vec<SortExpr>>,
     pub limit: Option<u32>,
 }
