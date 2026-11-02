@@ -732,8 +732,12 @@ impl BPlusTree {
         Ok(())
     }
 
+    /// Read-latches the root, crabbing from the header: the header's read latch is held until
+    /// the root is latched, so a split or collapse cannot replace the root in between. Returns
+    /// `None` for an empty tree.
     fn get_root_page_from_header(&self) -> Result<Option<PageRef<'_>>, IndexError> {
-        let header = self.read_header()?;
+        let mut current = self.bpm.read_page(self.header_page_id)?;
+        let header = self.header_from_bytes(current.data())?;
         if header.root_page_id == INVALID_PAGE_ID {
             warn!(
                 "tid={:?} header root_page_id is invalid (empty tree); header={:?}",
@@ -742,7 +746,9 @@ impl BPlusTree {
             );
             return Ok(None);
         }
-        Ok(Some(self.bpm.read_page(header.root_page_id)?))
+        let root = self.bpm.read_page(header.root_page_id)?;
+        step_down(&mut current, root);
+        Ok(Some(current))
     }
 
     /// Read-crabs to the leaf for `key` and write-latches it. Returns `None` when the tree is
@@ -1871,6 +1877,191 @@ mod tests {
                 }
                 h.check_full_scan();
                 assert!(h.model.is_empty());
+            }
+        }
+
+        mod concurrent_root_changes {
+            use super::*;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::thread;
+
+            const KEY_LEN: usize = 2000;
+            const KEYS: u32 = 300;
+            const ROUNDS: u64 = 60;
+            const WRITERS: usize = 2;
+            const READERS: u64 = 2;
+            const FRAMES: usize = 256;
+            const KEEP_EVERY: u32 = 10;
+
+            #[derive(Clone, Copy)]
+            enum Op {
+                Insert(u32),
+                Remove(u32),
+            }
+
+            fn apply(tree: &BPlusTree, present: &[AtomicBool], op: Op) {
+                match op {
+                    Op::Insert(n) => {
+                        tree.insert(key_for(n, KEY_LEN), IndexValue::IndexValue(rid_for(n)))
+                            .unwrap_or_else(|e| panic!("insert {n} failed: {e}"));
+                        present[n as usize].store(true, Ordering::Release);
+                    }
+                    Op::Remove(n) => {
+                        present[n as usize].store(false, Ordering::Release);
+                        tree.remove(key_for(n, KEY_LEN))
+                            .unwrap_or_else(|e| panic!("remove {n} failed: {e}"));
+                    }
+                }
+            }
+
+            fn finds(tree: &BPlusTree, n: u32) -> bool {
+                matches!(
+                    tree.search(&key_for(n, KEY_LEN)),
+                    Ok(Some(IndexValue::IndexValue(rid))) if rid == rid_for(n)
+                )
+            }
+
+            fn keys_a_reader_missed(
+                tree: &BPlusTree,
+                present: &[AtomicBool],
+                writers_done: &AtomicBool,
+                seed: u64,
+            ) -> Vec<u32> {
+                let mut rng = StdRng::seed_from_u64(seed);
+                let mut missed = Vec::new();
+                while !writers_done.load(Ordering::Acquire) {
+                    let n = rand::Rng::random_range(&mut rng, 0..KEYS);
+                    let is_present = || present[n as usize].load(Ordering::Acquire);
+                    if is_present() && !finds(tree, n) && is_present() {
+                        missed.push(n);
+                    }
+                }
+                missed
+            }
+
+            /// Runs each writer's ops on its own thread while readers search for random keys.
+            /// Returns the keys a reader failed to find although a writer had finished inserting
+            /// them before the search started and had not started removing them when it ended.
+            fn keys_missed_during(
+                tree: &BPlusTree,
+                present: &[AtomicBool],
+                writer_ops: Vec<Vec<Op>>,
+                seed: u64,
+            ) -> Vec<u32> {
+                let writers_done = AtomicBool::new(false);
+                let writers_done = &writers_done;
+                thread::scope(|s| {
+                    let readers: Vec<_> = (0..READERS)
+                        .map(|r| {
+                            s.spawn(move || {
+                                keys_a_reader_missed(tree, present, writers_done, seed * 31 + r)
+                            })
+                        })
+                        .collect();
+                    let writers: Vec<_> = writer_ops
+                        .into_iter()
+                        .map(|ops| {
+                            s.spawn(move || {
+                                for op in ops {
+                                    apply(tree, present, op);
+                                }
+                            })
+                        })
+                        .collect();
+                    let writer_results: Vec<_> = writers.into_iter().map(|w| w.join()).collect();
+                    writers_done.store(true, Ordering::Release);
+                    let missed = readers
+                        .into_iter()
+                        .flat_map(|r| r.join().expect("reader thread panicked"))
+                        .collect();
+                    for result in writer_results {
+                        if let Err(panic) = result {
+                            std::panic::resume_unwind(panic);
+                        }
+                    }
+                    missed
+                })
+            }
+
+            fn deal_round_robin(keys: &[u32], op: fn(u32) -> Op) -> Vec<Vec<Op>> {
+                let mut per_writer = vec![Vec::new(); WRITERS];
+                for (i, &n) in keys.iter().enumerate() {
+                    per_writer[i % WRITERS].push(op(n));
+                }
+                per_writer
+            }
+
+            fn assert_tree_holds_exactly(tree: &BPlusTree, present: &[AtomicBool], round: u64) {
+                assert_tree_is_well_formed(tree);
+                let expected: Vec<IndexKey> = (0..KEYS)
+                    .filter(|&n| present[n as usize].load(Ordering::Acquire))
+                    .map(|n| key_for(n, KEY_LEN))
+                    .collect();
+                let scanned: Vec<IndexKey> = tree
+                    .scan((Bound::Unbounded, Bound::Unbounded))
+                    .unwrap()
+                    .map(|r| r.unwrap().0)
+                    .collect();
+                assert!(
+                    scanned == expected,
+                    "round {round}: scan holds {} keys, expected {}",
+                    scanned.len(),
+                    expected.len()
+                );
+            }
+
+            fn fresh_tree() -> (BPlusTree, Vec<AtomicBool>, tempfile::TempDir) {
+                let (bpm, tmp) = make_bpm(FRAMES);
+                let tree = BPlusTree::new("idx".to_string(), KEY_LEN as u32, bpm).unwrap();
+                assert_eq!(
+                    tree.internal_max_size, 4,
+                    "test expects four-key internal pages"
+                );
+                let present = (0..KEYS).map(|_| AtomicBool::new(false)).collect();
+                (tree, present, tmp)
+            }
+
+            #[test]
+            fn readers_and_writers_see_every_key_while_the_root_splits() {
+                for round in 0..ROUNDS {
+                    let (tree, present, _tmp) = fresh_tree();
+                    let mut keys: Vec<u32> = (0..KEYS).collect();
+                    keys.shuffle(&mut StdRng::seed_from_u64(round));
+                    let missed = keys_missed_during(
+                        &tree,
+                        &present,
+                        deal_round_robin(&keys, Op::Insert),
+                        round,
+                    );
+                    assert!(
+                        missed.is_empty(),
+                        "round {round}: readers missed inserted keys {missed:?}"
+                    );
+                    assert_tree_holds_exactly(&tree, &present, round);
+                }
+            }
+
+            #[test]
+            fn readers_see_every_kept_key_while_the_root_collapses() {
+                for round in 0..ROUNDS {
+                    let (tree, present, _tmp) = fresh_tree();
+                    for n in 0..KEYS {
+                        apply(&tree, &present, Op::Insert(n));
+                    }
+                    let mut doomed: Vec<u32> = (0..KEYS).filter(|n| n % KEEP_EVERY != 0).collect();
+                    doomed.shuffle(&mut StdRng::seed_from_u64(1000 + round));
+                    let missed = keys_missed_during(
+                        &tree,
+                        &present,
+                        deal_round_robin(&doomed, Op::Remove),
+                        round,
+                    );
+                    assert!(
+                        missed.is_empty(),
+                        "round {round}: readers missed kept keys {missed:?}"
+                    );
+                    assert_tree_holds_exactly(&tree, &present, round);
+                }
             }
         }
     }
