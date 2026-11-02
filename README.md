@@ -8,28 +8,53 @@ This is a Rust implementation of a relational DBMS. It takes heavy inspiration f
 cargo build
 cargo run      # SQL shell on a fresh temporary database; end statements with `;`, quit with \q
 cargo run -- mydb   # the same shell on the database in directory mydb/, kept across runs
-                    # that exit cleanly; a crash or kill can damage it (no WAL yet)
 cargo test
 ```
+
+`cargo run -- mydb` keeps tables, rows and indexes in `mydb/cmudb.data`, written after every
+commit and on exit. There is no WAL yet, so a crash or kill between those writes can damage the
+file. Data folders made before data file version 2 do not open.
 
 CONTRIBUTING.md lists the checks CI runs, and ARCHITECTURE.md maps the code.
 
 ## What's done:
 - disk-backed pages for tables, read and written in place through typed views over the page bytes
+- a single data file per database holding the pages, the catalog and the transaction clocks, so
+  tables, rows and indexes survive a restart; the file is locked while a process has it open
 - Adaptive replacement cache policy for pages
 - B+ tree indexes with optimistic latch coupling
-- An in-memory catalog
 - Most executors described in the CMU course, exchanging batches of rows (pull-based, 1024 rows per batch by default)
 - MVCC with snapshot isolation (`BEGIN`/`COMMIT`/`ROLLBACK` in the shell; see docs/mvcc.md)
-- parser (using sqlparser crate)
-- binder
-- planner
+- parser (using sqlparser crate), binder and a rule-based planner, each failing with its own
+  typed error, and a clear "not supported" error for SQL they do not handle
+- planner choices: an `IndexScan` for `col = constant` on an indexed column, a nested index join
+  when the inner table has an index on its join column, a hash join for other equi-joins, and an
+  external merge sort for `ORDER BY` that spills sorted runs to disk once its input passes a
+  memory budget
+- scratch pages from sorts and hash joins are freed and their page ids reused
+
+SQL the shell runs:
+- `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`, `INSERT ... VALUES`, `UPDATE`, `DELETE`
+- `SELECT` with `WHERE`, inner and left joins of two tables (`JOIN ... ON`), `GROUP BY` with
+  `COUNT`, `SUM`, `AVG`, `MIN` and `MAX`, `SELECT DISTINCT`, `ORDER BY` and `LIMIT`
+- window functions: those aggregates and `RANK()` with `OVER (PARTITION BY ... ORDER BY ...)`
+- column types `INT` (32-bit), `BIGINT`, `FLOAT` (64-bit), `BOOLEAN`, `TIMESTAMP`
+  (microseconds, no time zone, written as `'YYYY-MM-DD HH:MM:SS'`), `TEXT` and `VARCHAR(n)`
+  (at most `n` characters); `INT` and `BIGINT` values widen to `FLOAT` where needed
+- operators `+ - * /`, comparisons, `AND` and `OR`
 
 ## What's missing:
-- optimizer
+- a cost-based optimizer (the planner uses fixed rules and no statistics)
 - serializable isolation
-- `CHAR(n)`, string functions and `LIKE`; columns are `INT` (32-bit), `BIGINT`, `FLOAT` (64-bit), `BOOLEAN`, `TIMESTAMP` (microseconds, no time zone, written as `'YYYY-MM-DD HH:MM:SS'`), `TEXT` and `VARCHAR(n)` (at most `n` characters; only `VARCHAR(n)` columns can be indexed, and a row must fit in one 8 KiB page)
-- external merge sort, window functions and `DROP TABLE`/`DROP INDEX` have executors, but the binder and planner never produce them
+- a write-ahead log and crash recovery
+- `HAVING`, subqueries, `WITH`, `OFFSET`, `IS NULL`, `NOT`, `LIKE`, `IN`, `CAST`, `%`, string
+  functions and `||`, joins of more than two tables, window frames (`ROWS`/`RANGE`) and window
+  functions in a `SELECT` that also aggregates
+- `CHAR(n)`; indexes on plain `TEXT` columns (index a `VARCHAR(n)` column instead)
+- a row must fit in one 8 KiB page, and an `UPDATE` that grows a row past its page's free space
+  fails instead of moving the row
+- `DROP TABLE` and `DROP INDEX` do not free their pages, and GC does not reclaim deleted rows'
+  slots or dead index entries
 
 ## Benchmarks
 
