@@ -392,17 +392,6 @@ impl ArcReplacer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use env_logger::Env;
-    use std::sync::Once;
-
-    fn init_logger() {
-        static INIT: Once = Once::new();
-        INIT.call_once(|| {
-            let _ = env_logger::Builder::from_env(Env::default().default_filter_or("warn"))
-                .is_test(true)
-                .try_init();
-        });
-    }
 
     #[test]
     #[should_panic(expected = "MRU list plus MRU ghost list exceeds capacity")]
@@ -450,7 +439,6 @@ mod tests {
 
     #[test]
     fn test_sample() {
-        init_logger();
         let mut arc_replacer = ArcReplacer::new(7);
         arc_replacer.record_access(1, 1);
         arc_replacer.record_access(2, 2);
@@ -496,7 +484,6 @@ mod tests {
 
     #[test]
     fn test_sample_two() {
-        init_logger();
         let mut arc_replacer = ArcReplacer::new(3);
         arc_replacer.record_access(1, 1);
         arc_replacer.set_evictable(1, true);
@@ -561,16 +548,6 @@ mod tests {
 
     #[test]
     fn test_arc_replacer_performance() {
-        init_logger();
-        println!("BEGIN");
-        println!("This test will see how your RecordAccess performs when the list is large.");
-        println!(
-            "If this takes above 3s on average, you might get into trouble trying to get full score in some following projects..."
-        );
-        println!(
-            "if you care, you may want to think of what could be very slow when the list is very large, and how to make that faster"
-        );
-
         let bpm_size: usize = 256 << 10;
         let mut arc_replacer = ArcReplacer::new(bpm_size);
 
@@ -594,13 +571,6 @@ mod tests {
 
         let total_ms: u128 = access_times_ms.iter().copied().sum();
         let avg_s: f64 = (total_ms as f64) / 1000.0 / (access_times_ms.len() as f64);
-
-        println!("END");
-        println!("Average time used: {avg_s}s.");
-        println!(
-            "If this takes above 3s on average, you might get into trouble trying to get full score in some following projects..."
-        );
-        println!("If you care, try optimizing RecordAccess for a bit");
 
         assert!(avg_s < 3.0, "Average time used: {avg_s}s");
     }

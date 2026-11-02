@@ -8,20 +8,11 @@ use cmudb::create_buffer_pool_manager;
 use cmudb::disk::{DiskManager, DiskScheduler};
 use cmudb::replacer::ArcReplacer;
 use common::seed::{Stream, stream_rng, with_seed};
-use env_logger::Env;
 use parking_lot::RwLock;
 use rand::Rng;
 use tempfile::tempdir;
 
-fn init_logger() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        let _ = env_logger::Builder::from_env(Env::default().default_filter_or("warn")).try_init();
-    });
-}
-
 fn make_bpm(num_frames: usize) -> (Arc<BufferPoolManager>, tempfile::TempDir) {
-    init_logger();
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("db");
     let log_path = dir.path().join("log");
