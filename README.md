@@ -27,7 +27,7 @@ CONTRIBUTING.md lists the checks CI runs, and ARCHITECTURE.md maps the code.
 - optimizer
 - serializable isolation
 - support for more types, only a few basic types are supported (int, booleans, floats, timestamps)
-- hash joins, external merge sort, window functions and `DROP TABLE`/`DROP INDEX` have executors, but the binder and planner never produce them
+- external merge sort, window functions and `DROP TABLE`/`DROP INDEX` have executors, but the binder and planner never produce them
 
 ## Benchmarks
 
@@ -78,7 +78,7 @@ criterion's 95% interval):
 | query/filter_10pct_of_10k | 18.6 ms (18.2 to 19.4) | 1.9 µs |
 | query/aggregate_10k | 20.2 ms (18.5 to 21.6) | 2.0 µs |
 | query/sort_10k | 24.3 ms (23.2 to 25.2) | 2.4 µs |
-| query/nested_loop_join_10k_x_100 | 60.9 ms (59.2 to 62.7) | |
+| query/nested_loop_join_10k_x_100 (now hash_join_10k_x_100, not yet measured) | 60.9 ms (59.2 to 62.7) | |
 | query/index_join_100_into_10k | 2.4 ms (2.4 to 2.5) | 24 µs per outer row |
 | query/index_point_lookup | 33.8 µs (32.9 to 34.9) | |
 | query/insert_1k_rows | 4.9 ms (4.7 to 5.2) | 4.9 µs |

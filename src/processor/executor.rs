@@ -10,10 +10,10 @@ use crate::index::IndexError;
 use crate::processor::plan::{
     AggType, AggregationPlanNode, Arithmetic, CreateIndexPlanNode, CreateTablePlanNode,
     DeletePlanNode, DropIndexPlanNode, DropTablePlanNode, Expression, ExternalMergeSortPlanNode,
-    FilterPlanNode, HashJoinPlanNode, IndexScanPlanNode, InputRow, InsertPlanNode, JoinRow,
-    JoinType, LimitPlanNode, NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, NullOrdering, Plan,
-    ProjectionPlanNode, SeqScanPlanNode, SortDirection, SortExpr, SortPlanNode, UpdatePlanNode,
-    ValuesPlanNode, WindowFunctionPlanNode,
+    FilterPlanNode, HashJoinPlanNode, IndexScanPlanNode, InputRow, InsertPlanNode, JoinPredicate,
+    JoinRow, JoinType, LimitPlanNode, NestedIndexJoinPlanNode, NestedLoopJoinPlanNode,
+    NullOrdering, Plan, ProjectionPlanNode, SeqScanPlanNode, SortDirection, SortExpr, SortPlanNode,
+    UpdatePlanNode, ValuesPlanNode, WindowFunctionPlanNode,
 };
 use crate::table_heap::{FreeError, RecordId, TableHeap, TableHeapError, TableHeapIterator, Tuple};
 use log::warn;
@@ -1271,6 +1271,15 @@ fn free_all(heaps: impl IntoIterator<Item = SpillHeap>) -> Result<(), ExecutorEr
     first_failure.map_err(ExecutorError::from)
 }
 
+/// Whether a hash join's residual condition holds for a pair of rows with equal keys; true
+/// when there is none.
+fn residual_holds(residual: Option<&JoinPredicate>, pair: &JoinRow) -> Result<bool, ExecutorError> {
+    match residual {
+        Some(predicate) => Ok(is_true(predicate.evaluate_on(pair)?)),
+        None => Ok(true),
+    }
+}
+
 fn partition_of(key: &ExprKey) -> usize {
     let mut h = DefaultHasher::new();
     key.hash(&mut h);
@@ -1361,6 +1370,19 @@ impl<'a> Executor for HashJoinExecutor<'a> {
                 continue;
             }
             for row in build_table.get_mut(&key).into_iter().flatten() {
+                let pair = JoinRow {
+                    left: InputRow {
+                        tuple: &row.tuple,
+                        schema: self.left.schema(),
+                    },
+                    right: InputRow {
+                        tuple: &rt,
+                        schema: self.right.schema(),
+                    },
+                };
+                if !residual_holds(self.plan.residual.as_ref(), &pair)? {
+                    continue;
+                }
                 row.matched = true;
                 let values = joined_row(
                     self.left.schema(),
@@ -2761,6 +2783,7 @@ mod tests {
             right: Box::new(values_plan(&side, right)),
             left_exprs: vec![col(0)],
             right_exprs: vec![col(0)],
+            residual: None,
             join_type: JoinType::Inner,
         }
     }

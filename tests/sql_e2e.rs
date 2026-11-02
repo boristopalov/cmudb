@@ -388,33 +388,143 @@ fn values_statement() {
     );
 }
 
+fn is_hash_join(plan: &Plan) -> bool {
+    matches!(plan, Plan::HashJoin(_))
+}
+
+fn is_nested_loop_join(plan: &Plan) -> bool {
+    matches!(plan, Plan::NestedLoopJoin(_))
+}
+
+fn sorted_nullable(mut rows: Vec<Vec<Option<i32>>>) -> Vec<Vec<Option<i32>>> {
+    rows.sort();
+    rows
+}
+
 #[test]
-fn inner_and_left_joins_without_index_use_nested_loop_join() {
+fn inner_and_left_equi_joins_without_index_use_hash_join() {
     let db = emp_db();
     db.exec("CREATE TABLE dept (id INTEGER, name INTEGER)");
     db.exec("INSERT INTO dept VALUES (10, 1000), (20, 2000), (40, 4000)");
+    let inner = "SELECT emp.id, dept.name FROM emp JOIN dept ON emp.dept = dept.id";
+    assert!(plan_contains(&db.plan_of(inner), is_hash_join));
     assert_eq!(
-        ints(&db.exec("SELECT emp.id, dept.name FROM emp JOIN dept ON emp.dept = dept.id")),
+        sorted(ints(&db.exec(inner))),
         vec![[1, 1000], [2, 1000], [3, 2000]]
     );
-    let left = db.exec("SELECT emp.id, dept.name FROM emp LEFT JOIN dept ON emp.dept = dept.id");
-    assert_eq!(left.len(), 4);
+    let left = "SELECT emp.id, dept.name FROM emp LEFT JOIN dept ON emp.dept = dept.id";
+    assert!(plan_contains(&db.plan_of(left), is_hash_join));
     assert_eq!(
-        left[3],
-        vec![int(4), None],
+        sorted_nullable(nullable_ints(&db.exec(left))),
+        vec![
+            vec![Some(1), Some(1000)],
+            vec![Some(2), Some(1000)],
+            vec![Some(3), Some(2000)],
+            vec![Some(4), None],
+        ],
         "unmatched left row is NULL-padded"
-    );
-    assert_eq!(
-        ints(&db.exec(
-            "SELECT emp.id, dept.id FROM emp JOIN dept ON emp.dept < dept.id WHERE emp.id = 4"
-        )),
-        vec![[4, 40]]
     );
     assert_eq!(
         ints(&db.exec(
             "SELECT COUNT(*) FROM emp JOIN dept ON emp.dept = dept.id WHERE dept.name > 1000"
         )),
         vec![[1]]
+    );
+}
+
+#[test]
+fn joins_without_a_column_equality_across_sides_use_nested_loop_join() {
+    let db = emp_db();
+    db.exec("CREATE TABLE dept (id INTEGER, name INTEGER)");
+    db.exec("INSERT INTO dept VALUES (10, 1000), (20, 2000), (40, 4000)");
+    let less_than =
+        "SELECT emp.id, dept.id FROM emp JOIN dept ON emp.dept < dept.id WHERE emp.id = 4";
+    assert!(plan_contains(&db.plan_of(less_than), is_nested_loop_join));
+    assert_eq!(ints(&db.exec(less_than)), vec![[4, 40]]);
+    for sql in [
+        "SELECT emp.id FROM emp JOIN dept ON emp.dept = dept.id OR emp.id = 1",
+        "SELECT emp.id FROM emp JOIN dept ON emp.dept = emp.id",
+        "SELECT emp.id FROM emp JOIN dept ON emp.bonus = dept.id",
+    ] {
+        assert!(
+            plan_contains(&db.plan_of(sql), is_nested_loop_join),
+            "{sql}: no same-type left.col = right.col conjunct to hash on"
+        );
+    }
+}
+
+/// Two tables whose join columns hold NULLs, duplicate keys on both sides and keys with no
+/// partner on either side, spread over enough rows to fill several hash partitions.
+fn hash_join_tables() -> Db {
+    let db = Db::new(256);
+    db.exec("CREATE TABLE l (k INTEGER, k2 INTEGER, a INTEGER)");
+    db.exec("CREATE TABLE r (k INTEGER, k2 INTEGER, b INTEGER)");
+    let key = |i: i32| match i % 11 {
+        0 => "NULL".to_string(),
+        m => (i % 37 + m % 2).to_string(),
+    };
+    let l_rows: Vec<String> = (0..300)
+        .map(|i| format!("({}, {}, {i})", key(i), i % 3))
+        .collect();
+    let r_rows: Vec<String> = (0..200)
+        .map(|i| format!("({}, {}, {})", key(i + 5), i % 4, 1000 + i))
+        .collect();
+    db.exec(&format!("INSERT INTO l VALUES {}", l_rows.join(", ")));
+    db.exec(&format!("INSERT INTO r VALUES {}", r_rows.join(", ")));
+    db
+}
+
+#[test]
+fn hash_joins_return_the_nested_loop_join_rows() {
+    let db = hash_join_tables();
+    for join in ["JOIN", "LEFT JOIN"] {
+        for on in [
+            "l.k = r.k",
+            "r.k = l.k",
+            "l.k = r.k AND l.k2 = r.k2",
+            "l.k = r.k AND l.a < r.b - 1050",
+            "l.k = r.k AND l.k2 = 1",
+            "l.k = r.k AND r.k2 = r.k2 AND l.a > 100",
+        ] {
+            for where_clause in ["", " WHERE l.a > 50"] {
+                let sql = format!("SELECT l.a, r.b FROM l {join} r ON {on}{where_clause}");
+                let hashed = db.plan_of(&sql);
+                assert!(plan_contains(&hashed, is_hash_join), "{sql}");
+                let nested = with_nested_loop_joins(db.plan_of(&sql));
+                assert!(plan_contains(&nested, is_nested_loop_join), "{sql}");
+                let expected = sorted_nullable(nullable_ints(&db.run_plan(&nested).unwrap()));
+                assert!(
+                    !expected.is_empty(),
+                    "{sql}: the reference join returns rows"
+                );
+                assert_eq!(
+                    sorted_nullable(nullable_ints(&db.run_plan(&hashed).unwrap())),
+                    expected,
+                    "{sql}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_hash_join_query_frees_its_spill_pages_and_a_rerun_reuses_them() {
+    let db = hash_join_tables();
+    let sql = "SELECT l.a, r.b FROM l JOIN r ON l.k = r.k";
+    assert!(plan_contains(&db.plan_of(sql), is_hash_join));
+    let live_before = db.bpm().live_page_count();
+    db.exec(sql);
+    assert_eq!(
+        db.bpm().live_page_count(),
+        live_before,
+        "the join leaves no spill page allocated"
+    );
+    let after_first_run = db.bpm().allocated_page_count();
+    db.exec(sql);
+    assert_eq!(
+        db.bpm().allocated_page_count(),
+        after_first_run,
+        "a second run of the same join allocates no new page ids"
     );
 }
 

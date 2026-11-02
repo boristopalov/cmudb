@@ -10,16 +10,18 @@ use crate::parser::{
 use crate::processor::plan::{
     AggType, AggregationPlanNode, ColIdx, ColumnAssignment, CreateIndexPlanNode,
     CreateTablePlanNode, DeletePlanNode, Expression, ExternalMergeSortPlanNode, FilterPlanNode,
-    IndexScanPlanNode, InsertPlanNode, JoinColumn, JoinPredicate, JoinType, LimitPlanNode,
-    NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, Op, Plan, ProjectionPlanNode, SeqScanPlanNode,
-    Side, UpdatePlanNode, ValuesPlanNode,
+    HashJoinPlanNode, IndexScanPlanNode, InsertPlanNode, JoinColumn, JoinPredicate, JoinType,
+    LimitPlanNode, NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, Op, Plan, ProjectionPlanNode,
+    SeqScanPlanNode, Side, UpdatePlanNode, ValuesPlanNode,
 };
 
 /// Turns bound statements into plans, without statistics or a cost model.
 ///
 /// A `col = constant` filter on a table with a single-column index on `col` becomes an
 /// `IndexScan`; an inner `left.col = right.col` join whose right table has a single-column
-/// index on its join column becomes a `NestedIndexJoin`. Everything else is a `SeqScan`
+/// index on its join column becomes a `NestedIndexJoin`. Any other join whose condition ANDs
+/// at least one `left.col = right.col` of matching types becomes a `HashJoin` on those
+/// equalities, with the rest of the condition as its residual. Everything else is a `SeqScan`
 /// or a `NestedLoopJoin`. `ORDER BY` is an `ExternalMergeSort`, which sorts in memory until
 /// its input passes the executor's sort memory budget and spills sorted runs after that.
 pub struct Planner<'a> {
@@ -351,13 +353,24 @@ impl<'a> Planner<'a> {
             });
         }
 
-        Plan::NestedLoopJoin(NestedLoopJoinPlanNode {
-            schema: out_schema,
-            left: Box::new(left),
-            right: Box::new(right),
-            predicate: join.predicate,
-            join_type: join.join_type,
-        })
+        match hash_join_keys(join.predicate, &left_ts.schema, &right_ts.schema) {
+            Ok(keys) => Plan::HashJoin(HashJoinPlanNode {
+                schema: out_schema,
+                left: Box::new(left),
+                right: Box::new(right),
+                left_exprs: keys.left_exprs,
+                right_exprs: keys.right_exprs,
+                residual: keys.residual,
+                join_type: join.join_type,
+            }),
+            Err(predicate) => Plan::NestedLoopJoin(NestedLoopJoinPlanNode {
+                schema: out_schema,
+                left: Box::new(left),
+                right: Box::new(right),
+                predicate,
+                join_type: join.join_type,
+            }),
+        }
     }
 
     fn index_for_cols(&self, table_oid: u32, col_idxs: &[usize]) -> Option<u32> {
@@ -382,7 +395,7 @@ fn agg_type_name(t: &AggType) -> &'static str {
 }
 
 /// ANDs the filters together; `None` when there are none.
-fn conjunction(filters: Option<Vec<Expression>>) -> Option<Expression> {
+fn conjunction<C>(filters: Option<Vec<Expression<C>>>) -> Option<Expression<C>> {
     filters?
         .into_iter()
         .reduce(|left, right| Expression::Binary {
@@ -390,6 +403,72 @@ fn conjunction(filters: Option<Vec<Expression>>) -> Option<Expression> {
             right: Box::new(right),
             op: Op::And,
         })
+}
+
+/// The operands of every top-level AND in `expr`, left to right.
+fn conjuncts<C>(expr: &Expression<C>) -> Vec<&Expression<C>> {
+    match expr {
+        Expression::Binary {
+            left,
+            right,
+            op: Op::And,
+        } => {
+            let mut parts = conjuncts(left);
+            parts.extend(conjuncts(right));
+            parts
+        }
+        other => vec![other],
+    }
+}
+
+/// The equality keys and residual condition of a hash join.
+#[derive(Debug)]
+struct HashJoinKeys {
+    left_exprs: Vec<Expression>,
+    right_exprs: Vec<Expression>,
+    residual: Option<JoinPredicate>,
+}
+
+/// Splits a join condition into hash join keys: each ANDed `left.col = right.col` whose two
+/// columns have the same type becomes a key pair, and the other conjuncts become the residual.
+/// Returns the condition unchanged when it has no such equality.
+///
+/// Keys of different types stay in the residual because the hash table compares keys by
+/// value and type, while SQL equality compares INT with FLOAT numerically.
+fn hash_join_keys(
+    predicate: JoinPredicate,
+    left: &Schema,
+    right: &Schema,
+) -> Result<HashJoinKeys, JoinPredicate> {
+    let key_columns = |part: &JoinPredicate| {
+        left_right_equi_join(part)
+            .filter(|&(l, r)| left.cols[l as usize].dtype == right.cols[r as usize].dtype)
+    };
+    let parts = conjuncts(&predicate);
+    if !parts.iter().any(|part| key_columns(part).is_some()) {
+        return Err(predicate);
+    }
+    let column = |schema: &Schema, col: u32| Expression::Column {
+        col: ColIdx(col),
+        dtype: schema.cols[col as usize].dtype,
+    };
+    let mut left_exprs = Vec::new();
+    let mut right_exprs = Vec::new();
+    let mut residual = Vec::new();
+    for part in parts {
+        match key_columns(part) {
+            Some((l, r)) => {
+                left_exprs.push(column(left, l));
+                right_exprs.push(column(right, r));
+            }
+            None => residual.push(part.clone()),
+        }
+    }
+    Ok(HashJoinKeys {
+        left_exprs,
+        right_exprs,
+        residual: conjunction(Some(residual)),
+    })
 }
 
 /// The left and right tables of a two-way join.
@@ -584,8 +663,8 @@ mod tests {
 
     #[test]
     fn multiple_filters_are_combined_with_and() {
-        assert!(conjunction(None).is_none());
-        assert!(conjunction(Some(vec![])).is_none());
+        assert!(conjunction::<ColIdx>(None).is_none());
+        assert!(conjunction::<ColIdx>(Some(vec![])).is_none());
         let combined = conjunction(Some(vec![column(0), column(1)]));
         assert!(matches!(
             combined,
@@ -595,13 +674,6 @@ mod tests {
 
     #[test]
     fn index_lookups_match_column_equals_constant_in_either_order() {
-        fn eq<C>(l: Expression<C>, r: Expression<C>) -> Expression<C> {
-            Expression::Binary {
-                left: Box::new(l),
-                right: Box::new(r),
-                op: Op::Eq,
-            }
-        }
         let three = || Expression::Constant(Some(Value::INT(3)));
         assert_eq!(
             column_equals_constant(&eq(column(2), three())),
@@ -722,5 +794,106 @@ mod tests {
             }
         );
         assert_eq!(err.to_string(), "CREATE INDEX references unknown column: b");
+    }
+
+    fn eq<C>(l: Expression<C>, r: Expression<C>) -> Expression<C> {
+        Expression::Binary {
+            left: Box::new(l),
+            right: Box::new(r),
+            op: Op::Eq,
+        }
+    }
+
+    fn and<C>(l: Expression<C>, r: Expression<C>) -> Expression<C> {
+        Expression::Binary {
+            left: Box::new(l),
+            right: Box::new(r),
+            op: Op::And,
+        }
+    }
+
+    fn typed_join_column(side: Side, col: u32, dtype: DataType) -> JoinPredicate {
+        Expression::Column {
+            col: JoinColumn {
+                side,
+                col: ColIdx(col),
+            },
+            dtype,
+        }
+    }
+
+    fn key_cols(exprs: &[Expression]) -> Vec<u32> {
+        exprs
+            .iter()
+            .map(|e| match e {
+                Expression::Column { col, .. } => col.0,
+                _ => panic!("hash join keys are plain columns"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hash_join_keys_take_every_cross_side_equality_and_keep_the_rest_as_residual() {
+        let left = int_schema(&["c0", "c1", "c2"]);
+        let right = int_schema(&["c0", "c1", "c2"]);
+        let predicate = and(
+            and(
+                eq(join_column(Side::Left, 0), join_column(Side::Right, 2)),
+                eq(join_column(Side::Left, 1), join_column(Side::Left, 2)),
+            ),
+            and(
+                eq(join_column(Side::Right, 1), join_column(Side::Left, 2)),
+                Expression::Binary {
+                    left: Box::new(join_column(Side::Left, 0)),
+                    right: Box::new(join_column(Side::Right, 0)),
+                    op: Op::Lt,
+                },
+            ),
+        );
+        let keys = hash_join_keys(predicate, &left, &right).expect("two equalities are keys");
+        assert_eq!(key_cols(&keys.left_exprs), vec![0, 2]);
+        assert_eq!(key_cols(&keys.right_exprs), vec![2, 1]);
+        let residual = keys
+            .residual
+            .expect("the same-side equality and the < stay");
+        assert_eq!(conjuncts(&residual).len(), 2);
+    }
+
+    #[test]
+    fn hash_join_keys_without_residual_when_the_condition_is_only_equalities() {
+        let schema = int_schema(&["c0"]);
+        let keys = hash_join_keys(
+            eq(join_column(Side::Right, 0), join_column(Side::Left, 0)),
+            &schema,
+            &schema,
+        )
+        .expect("one equality is a key");
+        assert_eq!(key_cols(&keys.left_exprs), vec![0]);
+        assert_eq!(key_cols(&keys.right_exprs), vec![0]);
+        assert!(keys.residual.is_none());
+    }
+
+    #[test]
+    fn hash_join_keys_reject_conditions_without_a_same_type_cross_side_equality() {
+        let ints = int_schema(&["c0", "c1"]);
+        let floats = Schema::new(vec![(DataType::FLOAT, "f".to_string())]);
+        let mixed = eq(
+            typed_join_column(Side::Left, 0, DataType::INT),
+            typed_join_column(Side::Right, 0, DataType::FLOAT),
+        );
+        assert!(hash_join_keys(mixed, &ints, &floats).is_err());
+
+        let same_side = eq(join_column(Side::Left, 0), join_column(Side::Left, 1));
+        assert!(hash_join_keys(same_side, &ints, &ints).is_err());
+
+        let or = Expression::Binary {
+            left: Box::new(eq(join_column(Side::Left, 0), join_column(Side::Right, 0))),
+            right: Box::new(eq(join_column(Side::Left, 1), join_column(Side::Right, 1))),
+            op: Op::Or,
+        };
+        assert!(
+            hash_join_keys(or, &ints, &ints).is_err(),
+            "an equality under OR is not a key"
+        );
     }
 }

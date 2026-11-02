@@ -134,6 +134,9 @@ pub struct HashJoinPlanNode {
     pub right: Box<Plan>,
     pub left_exprs: Vec<Expression>,
     pub right_exprs: Vec<Expression>,
+    /// The rest of the join condition, checked on each pair of rows whose keys are equal; a
+    /// left row counts as matched only when this holds too.
+    pub residual: Option<JoinPredicate>,
     pub join_type: JoinType,
 }
 
