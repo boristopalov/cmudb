@@ -330,7 +330,6 @@ impl Database {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
         let data_path = dir.join(DATA_FILE);
-        let is_new = std::fs::metadata(&data_path).map_or(true, |m| m.len() == 0);
         let lock = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -341,6 +340,7 @@ impl Database {
             std::fs::TryLockError::WouldBlock => PersistError::InUse,
             std::fs::TryLockError::Error(e) => PersistError::Io(e),
         })?;
+        let is_new = lock.metadata()?.len() == 0;
         let dm = DiskManager::new(data_path, dir.join(LOG_FILE))?;
         let bpm = Arc::new(create_buffer_pool_manager(
             frames,
