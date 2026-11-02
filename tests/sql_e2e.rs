@@ -508,18 +508,23 @@ fn hash_joins_return_the_nested_loop_join_rows() {
 }
 
 #[test]
-#[ignore = "known gap: hash join partition pages are never freed (BOR-20)"]
-fn repeating_a_hash_join_query_reuses_its_spill_pages() {
+fn a_hash_join_query_frees_its_spill_pages_and_a_rerun_reuses_them() {
     let db = hash_join_tables();
     let sql = "SELECT l.a, r.b FROM l JOIN r ON l.k = r.k";
     assert!(plan_contains(&db.plan_of(sql), is_hash_join));
+    let live_before = db.bpm().live_page_count();
     db.exec(sql);
+    assert_eq!(
+        db.bpm().live_page_count(),
+        live_before,
+        "the join leaves no spill page allocated"
+    );
     let after_first_run = db.bpm().allocated_page_count();
     db.exec(sql);
     assert_eq!(
         db.bpm().allocated_page_count(),
         after_first_run,
-        "a second run of the same join allocates no new pages"
+        "a second run of the same join allocates no new page ids"
     );
 }
 
