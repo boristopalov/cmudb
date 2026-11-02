@@ -60,7 +60,7 @@ pub enum TablePageError {
     /// The deleted-tuple counter would overflow or drop below zero for a change to `slot`.
     CorruptDeletedCounter { count: u16, slot: u32 },
     /// An update of `slot` to `len` bytes does not fit on the page, which has `available` bytes
-    /// left for it even after compaction. A row cannot move to another page.
+    /// left for it even after compaction. Nothing on the page changed.
     UpdateDoesNotFit {
         slot: u32,
         len: usize,
@@ -108,7 +108,7 @@ impl fmt::Display for TablePageError {
                 available,
             } => write!(
                 f,
-                "the updated row in slot {slot} needs {len} bytes but its page has {available} bytes left for it, and rows cannot move to another page"
+                "the updated row in slot {slot} needs {len} bytes but its page has {available} bytes left for it"
             ),
         }
     }

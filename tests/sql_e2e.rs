@@ -2210,7 +2210,6 @@ fn a_row_too_large_for_a_page_is_refused_with_a_clear_error() {
 }
 
 #[test]
-#[ignore = "known gap: a row that grows past its page's free space cannot move to another page (BOR-76)"]
 fn an_update_can_grow_every_row_of_a_full_page_past_the_reserve() {
     let db = Db::new(64);
     db.exec("CREATE TABLE t (id INT, note TEXT)");
@@ -2225,20 +2224,133 @@ fn an_update_can_grow_every_row_of_a_full_page_past_the_reserve() {
     );
 }
 
-#[test]
-fn an_update_that_grows_rows_past_their_page_fails_and_changes_nothing() {
+/// A table `t (id INT, note TEXT)` indexed on `id`, whose first page is full of 200 short rows.
+fn full_page_of_short_notes() -> Db {
     let db = Db::new(64);
     db.exec("CREATE TABLE t (id INT, note TEXT)");
+    db.exec("CREATE INDEX t_id ON t (id)");
     for id in 0..200 {
         db.exec(&format!("INSERT INTO t VALUES ({id}, 'n')"));
     }
+    db
+}
+
+#[test]
+fn a_rollback_puts_back_rows_that_moved_to_another_page() {
+    let db = full_page_of_short_notes();
     let long = "z".repeat(200);
-    let err = db
-        .try_exec(&format!("UPDATE t SET note = '{long}'"))
-        .expect_err("the first page cannot hold every row at 200 bytes");
-    assert!(err.contains("rows cannot move to another page"), "{err}");
+    let longer = "w".repeat(2000);
+    let longest = "v".repeat(5000);
+    db.exec("BEGIN");
+    assert_eq!(
+        ints(&db.exec(&format!("UPDATE t SET note = '{long}'"))),
+        vec![[200]]
+    );
+    db.exec(&format!("UPDATE t SET note = '{longer}' WHERE id = 7"));
+    db.exec(&format!("UPDATE t SET note = '{longest}' WHERE id = 7"));
+    assert_eq!(
+        ints(&db.exec(&format!("SELECT COUNT(*) FROM t WHERE note = '{long}'"))),
+        vec![[199]]
+    );
+    assert_eq!(
+        texts(&db.exec("SELECT note FROM t WHERE id = 7")),
+        vec![vec![some(&longest)]]
+    );
+    db.exec("ROLLBACK");
     assert_eq!(
         ints(&db.exec("SELECT COUNT(*) FROM t WHERE note = 'n'")),
         vec![[200]]
+    );
+    assert_eq!(ints(&db.exec("SELECT COUNT(*) FROM t")), vec![[200]]);
+    assert_eq!(
+        texts(&db.exec("SELECT note FROM t WHERE id = 7")),
+        vec![vec![some("n")]]
+    );
+}
+
+#[test]
+fn a_row_that_moved_is_found_once_through_its_index_and_keeps_its_key() {
+    let db = full_page_of_short_notes();
+    let longer = "w".repeat(2000);
+    let longest = "v".repeat(5000);
+    let by_id = format!("UPDATE t SET note = '{longer}' WHERE id = 7");
+    assert!(plan_contains(&db.plan_of(&by_id), |p| matches!(
+        p,
+        Plan::IndexScan(_)
+    )));
+    assert_eq!(ints(&db.exec(&by_id)), vec![[1]]);
+    assert_eq!(
+        ints(&db.exec(&format!("UPDATE t SET note = '{longest}' WHERE id = 7"))),
+        vec![[1]],
+        "the scan skips the entry the move filed under the same key"
+    );
+    assert_eq!(
+        texts(&db.exec("SELECT note FROM t WHERE id = 7")),
+        vec![vec![some(&longest)]]
+    );
+    assert_eq!(
+        ints(&db.exec("SELECT COUNT(*) FROM t WHERE id = 7")),
+        vec![[1]]
+    );
+    assert!(
+        db.try_exec("INSERT INTO t VALUES (7, 'again')").is_err(),
+        "the moved row still holds its key in the unique index"
+    );
+    db.exec("UPDATE t SET id = 1000 WHERE id = 7");
+    assert!(db.exec("SELECT id FROM t WHERE id = 7").is_empty());
+    assert_eq!(
+        ints(&db.exec("SELECT id FROM t WHERE id = 1000")),
+        vec![[1000]]
+    );
+}
+
+#[test]
+fn an_index_scan_that_reaches_a_moved_row_again_updates_it_once() {
+    let db = full_page_of_short_notes();
+    db.exec("UPDATE t SET id = 7000 WHERE id = 7");
+    for _ in 0..1000 {
+        db.exec("INSERT INTO t VALUES (7, 'dead')");
+        db.exec("DELETE FROM t WHERE id = 7");
+    }
+    db.exec("UPDATE t SET id = 7 WHERE id = 7000");
+    let longer = "w".repeat(2000);
+    let by_id = format!("UPDATE t SET note = '{longer}' WHERE id = 7");
+    assert_eq!(
+        db.exec_dml_with_batch_size(&by_id, 1),
+        1,
+        "the move files row 7 after the dead entries the scan has not read yet"
+    );
+    assert_eq!(
+        texts(&db.exec("SELECT note FROM t WHERE id = 7")),
+        vec![vec![some(&longer)]]
+    );
+}
+
+#[test]
+fn an_update_that_moves_a_row_onto_a_taken_key_is_refused() {
+    let db = full_page_of_short_notes();
+    let longer = "w".repeat(2000);
+    let err = db
+        .try_exec(&format!(
+            "UPDATE t SET id = 8, note = '{longer}' WHERE id = 7"
+        ))
+        .expect_err("id 8 is taken");
+    assert!(err.contains("DuplicateKey"), "{err}");
+    assert_eq!(
+        texts(&db.exec("SELECT note FROM t WHERE id = 7")),
+        vec![vec![some("n")]]
+    );
+    assert_eq!(ints(&db.exec("SELECT COUNT(*) FROM t")), vec![[200]]);
+}
+
+#[test]
+fn an_update_too_large_for_any_page_fails_and_changes_nothing() {
+    let db = full_page_of_short_notes();
+    let huge = "y".repeat(9000);
+    db.try_exec(&format!("UPDATE t SET note = '{huge}' WHERE id = 7"))
+        .expect_err("9000 bytes do not fit a page");
+    assert_eq!(
+        texts(&db.exec("SELECT note FROM t WHERE id = 7")),
+        vec![vec![some("n")]]
     );
 }

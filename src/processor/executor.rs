@@ -18,7 +18,7 @@ use crate::processor::plan::{
 use crate::table_heap::{FreeError, RecordId, TableHeap, TableHeapError, TableHeapIterator, Tuple};
 use log::warn;
 use std::collections::hash_map::IntoIter;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Bound;
@@ -591,6 +591,9 @@ pub struct UpdateExecutor<'a> {
     plan: &'a UpdatePlanNode,
     child: Box<dyn Executor + 'a>,
     table: Option<Arc<TableInfo>>,
+    /// Record ids this statement moved rows to. The child scan can reach a moved row again
+    /// under its new record id, and it is already updated.
+    moved_to: HashSet<RecordId>,
 }
 
 impl<'a> UpdateExecutor<'a> {
@@ -604,6 +607,7 @@ impl<'a> UpdateExecutor<'a> {
             plan,
             child,
             table: None,
+            moved_to: HashSet::new(),
         }
     }
 }
@@ -616,41 +620,50 @@ impl<'a> Executor for UpdateExecutor<'a> {
         Ok(())
     }
 
-    /// Updates every row of the next child batch in place and returns the updated rows.
-    /// Each row keeps its record id, and the version it replaces moves to the undo chain.
+    /// Updates every row of the next child batch and returns the updated rows with the record
+    /// ids they now live at. The version each row replaces moves to the undo chain. A row keeps
+    /// its record id unless its new version no longer fits on its page, and then it moves.
     fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
         let table = self
             .table
-            .as_ref()
+            .clone()
             .ok_or_else(|| not_opened("UpdateExecutor"))?;
-
-        let Some(batch) = self.child.next_batch()? else {
-            return Ok(None);
-        };
-
         let schema = &self.plan.schema;
         let indexes = self.ctx.catalog.get_table_indexes(self.plan.table_oid)?;
-        let mut out = Vec::with_capacity(batch.len());
-        for (tuple_to_update, rid) in batch {
-            let mut new_values = row_values(schema, &tuple_to_update)?;
-            for assignment in &self.plan.assignments {
-                new_values[assignment.col_idx.index()] =
-                    assignment.value.evaluate(&tuple_to_update, schema)?;
-            }
+        loop {
+            let Some(batch) = self.child.next_batch()? else {
+                return Ok(None);
+            };
+            let mut out = Vec::with_capacity(batch.len());
+            for (tuple_to_update, rid) in batch {
+                if self.moved_to.contains(&rid) {
+                    continue;
+                }
+                let mut new_values = row_values(schema, &tuple_to_update)?;
+                for assignment in &self.plan.assignments {
+                    new_values[assignment.col_idx.index()] =
+                        assignment.value.evaluate(&tuple_to_update, schema)?;
+                }
 
-            let new_tuple = schema.encode_tuple(new_values.as_ref())?;
-            mvcc::update_tuple(
-                &self.ctx.txn,
-                &self.ctx.txn_mgr,
-                &table.heap,
-                &indexes,
-                rid,
-                &tuple_to_update,
-                &new_tuple,
-            )?;
-            out.push((new_tuple, rid));
+                let new_tuple = schema.encode_tuple(new_values.as_ref())?;
+                let new_rid = mvcc::update_tuple(
+                    &self.ctx.txn,
+                    &self.ctx.txn_mgr,
+                    &table.heap,
+                    &indexes,
+                    rid,
+                    &tuple_to_update,
+                    &new_tuple,
+                )?;
+                if new_rid != rid {
+                    self.moved_to.insert(new_rid);
+                }
+                out.push((new_tuple, new_rid));
+            }
+            if let Some(batch) = Batch::from_rows(out) {
+                return Ok(Some(batch));
+            }
         }
-        Ok(Batch::from_rows(out))
     }
 
     fn close(&mut self) -> Result<(), ExecutorError> {

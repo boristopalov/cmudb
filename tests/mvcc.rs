@@ -607,6 +607,64 @@ fn null_to_value_update_stays_in_place() {
     db.commit(&new);
 }
 
+#[test]
+fn a_row_that_moves_to_another_page_keeps_its_old_version_for_older_snapshots() {
+    let db = Db::new();
+    db.auto("CREATE TABLE t (id INTEGER, note TEXT)");
+    db.auto("CREATE INDEX t_id ON t (id)");
+    for id in 0..200 {
+        db.auto(&format!("INSERT INTO t VALUES ({id}, 'n')"));
+    }
+    let long = "z".repeat(2000);
+    let has_long_note = format!("SELECT id FROM t WHERE note = '{long}'");
+
+    let old = db.begin();
+    let writer = db.begin();
+    db.exec(
+        &writer,
+        &format!("UPDATE t SET note = '{long}' WHERE id = 7"),
+    )
+    .unwrap();
+    let rival = db.begin();
+    let err = db
+        .exec(&rival, "UPDATE t SET id = 700 WHERE id = 7")
+        .unwrap_err();
+    assert!(
+        is_write_conflict(&err),
+        "the old record id holds the writer's uncommitted deletion: {err}"
+    );
+    db.abort(&rival);
+    assert!(db.query(&old, &has_long_note).is_empty());
+    db.commit(&writer);
+
+    assert!(
+        db.query(&old, &has_long_note).is_empty(),
+        "the moved row's new record id is invisible to an older snapshot"
+    );
+    assert_eq!(
+        db.query(&old, "SELECT id FROM t WHERE id = 7 AND note = 'n'"),
+        rows(&[&[7]])
+    );
+    assert_eq!(db.query(&old, "SELECT COUNT(*) FROM t"), rows(&[&[200]]));
+    let err = db
+        .exec(&old, "UPDATE t SET note = 'm' WHERE id = 7")
+        .unwrap_err();
+    assert!(
+        is_write_conflict(&err),
+        "the move committed after the snapshot: {err}"
+    );
+    db.abort(&old);
+
+    let new = db.begin();
+    assert_eq!(db.query(&new, &has_long_note), rows(&[&[7]]));
+    assert_eq!(
+        db.query(&new, "SELECT id FROM t WHERE id = 7"),
+        rows(&[&[7]])
+    );
+    assert_eq!(db.query(&new, "SELECT COUNT(*) FROM t"), rows(&[&[200]]));
+    db.commit(&new);
+}
+
 mod failure_paths {
     use super::*;
     use cmudb::buffer_pool::BpmError;
@@ -708,6 +766,49 @@ mod failure_paths {
         db.abort(&t2);
     }
 
+    /// The pool has a single frame and page 0 is full, so the move's insert has to evict page
+    /// 0 to get a new page, and that eviction's disk write fails after the old record id
+    /// already holds the move's deletion.
+    #[test]
+    fn a_move_that_fails_after_deleting_the_old_row_is_rolled_back_by_abort() {
+        let (bpm, _dir) = cmudb::testing::bpm(1);
+        let heap = TableHeap::new(bpm.clone()).unwrap();
+        let mgr = TransactionManager::new(bpm.clone());
+        let row = |b: u8| Tuple {
+            data: vec![b; 1000],
+        };
+        let t0 = mgr.begin(IsolationLevel::SnapshotIsolation);
+        let rids: Vec<_> = (0..8)
+            .map(|b| mvcc::insert_tuple(&t0, &heap, &[], &row(b)).unwrap())
+            .collect();
+        mgr.commit(&t0).unwrap();
+        assert!(rids.iter().all(|r| r.page_id == rids[0].page_id));
+        let a = rids[0];
+
+        let t1 = mgr.begin(IsolationLevel::SnapshotIsolation);
+        let grown = Tuple {
+            data: vec![9; 1100],
+        };
+        bpm.fail_next_disk_writes(1);
+        let err = mvcc::update_tuple(&t1, &mgr, &heap, &[], a, &row(0), &grown).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MvccError::Txn(TxnError::Storage(TableHeapError::Bpm(_)))
+            ),
+            "{err:?}"
+        );
+        assert_eq!(t1.state(), TransactionState::Tainted);
+        assert_eq!(
+            heap.get_with_meta(a).unwrap().0.ts,
+            t1.id(),
+            "the old record id holds the move's uncommitted deletion"
+        );
+        mgr.abort(&t1).unwrap();
+        assert_eq!(read(&mgr, &heap, a), Some(row(0).data));
+        assert!(!heap.get_with_meta(a).unwrap().0.is_deleted);
+    }
+
     #[test]
     fn rejected_write_leaves_no_undo_entry() {
         let db = Db::new();
@@ -719,14 +820,14 @@ mod failure_paths {
 
         let t1 = db.begin();
         let wider = Tuple {
-            data: vec![9; TablePageRef::MAX_TUPLE_SIZE],
+            data: vec![9; TablePageRef::MAX_TUPLE_SIZE + 1],
         };
         let err = mvcc::update_tuple(&t1, &db.mgr, &heap, &[], a, &tuple(1), &wider).unwrap_err();
         assert!(
             matches!(
                 err,
                 MvccError::Txn(TxnError::Storage(TableHeapError::Page {
-                    source: TablePageError::UpdateDoesNotFit { .. },
+                    source: TablePageError::DoesNotFit { .. },
                     ..
                 }))
             ),
