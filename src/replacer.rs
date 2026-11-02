@@ -253,6 +253,16 @@ impl ArcReplacer {
     ///
     /// Returns `None` if no frame is evictable.
     pub fn evict(&mut self) -> Option<usize> {
+        self.begin_eviction().map(Eviction::commit)
+    }
+
+    /// Picks a victim frame like [`ArcReplacer::evict`], but keeps it restorable until
+    /// [`Eviction::commit`] is called. Dropping the returned [`Eviction`] uncommitted puts
+    /// the frame back in its list, at its old position, still evictable, and leaves the
+    /// MRU target size as it was.
+    ///
+    /// Returns `None` if no frame is evictable.
+    pub fn begin_eviction(&mut self) -> Option<Eviction<'_>> {
         info!(
             "evict: attempting eviction mru_target_size={} mru_len={} mfu_len={}",
             self.mru_target_size, self.mru_list.length, self.mfu_list.length
@@ -262,16 +272,20 @@ impl ArcReplacer {
         } else {
             (ResidentList::Mfu, ResidentList::Mru)
         };
-        let victim = self
+        let Some(undo) = self
             .evict_from_list(preferred)
-            .or_else(|| self.evict_from_list(fallback));
-        if victim.is_none() {
+            .or_else(|| self.evict_from_list(fallback))
+        else {
             warn!("evict: no evictable frames available");
-        }
-        victim
+            return None;
+        };
+        Some(Eviction {
+            replacer: self,
+            undo: Some(undo),
+        })
     }
 
-    fn evict_from_list(&mut self, resident: ResidentList) -> Option<usize> {
+    fn evict_from_list(&mut self, resident: ResidentList) -> Option<EvictionUndo> {
         let list = resident.list();
         let mut current = self.list(list).least_recent?;
 
@@ -289,6 +303,7 @@ impl ArcReplacer {
         }
 
         let page_id = self.nodes[current].page_id;
+        let more_recent = self.nodes[current].prev;
         let Some(frame_id) = self.nodes[current].frame_id else {
             warn!("evict_from_list: node missing frame_id list={list:?} page_id={page_id}");
             return None;
@@ -298,7 +313,32 @@ impl ArcReplacer {
             resident.ghost().list()
         );
         self.give_up_frame(current);
-        Some(frame_id)
+        Some(EvictionUndo {
+            node_idx: current,
+            frame_id,
+            list: resident,
+            more_recent,
+        })
+    }
+
+    fn undo_eviction(&mut self, undo: EvictionUndo) {
+        let EvictionUndo {
+            node_idx,
+            frame_id,
+            list,
+            more_recent,
+        } = undo;
+        info!(
+            "undo_eviction: restoring frame_id={frame_id} page_id={} to list={:?}",
+            self.nodes[node_idx].page_id,
+            list.list()
+        );
+        self.detach(node_idx);
+        self.insert_after(node_idx, list.list(), more_recent);
+        self.nodes[node_idx].frame_id = Some(frame_id);
+        self.nodes[node_idx].evictable = true;
+        self.frame_indices.insert(frame_id, node_idx);
+        self.evictable_count += 1;
     }
 
     fn give_up_frame(&mut self, idx: usize) {
@@ -397,9 +437,71 @@ impl ArcReplacer {
         }
     }
 
+    fn insert_after(&mut self, node_idx: usize, list: ArcList, more_recent: Option<usize>) {
+        let Some(more_recent) = more_recent else {
+            self.push(node_idx, list);
+            return;
+        };
+        let less_recent = self.nodes[more_recent].next;
+        self.nodes[more_recent].next = Some(node_idx);
+        self.nodes[node_idx].list = list;
+        self.nodes[node_idx].prev = Some(more_recent);
+        self.nodes[node_idx].next = less_recent;
+        match less_recent {
+            Some(less_recent) => self.nodes[less_recent].prev = Some(node_idx),
+            None => self.list_mut(list).least_recent = Some(node_idx),
+        }
+        self.list_mut(list).length += 1;
+    }
+
     fn move_to_front(&mut self, node_idx: usize, list: ArcList) {
         self.detach(node_idx);
         self.push(node_idx, list);
+    }
+}
+
+#[derive(Debug)]
+struct EvictionUndo {
+    node_idx: usize,
+    frame_id: usize,
+    list: ResidentList,
+    more_recent: Option<usize>,
+}
+
+/// A victim chosen by [`ArcReplacer::begin_eviction`]. It holds the replacer mutably, so
+/// nothing else changes the replacer until it is committed or dropped.
+///
+/// Dropping it without calling [`Eviction::commit`] restores the victim as it was.
+#[derive(Debug)]
+#[must_use = "dropping an uncommitted eviction restores the victim"]
+pub struct Eviction<'a> {
+    replacer: &'a mut ArcReplacer,
+    undo: Option<EvictionUndo>,
+}
+
+impl Eviction<'_> {
+    /// Returns the victim frame's id.
+    pub fn frame_id(&self) -> usize {
+        self.undo
+            .as_ref()
+            .map(|undo| undo.frame_id)
+            .expect("an uncommitted eviction keeps its undo record")
+    }
+
+    /// Makes the eviction final and returns the victim frame's id.
+    pub fn commit(mut self) -> usize {
+        self.undo
+            .take()
+            .map(|undo| undo.frame_id)
+            .expect("an uncommitted eviction keeps its undo record")
+    }
+}
+
+impl Drop for Eviction<'_> {
+    fn drop(&mut self) {
+        if let Some(undo) = self.undo.take() {
+            self.replacer.undo_eviction(undo);
+        }
     }
 }
 
@@ -529,6 +631,102 @@ mod tests {
             1,
             "stale frame 1 changed the evictable count"
         );
+    }
+
+    fn replacer_with_evictable_frames(frames: &[usize]) -> ArcReplacer {
+        let mut arc_replacer = ArcReplacer::new(frames.len() + 1);
+        for &frame_id in frames {
+            arc_replacer.record_access(frame_id, frame_id * 10);
+            arc_replacer.set_evictable(frame_id, true);
+        }
+        arc_replacer
+    }
+
+    fn drain_evictions(arc_replacer: &mut ArcReplacer) -> Vec<usize> {
+        std::iter::from_fn(|| arc_replacer.evict()).collect()
+    }
+
+    fn assert_uncommitted_eviction_changes_nothing(setup: impl Fn(&mut ArcReplacer)) {
+        let mut untouched = replacer_with_evictable_frames(&[1, 2, 3, 4]);
+        let mut restored = replacer_with_evictable_frames(&[1, 2, 3, 4]);
+        setup(&mut untouched);
+        setup(&mut restored);
+
+        let victim = restored
+            .begin_eviction()
+            .expect("an evictable frame")
+            .frame_id();
+        assert_eq!(restored.size(), untouched.size(), "evictable count");
+        assert_eq!(restored.mru_target_size, untouched.mru_target_size);
+        assert_eq!(
+            restored.mru_ghost_list.length,
+            untouched.mru_ghost_list.length
+        );
+        assert_eq!(
+            restored.mfu_ghost_list.length,
+            untouched.mfu_ghost_list.length
+        );
+        assert_eq!(restored.frame_indices, untouched.frame_indices);
+
+        assert_eq!(
+            restored.nodes[restored.frame_indices[&victim]].list,
+            untouched.nodes[untouched.frame_indices[&victim]].list,
+            "the victim went back to a different list"
+        );
+        for frame_id in 1..=4 {
+            restored.set_evictable(frame_id, true);
+            untouched.set_evictable(frame_id, true);
+        }
+        assert_eq!(
+            drain_evictions(&mut restored),
+            drain_evictions(&mut untouched),
+            "eviction order changed after an uncommitted eviction"
+        );
+    }
+
+    #[test]
+    fn an_uncommitted_eviction_of_the_least_recent_frame_restores_it() {
+        assert_uncommitted_eviction_changes_nothing(|_| {});
+    }
+
+    #[test]
+    fn an_uncommitted_eviction_from_the_middle_of_a_list_restores_its_position() {
+        assert_uncommitted_eviction_changes_nothing(|arc_replacer| {
+            arc_replacer.set_evictable(1, false);
+        });
+    }
+
+    #[test]
+    fn an_uncommitted_eviction_from_the_mfu_list_restores_it_there() {
+        assert_uncommitted_eviction_changes_nothing(|arc_replacer| {
+            arc_replacer.record_access(2, 20);
+            arc_replacer.record_access(3, 30);
+            arc_replacer.mru_target_size = 3;
+        });
+    }
+
+    #[test]
+    fn a_restored_victim_is_not_counted_as_a_ghost_hit_on_its_next_access() {
+        let mut arc_replacer = replacer_with_evictable_frames(&[1, 2]);
+        let victim = arc_replacer
+            .begin_eviction()
+            .expect("an evictable frame")
+            .frame_id();
+        arc_replacer.record_access(victim, victim * 10);
+        assert_eq!(arc_replacer.mru_target_size, 0, "MRU target size moved");
+        assert_eq!(arc_replacer.mru_ghost_list.length, 0);
+        assert_eq!(arc_replacer.mfu_list.length, 1);
+    }
+
+    #[test]
+    fn a_committed_eviction_moves_the_victim_to_a_ghost_list() {
+        let mut arc_replacer = replacer_with_evictable_frames(&[1, 2]);
+        let eviction = arc_replacer.begin_eviction().expect("an evictable frame");
+        assert_eq!(eviction.frame_id(), 1);
+        assert_eq!(eviction.commit(), 1);
+        assert_eq!(arc_replacer.size(), 1);
+        assert_eq!(arc_replacer.mru_ghost_list.length, 1);
+        assert!(!arc_replacer.frame_indices.contains_key(&1));
     }
 
     #[test]

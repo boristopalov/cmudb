@@ -431,9 +431,10 @@ impl BufferPoolManager {
             "tid={} get_free_frame: no free frames, attempting eviction",
             Self::tid()
         );
-        let Some(frame_id) = meta.replacer.evict() else {
+        let Some(eviction) = meta.replacer.begin_eviction() else {
             return Err(BpmError::NoFreeFrame);
         };
+        let frame_id = eviction.frame_id();
         info!(
             "tid={} get_free_frame: replacer returned victim frame_id={frame_id}",
             Self::tid()
@@ -449,6 +450,7 @@ impl BufferPoolManager {
         let mut frame = self.frame(frame_id)?.write();
 
         let Some(page_id) = frame.page_id else {
+            eviction.commit();
             return Ok(FrameReservation {
                 frame_id,
                 evicted: None,
@@ -460,9 +462,16 @@ impl BufferPoolManager {
                 "tid={} get_free_frame: flushing dirty page_id={page_id} before eviction",
                 Self::tid()
             );
-            self.write_to_disk(page_id, &frame.buf)?;
+            if let Err(e) = self.write_to_disk(page_id, &frame.buf) {
+                warn!(
+                    "tid={} get_free_frame: flush of page_id={page_id} failed, keeping it in frame_id={frame_id}: {e}",
+                    Self::tid()
+                );
+                return Err(e);
+            }
         }
 
+        eviction.commit();
         meta.page_table.remove(&page_id);
         let data = frame.buf;
         frame.clear();
@@ -524,6 +533,12 @@ impl BufferPoolManager {
     /// Reports whether `page_id` currently sits in a frame, so a read of it would not touch disk.
     pub fn is_resident(&self, page_id: usize) -> bool {
         self.meta.lock().page_table.contains_key(&page_id)
+    }
+
+    /// Makes the next `count` page writes to disk fail with an injected I/O error.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn fail_next_disk_writes(&self, count: u32) {
+        self.scheduler.lock().disk_manager().fail_next_writes(count);
     }
 
     pub fn flush_page(&self, page_id: usize) -> Result<(), BpmError> {
@@ -686,6 +701,113 @@ mod tests {
             bpm.new_page().is_ok(),
             "frame stayed pinned after its last guard dropped"
         );
+    }
+
+    const VICTIM_FILL: u8 = 0xA1;
+
+    #[derive(Clone, Copy)]
+    enum FrameRequest {
+        NewPage,
+        ReadMiss,
+        WriteMiss,
+    }
+
+    fn assert_a_failed_victim_flush_keeps_the_victim_cached(request: FrameRequest) {
+        let (bpm, _dir) = crate::testing::bpm(2);
+        let on_disk = bpm.new_page().unwrap().page_id().unwrap();
+        bpm.flush_page(on_disk).unwrap();
+        let victim = {
+            let mut page = bpm.new_page().unwrap();
+            page.data_mut().fill(VICTIM_FILL);
+            page.page_id().unwrap()
+        };
+        let other = bpm.new_page().unwrap().page_id().unwrap();
+        assert!(
+            !bpm.is_resident(on_disk),
+            "setup expected the first page to be evicted"
+        );
+        let victim_frame = bpm.meta.lock().page_table[&victim];
+        let allocated = bpm.allocated_page_count();
+
+        bpm.fail_next_disk_writes(1);
+        let result = match request {
+            FrameRequest::NewPage => bpm.new_page().map(drop),
+            FrameRequest::ReadMiss => bpm.read_page(on_disk).map(drop),
+            FrameRequest::WriteMiss => bpm.write_page(on_disk).map(drop),
+        };
+        match result {
+            Err(BpmError::Io(e)) => assert_eq!(e.to_string(), disk::INJECTED_WRITE_FAILURE),
+            other => panic!("expected the injected write failure, got {other:?}"),
+        }
+
+        {
+            let meta = bpm.meta.lock();
+            assert_eq!(
+                meta.page_table.get(&victim),
+                Some(&victim_frame),
+                "the victim lost its page table entry"
+            );
+            assert_eq!(meta.page_table.len(), 2, "page table entries");
+            assert!(meta.free_list.is_empty(), "the victim frame was freed");
+            assert_eq!(meta.pins[victim_frame], 0, "victim pins");
+            assert_eq!(
+                meta.replacer.size(),
+                2,
+                "the victim stopped being evictable"
+            );
+        }
+        {
+            let frame = bpm.frames[victim_frame].read();
+            assert_eq!(frame.page_id, Some(victim));
+            assert!(
+                frame.dirty.load(Ordering::Acquire),
+                "the victim lost its dirty flag"
+            );
+            assert!(frame.buf.iter().all(|&b| b == VICTIM_FILL));
+        }
+        assert!(bpm.is_resident(other));
+        assert!(!bpm.is_resident(on_disk));
+        assert_eq!(
+            bpm.allocated_page_count(),
+            allocated,
+            "a failed request handed out a page id"
+        );
+
+        bpm.flush_page(victim).unwrap();
+        assert!(
+            bpm.read_from_disk(victim)
+                .unwrap()
+                .iter()
+                .all(|&b| b == VICTIM_FILL),
+            "the later flush wrote different bytes"
+        );
+        drop(bpm.read_page(on_disk).unwrap());
+        assert!(
+            !bpm.is_resident(victim),
+            "the retried miss picked a different victim"
+        );
+        assert!(
+            bpm.read_page(victim)
+                .unwrap()
+                .data()
+                .iter()
+                .all(|&b| b == VICTIM_FILL)
+        );
+    }
+
+    #[test]
+    fn a_failed_victim_flush_during_new_page_keeps_the_victim_cached_and_dirty() {
+        assert_a_failed_victim_flush_keeps_the_victim_cached(FrameRequest::NewPage);
+    }
+
+    #[test]
+    fn a_failed_victim_flush_during_a_read_miss_keeps_the_victim_cached_and_dirty() {
+        assert_a_failed_victim_flush_keeps_the_victim_cached(FrameRequest::ReadMiss);
+    }
+
+    #[test]
+    fn a_failed_victim_flush_during_a_write_miss_keeps_the_victim_cached_and_dirty() {
+        assert_a_failed_victim_flush_keeps_the_victim_cached(FrameRequest::WriteMiss);
     }
 
     const MISS_STALL_WINDOW: Duration = Duration::from_millis(200);
