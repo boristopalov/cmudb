@@ -328,6 +328,32 @@ fn window_partition_without_order_gives_partition_totals() {
 }
 
 #[test]
+fn window_order_by_puts_null_keys_in_the_last_peer_group() {
+    let db = sales_db();
+    db.exec("INSERT INTO sales VALUES (1, NULL)");
+    let plan = window(
+        &db,
+        Some(vec![col(0)]),
+        Some(vec![col(1)]),
+        vec![AggType::SUM, AggType::RANK],
+    );
+    let dept_1: Vec<_> = nullable_ints(&db.run_plan(&plan).unwrap())
+        .into_iter()
+        .filter(|r| r[0] == Some(1))
+        .collect();
+    assert_eq!(
+        dept_1,
+        vec![
+            vec![Some(1), Some(10), Some(10), Some(1)],
+            vec![Some(1), Some(20), Some(30), Some(2)],
+            vec![Some(1), Some(30), Some(60), Some(3)],
+            vec![Some(1), None, Some(60), Some(4)],
+        ],
+        "a NULL order key sorts above every value, so it ranks last and adds nothing to the sum"
+    );
+}
+
+#[test]
 fn window_with_order_by_computes_running_sum_and_rank_with_ties() {
     let db = sales_db();
     let plan = window(
