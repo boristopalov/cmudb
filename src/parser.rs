@@ -1126,10 +1126,10 @@ impl<'a> Binder<'a> {
             .as_ref()
             .ok_or(Unsupported::InsertWithoutSource)?;
         reject_unsupported_query_clauses(source)?;
-        reject_order_by_and_limit(source)?;
         let SetExpr::Values(values) = source.body.as_ref() else {
             return Err(Unsupported::InsertSource.into());
         };
+        reject_order_by_and_limit(source)?;
 
         let no_input_columns = HashMap::new();
         let rows = values

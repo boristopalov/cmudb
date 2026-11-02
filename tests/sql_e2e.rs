@@ -558,6 +558,14 @@ fn insert_source_clauses_the_binder_does_not_bind_are_rejected() {
             "INSERT INTO emp VALUES (5, 10, 500, 5.0, true) FETCH FIRST 1 ROWS ONLY",
             Unsupported::Fetch,
         ),
+        (
+            "INSERT INTO emp SELECT * FROM emp LIMIT 1",
+            Unsupported::InsertSource,
+        ),
+        (
+            "INSERT INTO emp SELECT * FROM emp ORDER BY 1",
+            Unsupported::InsertSource,
+        ),
     ] {
         assert_eq!(
             db.bind_error(sql),
