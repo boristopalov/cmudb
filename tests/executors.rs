@@ -6,7 +6,7 @@ mod common;
 use cmudb::catalog::{DataType, Schema, Value};
 use cmudb::processor::plan::{
     AggType, DropIndexPlanNode, DropTablePlanNode, Expression, ExternalMergeSortPlanNode,
-    HashJoinPlanNode, JoinType, LimitPlanNode, Plan, SeqScanPlanNode, SortPlanNode,
+    HashJoinPlanNode, JoinType, LimitPlanNode, Plan, SeqScanPlanNode, SortExpr, SortPlanNode,
     WindowFunctionPlanNode,
 };
 use common::*;
@@ -125,7 +125,7 @@ fn external_merge_sort_orders_by_multiple_keys() {
     let plan = Plan::ExternalMergeSort(ExternalMergeSortPlanNode {
         schema: int_schema(&["a", "b"]),
         child: Box::new(scan(&db, "t", &["a", "b"])),
-        order_by_exprs: vec![col(0), col(1)],
+        order_by_exprs: vec![SortExpr::ascending(col(0)), SortExpr::ascending(col(1))],
     });
     let rows = db.run_plan(&plan).unwrap();
     let keys: Vec<_> = rows.iter().map(|r| (r[0], r[1])).collect();
@@ -148,9 +148,33 @@ fn external_merge_sort_of_empty_input_is_empty() {
     let plan = Plan::ExternalMergeSort(ExternalMergeSortPlanNode {
         schema: int_schema(&["a"]),
         child: Box::new(scan(&db, "t", &["a"])),
-        order_by_exprs: vec![col(0)],
+        order_by_exprs: vec![SortExpr::ascending(col(0))],
     });
     assert!(db.run_plan(&plan).unwrap().is_empty());
+}
+
+#[test]
+fn external_merge_sort_orders_mixed_directions_with_nulls_lowest() {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE t (a INTEGER, b INTEGER)");
+    db.exec("INSERT INTO t VALUES (3, 1), (1, 2), (2, 3), (1, 1), (NULL, 5)");
+    let plan = Plan::ExternalMergeSort(ExternalMergeSortPlanNode {
+        schema: int_schema(&["a", "b"]),
+        child: Box::new(scan(&db, "t", &["a", "b"])),
+        order_by_exprs: vec![SortExpr::descending(col(0)), SortExpr::ascending(col(1))],
+    });
+    let rows = db.run_plan(&plan).unwrap();
+    let keys: Vec<_> = rows.iter().map(|r| (r[0], r[1])).collect();
+    assert_eq!(
+        keys,
+        vec![
+            (int(3), int(1)),
+            (int(2), int(3)),
+            (int(1), int(1)),
+            (int(1), int(2)),
+            (None, int(5)),
+        ]
+    );
 }
 
 #[test]
@@ -164,7 +188,7 @@ fn sort_and_limit_nodes_compose() {
         child: Box::new(Plan::Sort(SortPlanNode {
             schema: int_schema(&["a"]),
             child: Box::new(scan(&db, "t", &["a"])),
-            order_by_exprs: vec![col(0)],
+            order_by_exprs: vec![SortExpr::ascending(col(0))],
         })),
     });
     assert_eq!(ints(&db.run_plan(&plan).unwrap()), vec![[1], [3]]);
