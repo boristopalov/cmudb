@@ -631,6 +631,13 @@ impl BufferPoolManager {
         }
     }
 
+    /// Whether `page_id` was handed out by [`BufferPoolManager::new_page`] and not deleted
+    /// since.
+    pub fn page_is_allocated(&self, page_id: usize) -> bool {
+        let meta = self.meta.lock();
+        page_id < meta.next_page_id && !meta.free_page_ids.contains(&page_id)
+    }
+
     /// Resumes handing out page ids where `allocation` left off, for a pool over a data file
     /// written by an earlier pool. Forgets the free pages on disk, so reading one fails as it
     /// did before. Fails with [`BpmError::PoolInUse`] once this pool has handed out a page.

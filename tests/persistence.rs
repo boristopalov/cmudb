@@ -289,3 +289,26 @@ fn a_new_database_is_on_disk_before_its_first_commit() {
         Err(QueryError::RolledBack { .. })
     ));
 }
+
+#[test]
+#[ignore = "known gap: BOR-71, pages evicted between commits can link past the recorded allocation"]
+fn a_kill_while_a_block_grows_a_table_leaves_a_database_that_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = Database::open(dir.path(), 8).unwrap();
+        run(&db, "CREATE TABLE t (a INTEGER);");
+        let values: Vec<String> = (0..20_000).map(|i| format!("({i})")).collect();
+        run(
+            &db,
+            &format!("BEGIN; INSERT INTO t VALUES {};", values.join(", ")),
+        );
+        std::mem::forget(db);
+    }
+
+    let db = Database::open(dir.path(), 8).expect("reopen after a kill");
+    run(&db, "CREATE TABLE u (a INTEGER);");
+    let values: Vec<String> = (0..20_000).map(|i| format!("({i})")).collect();
+    run(&db, &format!("INSERT INTO u VALUES {};", values.join(", ")));
+    assert_eq!(rows(&db, "SELECT a FROM t;").len(), 0);
+    assert_eq!(rows(&db, "SELECT a FROM u;").len(), 20_000);
+}

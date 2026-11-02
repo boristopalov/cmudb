@@ -23,8 +23,10 @@ A SQL statement flows top to bottom:
 temporary directory instead. Page 0 of the data file is a header that points at a chain of
 metadata pages (`src/database_file.rs`) holding the catalog, the page allocator's next and free
 ids, and the transaction clocks. The data file is written after every commit through `Database`
-and on close or drop; there is no WAL, so a crash between commits loses what the last commit did
-not write. Page `id` lives at byte `id * PAGE_SIZE` of the data file.
+and on close or drop. There is no WAL (BOR-71): the buffer pool also writes pages when it evicts
+them, so a crash or kill between those writes can leave the file unopenable or inconsistent.
+Opening a table whose page links point past the recorded allocation fails with
+`TableHeapError::UnallocatedPageLink`. Page `id` lives at byte `id * PAGE_SIZE` of the data file.
 
 `cmudb::Database` (`src/database.rs`) runs the whole pipeline and
 owns the session's transaction block (`BEGIN`, `COMMIT`, `ROLLBACK`, autocommit). It returns a

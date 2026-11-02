@@ -319,7 +319,9 @@ impl Database {
     /// The data file is written after every commit made through [`Database::execute`] (or
     /// [`Database::execute_plan`]) and when the database closes, by [`Database::close`] or
     /// by being dropped. A transaction committed directly on [`Database::txn_mgr`] is written
-    /// at the next of those.
+    /// at the next of those. Pages evicted from the buffer pool are written in between, and
+    /// there is no log to undo them, so a crash or kill can leave the data file unopenable or
+    /// inconsistent.
     pub fn open(dir: impl AsRef<Path>, frames: usize) -> Result<Self, PersistError> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;

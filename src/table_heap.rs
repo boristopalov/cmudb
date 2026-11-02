@@ -27,6 +27,8 @@ pub enum TableHeapError {
     PageIdOutOfRange { page_id: usize },
     /// Following the heap's page links from its first page came back to `page_id`.
     PageChainCycle { page_id: u32 },
+    /// Page `from` links to page `to`, which the buffer pool has not handed out.
+    UnallocatedPageLink { from: u32, to: u32 },
 }
 
 impl fmt::Display for TableHeapError {
@@ -50,6 +52,10 @@ impl fmt::Display for TableHeapError {
             TableHeapError::PageChainCycle { page_id } => {
                 write!(f, "the table's page links loop back to page {page_id}")
             }
+            TableHeapError::UnallocatedPageLink { from, to } => write!(
+                f,
+                "page {from} of the table links to page {to}, which is not allocated"
+            ),
         }
     }
 }
@@ -263,6 +269,12 @@ impl TableHeap {
             let guard = bpm.read_page(page_id as usize)?;
             let page = TablePageRef::new(guard.data()).map_err(|e| e.on_page(page_id))?;
             match page.next_page_id() {
+                Some(next) if !bpm.page_is_allocated(next as usize) => {
+                    return Err(TableHeapError::UnallocatedPageLink {
+                        from: page_id,
+                        to: next,
+                    });
+                }
                 Some(next) => page_id = next,
                 None => break u32::from(page.num_tuples()),
             }
@@ -839,6 +851,31 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!("the table's page links loop back to page {first}")
+        );
+    }
+
+    #[test]
+    fn open_rejects_a_link_to_a_page_that_is_not_allocated() {
+        let (bpm, _dir) = crate::testing::bpm(8);
+        let heap = TableHeap::new(bpm.clone()).unwrap();
+        let first = heap.first_page_id as u32;
+        let past_the_end = bpm.allocation().next_page_id as u32;
+        {
+            let mut guard = bpm.write_page(heap.first_page_id).unwrap();
+            TablePageMut::new(guard.data_mut())
+                .unwrap()
+                .set_next_page_id(past_the_end);
+        }
+        let err = TableHeap::open(bpm, heap.first_page_id).err().unwrap();
+        assert!(matches!(
+            err,
+            TableHeapError::UnallocatedPageLink { from, to } if from == first && to == past_the_end
+        ));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "page {first} of the table links to page {past_the_end}, which is not allocated"
+            )
         );
     }
 
