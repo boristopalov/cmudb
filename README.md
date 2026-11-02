@@ -74,5 +74,5 @@ criterion's 95% interval):
 | query/insert_1k_rows | 4.9 ms (4.7 to 5.2) | 4.9 µs |
 
 The table heap benches use a 64-frame pool on a heap of about 270 pages, so scans and random
-gets include disk reads and evictions. The B+ tree benches use a 1024-frame pool, so their cost is
+gets include disk reads and evictions. The bench asserts that the heap is larger than the pool. The B+ tree benches use a 1024-frame pool, so their cost is
 mostly decoding whole pages rather than I/O.

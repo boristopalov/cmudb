@@ -7,6 +7,7 @@ use cmudb::replacer::ArcReplacer;
 use cmudb::table_heap::{RecordId, TableHeap, Tuple};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use rand::seq::SliceRandom;
+use std::collections::HashSet;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
@@ -134,6 +135,12 @@ fn table_heap(c: &mut Criterion) {
 
     let (heap, rids, _bpm, _dir) = filled_heap(HEAP_ROWS);
     assert_heap_holds(&heap, &rids);
+    let pages: HashSet<u32> = rids.iter().map(|r| r.page_id).collect();
+    assert!(
+        pages.len() > POOL_FRAMES,
+        "the heap spans {} pages, more than the {POOL_FRAMES}-frame pool, so scans and gets evict",
+        pages.len()
+    );
     group.bench_function("scan_10k", |b| b.iter(|| black_box(count_rows(&heap))));
 
     let mut shuffled = rids.clone();
