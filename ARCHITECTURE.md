@@ -19,7 +19,14 @@ A SQL statement flows top to bottom:
 | Buffer pool | `src/buffer_pool.rs`, `src/replacer.rs` (ARC) | `PageRef` / `PageMut` guards |
 | Disk | `src/disk.rs` | `DiskScheduler` thread over `DiskManager` |
 
-The catalog is in memory. `cmudb::Database` (`src/database.rs`) runs the whole pipeline and
+`cmudb::Database::open(dir)` keeps a database in `dir/cmudb.data`; `Database::scratch` uses a
+temporary directory instead. Page 0 of the data file is a header that points at a chain of
+metadata pages (`src/database_file.rs`) holding the catalog, the page allocator's next and free
+ids, and the transaction clocks. The data file is written after every commit through `Database`
+and on close or drop; there is no WAL, so a crash between commits loses what the last commit did
+not write. Page `id` lives at byte `id * PAGE_SIZE` of the data file.
+
+`cmudb::Database` (`src/database.rs`) runs the whole pipeline and
 owns the session's transaction block (`BEGIN`, `COMMIT`, `ROLLBACK`, autocommit). It returns a
 typed `StatementResult` per statement. The shell (`src/main.rs`) only prints those results, and
 `tests/common` is a thin wrapper over `Database`. One `Database` is one session: callers of

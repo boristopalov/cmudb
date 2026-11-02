@@ -5,6 +5,7 @@ use parking_lot::Mutex;
 
 use crate::buffer_pool::BufferPoolManager;
 use crate::catalog::{DataType, IndexType, Schema, Value};
+use crate::index::b_plus_page::PageId;
 use crate::index::{BPlusTree, Index, IndexError, InsertError, InsertResult, RemoveResult};
 use crate::table_heap::{RecordId, Tuple};
 
@@ -34,6 +35,28 @@ const RID_MIN: RecordId = RecordId {
 };
 const RID_MAX: RecordId = RecordId::RESERVED;
 
+/// The schema of the key made of `indexed_col_idxs` of `table_schema`.
+///
+/// Panics if a column index is out of range for `table_schema`.
+fn key_schema(table_schema: &Schema, indexed_col_idxs: &[usize]) -> Schema {
+    let key_cols: Vec<(DataType, String)> = indexed_col_idxs
+        .iter()
+        .map(|&i| {
+            let col = table_schema
+                .cols
+                .get(i)
+                .unwrap_or_else(|| panic!("indexed column {i} is not in the table schema"));
+            (col.dtype, col.name.clone())
+        })
+        .collect();
+    Schema::new(key_cols)
+}
+
+/// Length of a B+ tree key: the user key followed by the record id.
+fn entry_key_len(key_schema: &Schema) -> u32 {
+    (key_schema.data_len + RID_SUFFIX_LEN) as u32
+}
+
 /// Iterator over `(user key, record id)` index entries.
 pub type TableIndexIter = Box<dyn Iterator<Item = Result<(IndexKey, RecordId), IndexError>>>;
 
@@ -53,6 +76,9 @@ pub struct TableIndex {
     pub indexed_col_idxs: Vec<usize>,
     /// Schema of the index key (the key columns only).
     pub schema: Schema,
+    pub index_type: IndexType,
+    /// The page [`TableIndex::open`] finds the index at.
+    pub header_page_id: PageId,
     idx: Box<dyn Index + Send + Sync>,
     /// Serializes "check the key is free, then claim it" across writers of this index.
     pub unique_latch: Mutex<()>,
@@ -69,31 +95,49 @@ impl TableIndex {
         indexed_col_idxs: Vec<usize>,
         index_type: IndexType,
     ) -> Result<Self, IndexError> {
-        let key_cols: Vec<(DataType, String)> = indexed_col_idxs
-            .iter()
-            .map(|&i| {
-                let col = table_schema
-                    .cols
-                    .get(i)
-                    .unwrap_or_else(|| panic!("indexed column {i} is not in the table schema"));
-                (col.dtype, col.name.clone())
-            })
-            .collect();
-        let schema = Schema::new(key_cols);
+        let schema = key_schema(&table_schema, &indexed_col_idxs);
+        let tree = match index_type {
+            IndexType::BPlusTree => BPlusTree::new(index_name, entry_key_len(&schema), bpm)?,
+        };
+        Ok(Self::over(tree, table_schema, indexed_col_idxs, schema))
+    }
 
-        let idx = match index_type {
+    /// The index whose tree starts at `header_page_id`, as an earlier [`TableIndex::new`]
+    /// over the same data file left it.
+    ///
+    /// Panics if a column index is out of range for `table_schema`.
+    pub fn open(
+        bpm: Arc<BufferPoolManager>,
+        index_name: String,
+        table_schema: Schema,
+        indexed_col_idxs: Vec<usize>,
+        index_type: IndexType,
+        header_page_id: PageId,
+    ) -> Result<Self, IndexError> {
+        let schema = key_schema(&table_schema, &indexed_col_idxs);
+        let tree = match index_type {
             IndexType::BPlusTree => {
-                BPlusTree::new(index_name, (schema.data_len + RID_SUFFIX_LEN) as u32, bpm)?
+                BPlusTree::open(index_name, entry_key_len(&schema), header_page_id, bpm)?
             }
         };
+        Ok(Self::over(tree, table_schema, indexed_col_idxs, schema))
+    }
 
-        Ok(Self {
+    fn over(
+        tree: BPlusTree,
+        table_schema: Schema,
+        indexed_col_idxs: Vec<usize>,
+        schema: Schema,
+    ) -> Self {
+        Self {
             table_schema,
             indexed_col_idxs,
             schema,
-            idx: Box::new(idx),
+            index_type: IndexType::BPlusTree,
+            header_page_id: tree.header_page_id,
+            idx: Box::new(tree),
             unique_latch: Mutex::new(()),
-        })
+        }
     }
 
     /// Encodes the key columns of a table tuple, or returns `Ok(None)` when any of them is

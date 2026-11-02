@@ -177,6 +177,35 @@ impl BPlusTree {
         })
     }
 
+    /// The tree whose header page is `header_page_id`, as an earlier [`BPlusTree::new`] over
+    /// the same data file left it. Fails with [`IndexError::KeyLength`] when the header was
+    /// written for keys of another length.
+    pub fn open(
+        index_name: String,
+        key_len: u32,
+        header_page_id: PageId,
+        bpm: Arc<BufferPoolManager>,
+    ) -> Result<Self, IndexError> {
+        let key_len_usize =
+            usize::try_from(key_len).map_err(|_| IndexError::UnsupportedKeyLength(key_len))?;
+        let (Some(leaf_capacity), Some(internal_capacity)) = (
+            LeafPage::max_size_for_layout(key_len_usize),
+            InternalPage::max_size_for_layout(key_len_usize),
+        ) else {
+            return Err(IndexError::UnsupportedKeyLength(key_len));
+        };
+        let tree = Self {
+            index_name,
+            key_len,
+            header_page_id,
+            leaf_max_size: leaf_capacity,
+            internal_max_size: internal_capacity,
+            bpm,
+        };
+        tree.read_header()?;
+        Ok(tree)
+    }
+
     /// Acquires a read latch on the header page and copies out its fields.
     fn read_header(&self) -> Result<HeaderPage, IndexError> {
         let page = self.bpm.read_page(self.header_page_id)?;

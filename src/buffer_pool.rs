@@ -71,6 +71,14 @@ impl Meta {
     }
 }
 
+/// Which page ids a pool has handed out: every id below `next_page_id` except
+/// `free_page_ids`, which were deleted and are handed out again first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageAllocation {
+    pub next_page_id: usize,
+    pub free_page_ids: Vec<usize>,
+}
+
 #[derive(Debug)]
 pub struct BufferPoolManager {
     frames: Vec<RwLock<FrameHeader>>,
@@ -188,6 +196,8 @@ pub enum BpmError {
     NoSuchPage {
         page_id: usize,
     },
+    /// [`BufferPoolManager::resume_allocation`] on a pool that already handed out pages.
+    PoolInUse,
 }
 
 impl fmt::Display for BpmError {
@@ -212,6 +222,9 @@ impl fmt::Display for BpmError {
             }
             BpmError::NoSuchPage { page_id } => {
                 write!(f, "Page {page_id} is in no frame and not on disk")
+            }
+            BpmError::PoolInUse => {
+                write!(f, "the buffer pool already handed out pages")
             }
         }
     }
@@ -608,6 +621,59 @@ impl BufferPoolManager {
         self.scheduler.lock().disk_manager().fail_next_writes(count);
     }
 
+    /// The ids [`BufferPoolManager::new_page`] has handed out so far, as one past the highest
+    /// id and the deleted ids below it.
+    pub fn allocation(&self) -> PageAllocation {
+        let meta = self.meta.lock();
+        PageAllocation {
+            next_page_id: meta.next_page_id,
+            free_page_ids: meta.free_page_ids.iter().copied().collect(),
+        }
+    }
+
+    /// Resumes handing out page ids where `allocation` left off, for a pool over a data file
+    /// written by an earlier pool. Forgets the free pages on disk, so reading one fails as it
+    /// did before. Fails with [`BpmError::PoolInUse`] once this pool has handed out a page.
+    pub fn resume_allocation(&self, allocation: &PageAllocation) -> Result<(), BpmError> {
+        let mut meta = self.meta.lock();
+        if meta.next_page_id != 0 || !meta.free_page_ids.is_empty() {
+            return Err(BpmError::PoolInUse);
+        }
+        let dm = self.scheduler.lock().disk_manager();
+        for &page_id in &allocation.free_page_ids {
+            dm.deallocate_page(page_id);
+        }
+        meta.next_page_id = allocation.next_page_id;
+        meta.free_page_ids = allocation.free_page_ids.iter().copied().collect();
+        Ok(())
+    }
+
+    /// Writes every dirty page in the pool to disk and waits until the data file is on the
+    /// storage device. Returns how many pages it wrote. A page latched for writing is
+    /// written once its guard drops.
+    pub fn flush_all(&self) -> Result<usize, BpmError> {
+        let mut written = 0;
+        for frame_lock in &self.frames {
+            let frame = frame_lock.read();
+            let Some(page_id) = frame.page_id else {
+                continue;
+            };
+            if frame.dirty.load(Ordering::Acquire) {
+                self.write_to_disk(page_id, &frame.buf)?;
+                frame.dirty.store(false, Ordering::Release);
+                written += 1;
+            }
+        }
+        if written > 0 {
+            self.scheduler
+                .lock()
+                .disk_manager()
+                .sync()
+                .map_err(BpmError::Io)?;
+        }
+        Ok(written)
+    }
+
     pub fn flush_page(&self, page_id: usize) -> Result<(), BpmError> {
         info!("flush_page: flushing page page_id={page_id}");
         let Some(frame_id) = self.meta.lock().page_table.get(&page_id).copied() else {
@@ -633,6 +699,60 @@ mod tests {
     use crate::replacer::ArcReplacer;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
+
+    #[test]
+    fn flush_all_writes_each_dirty_page_once_and_a_new_pool_reads_them_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = |frames| {
+            let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).unwrap();
+            Arc::new(BufferPoolManager::new(
+                frames,
+                ArcReplacer::new(frames),
+                DiskScheduler::new(dm),
+            ))
+        };
+        let bpm = pool(4);
+        for fill in 0..3u8 {
+            bpm.new_page().unwrap().data_mut().fill(fill + 1);
+        }
+        bpm.delete_page(1).unwrap();
+        assert_eq!(
+            bpm.flush_all().unwrap(),
+            2,
+            "the deleted page is not written"
+        );
+        assert_eq!(
+            bpm.flush_all().unwrap(),
+            0,
+            "nothing is dirty after a flush"
+        );
+        let allocation = bpm.allocation();
+        assert_eq!(
+            allocation,
+            PageAllocation {
+                next_page_id: 3,
+                free_page_ids: vec![1],
+            }
+        );
+
+        let reopened = pool(4);
+        reopened.resume_allocation(&allocation).unwrap();
+        assert_eq!(reopened.read_page(0).unwrap().data()[0], 1);
+        assert_eq!(reopened.read_page(2).unwrap().data()[0], 3);
+        assert!(
+            matches!(reopened.read_page(1), Err(BpmError::Io(e)) if e.kind() == io::ErrorKind::NotFound),
+            "a page freed before the restart stays unreadable"
+        );
+        assert_eq!(reopened.new_page().unwrap().page_id(), Some(1));
+        assert!(matches!(
+            reopened.resume_allocation(&allocation),
+            Err(BpmError::PoolInUse)
+        ));
+        assert_eq!(
+            BpmError::PoolInUse.to_string(),
+            "the buffer pool already handed out pages"
+        );
+    }
 
     #[test]
     fn a_deleted_page_id_is_handed_out_again_before_a_new_one() {

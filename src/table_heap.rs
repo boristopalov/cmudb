@@ -25,6 +25,8 @@ pub enum TableHeapError {
     NewPageWithoutId,
     /// The page id does not fit in the `u32` that record ids and page links store.
     PageIdOutOfRange { page_id: usize },
+    /// Following the heap's page links from its first page came back to `page_id`.
+    PageChainCycle { page_id: u32 },
 }
 
 impl fmt::Display for TableHeapError {
@@ -44,6 +46,9 @@ impl fmt::Display for TableHeapError {
             TableHeapError::NewPageWithoutId => write!(f, "new page has no page_id"),
             TableHeapError::PageIdOutOfRange { page_id } => {
                 write!(f, "page id {page_id} exceeds RID capacity")
+            }
+            TableHeapError::PageChainCycle { page_id } => {
+                write!(f, "the table's page links loop back to page {page_id}")
             }
         }
     }
@@ -242,6 +247,32 @@ impl TableHeap {
             tail: Mutex::new(Tail {
                 page_id,
                 num_tuples: 0,
+            }),
+        })
+    }
+
+    /// The heap whose pages start at `first_page_id`, as an earlier [`TableHeap::new`] over
+    /// the same data file left it. Follows the page links to find where inserts go next.
+    pub fn open(bpm: Arc<BufferPoolManager>, first_page_id: usize) -> Result<Self, TableHeapError> {
+        let mut page_id = record_page_id(Some(first_page_id))?;
+        let mut seen = std::collections::HashSet::new();
+        let num_tuples = loop {
+            if !seen.insert(page_id) {
+                return Err(TableHeapError::PageChainCycle { page_id });
+            }
+            let guard = bpm.read_page(page_id as usize)?;
+            let page = TablePageRef::new(guard.data()).map_err(|e| e.on_page(page_id))?;
+            match page.next_page_id() {
+                Some(next) => page_id = next,
+                None => break u32::from(page.num_tuples()),
+            }
+        };
+        Ok(Self {
+            bpm,
+            first_page_id,
+            tail: Mutex::new(Tail {
+                page_id: page_id as usize,
+                num_tuples,
             }),
         })
     }
@@ -765,6 +796,49 @@ mod tests {
         assert_eq!(
             TableHeapError::Bpm(BpmError::NoFreeFrame).to_string(),
             "buffer pool error: No free frame available"
+        );
+    }
+
+    #[test]
+    fn open_finds_the_tail_so_inserts_continue_after_the_last_row() {
+        let (bpm, _dir) = crate::testing::bpm(8);
+        let heap = TableHeap::new(bpm.clone()).unwrap();
+        let big = Tuple {
+            data: vec![7; 3000],
+        };
+        let rids: Vec<RecordId> = (0..5).map(|_| heap.insert(&big).unwrap()).collect();
+        assert_ne!(
+            heap.first_page_id,
+            heap.last_page_id(),
+            "the heap spans pages"
+        );
+
+        let reopened = TableHeap::open(bpm.clone(), heap.first_page_id).unwrap();
+        assert_eq!(reopened.last_page_id(), heap.last_page_id());
+        let next = reopened.insert(&big).unwrap();
+        assert!(
+            !rids.contains(&next),
+            "the new row did not overwrite an old one"
+        );
+        assert_eq!(reopened.iter().count(), 6);
+    }
+
+    #[test]
+    fn open_rejects_a_page_chain_that_loops() {
+        let (bpm, _dir) = crate::testing::bpm(8);
+        let heap = TableHeap::new(bpm.clone()).unwrap();
+        let first = heap.first_page_id as u32;
+        {
+            let mut guard = bpm.write_page(heap.first_page_id).unwrap();
+            TablePageMut::new(guard.data_mut())
+                .unwrap()
+                .set_next_page_id(first);
+        }
+        let err = TableHeap::open(bpm, heap.first_page_id).err().unwrap();
+        assert!(matches!(err, TableHeapError::PageChainCycle { page_id } if page_id == first));
+        assert_eq!(
+            err.to_string(),
+            format!("the table's page links loop back to page {first}")
         );
     }
 

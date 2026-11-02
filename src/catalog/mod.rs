@@ -8,7 +8,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicU32;
-use std::sync::atomic::Ordering::AcqRel;
+use std::sync::atomic::Ordering::{AcqRel, Acquire};
 
 #[derive(Debug)]
 pub enum CatalogError {
@@ -35,6 +35,10 @@ pub enum CatalogError {
     IndexExists,
     IndexDoesNotExist,
     IndexCreationError(String),
+    /// A table from a [`CatalogSnapshot`] could not be opened.
+    TableOpenError(String),
+    /// An index from a [`CatalogSnapshot`] could not be opened.
+    IndexOpenError(String),
 }
 
 impl fmt::Display for CatalogError {
@@ -66,6 +70,8 @@ impl fmt::Display for CatalogError {
             CatalogError::IndexExists => write!(f, "index already exists"),
             CatalogError::IndexDoesNotExist => write!(f, "index does not exist"),
             CatalogError::IndexCreationError(msg) => write!(f, "index creation failed: {msg}"),
+            CatalogError::TableOpenError(msg) => write!(f, "opening a table failed: {msg}"),
+            CatalogError::IndexOpenError(msg) => write!(f, "opening an index failed: {msg}"),
         }
     }
 }
@@ -83,8 +89,42 @@ pub struct IndexInfo {
     pub index: TableIndex,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexType {
     BPlusTree,
+}
+
+/// The tables and indexes a [`Catalog`] holds, with the first page of each, which is all
+/// [`Catalog::restore`] needs to open them again. Entries are in oid order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogSnapshot {
+    pub next_table_oid: u32,
+    pub next_index_oid: u32,
+    pub tables: Vec<TableEntry>,
+    pub indexes: Vec<IndexEntry>,
+}
+
+/// One table of a [`CatalogSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableEntry {
+    pub oid: u32,
+    pub name: String,
+    pub columns: Vec<(DataType, String)>,
+    /// The first page of the table's heap.
+    pub first_page_id: usize,
+}
+
+/// One index of a [`CatalogSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexEntry {
+    pub oid: u32,
+    pub name: String,
+    pub table_oid: u32,
+    /// Position of each key column in the table's columns.
+    pub key_columns: Vec<usize>,
+    pub index_type: IndexType,
+    /// The header page of the index's tree.
+    pub header_page_id: usize,
 }
 
 /// Registry of tables and indexes, shared by reference-counted handles. Executors look tables and
@@ -111,6 +151,111 @@ impl Catalog {
             next_index_oid: AtomicU32::new(0),
             bpm,
             entries: RwLock::new(CatalogEntries::default()),
+        }
+    }
+
+    /// The catalog `snapshot` describes, with its tables and indexes opened from the pages
+    /// of `bpm` it names.
+    pub fn restore(
+        bpm: Arc<BufferPoolManager>,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<Self, CatalogError> {
+        let mut entries = CatalogEntries::default();
+        for t in &snapshot.tables {
+            let heap = TableHeap::open(bpm.clone(), t.first_page_id)
+                .map_err(|e| CatalogError::TableOpenError(format!("table {}: {e}", t.name)))?;
+            let info = TableInfo {
+                name: t.name.clone(),
+                schema: Schema::new(t.columns.clone()),
+                heap,
+            };
+            entries.tables.insert(t.oid, Arc::new(info));
+            entries.table_oids_by_name.insert(t.name.clone(), t.oid);
+        }
+        for i in &snapshot.indexes {
+            let table = entries.tables.get(&i.table_oid).cloned().ok_or_else(|| {
+                CatalogError::IndexOpenError(format!(
+                    "index {} is on table oid {}, which does not exist",
+                    i.name, i.table_oid
+                ))
+            })?;
+            if let Some(&col) = i
+                .key_columns
+                .iter()
+                .find(|&&c| c >= table.schema.cols.len())
+            {
+                return Err(CatalogError::IndexOpenError(format!(
+                    "index {} keys on column {col}, past the end of table {}",
+                    i.name, table.name
+                )));
+            }
+            let index = TableIndex::open(
+                bpm.clone(),
+                i.name.clone(),
+                table.schema.clone(),
+                i.key_columns.clone(),
+                i.index_type,
+                i.header_page_id,
+            )
+            .map_err(|e| CatalogError::IndexOpenError(format!("index {}: {e}", i.name)))?;
+            let info = IndexInfo {
+                oid: i.oid,
+                name: i.name.clone(),
+                table_oid: i.table_oid,
+                index,
+            };
+            entries.indexes.insert(i.oid, Arc::new(info));
+            entries
+                .index_oids_by_table_name
+                .entry(table.name.clone())
+                .or_default()
+                .insert(i.name.clone(), i.oid);
+        }
+        Ok(Self {
+            next_table_oid: AtomicU32::new(snapshot.next_table_oid),
+            next_index_oid: AtomicU32::new(snapshot.next_index_oid),
+            bpm,
+            entries: RwLock::new(entries),
+        })
+    }
+
+    /// What [`Catalog::restore`] needs to open this catalog's tables and indexes again.
+    pub fn snapshot(&self) -> CatalogSnapshot {
+        let entries = self.entries.read().unwrap();
+        let mut tables: Vec<TableEntry> = entries
+            .tables
+            .iter()
+            .map(|(&oid, t)| TableEntry {
+                oid,
+                name: t.name.clone(),
+                columns: t
+                    .schema
+                    .cols
+                    .iter()
+                    .map(|c| (c.dtype, c.name.clone()))
+                    .collect(),
+                first_page_id: t.heap.first_page_id,
+            })
+            .collect();
+        tables.sort_by_key(|t| t.oid);
+        let mut indexes: Vec<IndexEntry> = entries
+            .indexes
+            .iter()
+            .map(|(&oid, i)| IndexEntry {
+                oid,
+                name: i.name.clone(),
+                table_oid: i.table_oid,
+                key_columns: i.index.indexed_col_idxs.clone(),
+                index_type: i.index.index_type,
+                header_page_id: i.index.header_page_id,
+            })
+            .collect();
+        indexes.sort_by_key(|i| i.oid);
+        CatalogSnapshot {
+            next_table_oid: self.next_table_oid.load(Acquire),
+            next_index_oid: self.next_index_oid.load(Acquire),
+            tables,
+            indexes,
         }
     }
 
@@ -1032,5 +1177,88 @@ mod tests {
 
         assert!(matches!(result, Err(CatalogError::IndexCreationError(_))));
         assert!(catalog.get_table_indexes(oid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_reopens_what_snapshot_describes() {
+        let (catalog, bpm, _dir) = crate::testing::catalog(32);
+        let schema = Schema::new(vec![
+            (DataType::INT, "id".to_string()),
+            (DataType::FLOAT, "v".to_string()),
+        ]);
+        let oid = catalog.create_table("t".into(), schema.clone()).unwrap();
+        let tuple = schema
+            .encode_tuple(&[Some(Value::INT(4)), Some(Value::FLOAT(OrderedFloat(1.0)))])
+            .unwrap();
+        let rid = catalog.get_table(oid).unwrap().heap.insert(&tuple).unwrap();
+        catalog
+            .create_index(bpm.clone(), oid, "t_v".into(), &["v"], IndexType::BPlusTree)
+            .unwrap();
+
+        let snapshot = catalog.snapshot();
+        let restored = Catalog::restore(bpm, &snapshot).unwrap();
+        assert_eq!(restored.snapshot(), snapshot);
+        let ioid = restored.index_oid("t", "t_v").unwrap();
+        assert_eq!(
+            restored
+                .get_index(ioid)
+                .unwrap()
+                .index
+                .search(&[Value::FLOAT(OrderedFloat(1.0))])
+                .unwrap(),
+            vec![rid]
+        );
+        assert_eq!(restored.create_table("u".into(), schema).unwrap(), oid + 1);
+    }
+
+    #[test]
+    fn restore_rejects_an_index_that_does_not_fit_its_table() {
+        let (catalog, bpm, _dir) = crate::testing::catalog(32);
+        let schema = Schema::new(vec![(DataType::INT, "id".to_string())]);
+        let oid = catalog.create_table("t".into(), schema).unwrap();
+        catalog
+            .create_index(
+                bpm.clone(),
+                oid,
+                "t_id".into(),
+                &["id"],
+                IndexType::BPlusTree,
+            )
+            .unwrap();
+        let good = catalog.snapshot();
+
+        let mut no_table = good.clone();
+        no_table.indexes[0].table_oid = 9;
+        let mut bad_column = good.clone();
+        bad_column.indexes[0].key_columns = vec![3];
+        let mut not_a_tree = good.clone();
+        not_a_tree.indexes[0].header_page_id = good.tables[0].first_page_id;
+        let mut not_a_heap = good;
+        not_a_heap.tables[0].first_page_id = not_a_heap.indexes[0].header_page_id;
+
+        for (snapshot, expected) in [
+            (
+                no_table,
+                "index t_id is on table oid 9, which does not exist",
+            ),
+            (
+                bad_column,
+                "index t_id keys on column 3, past the end of table t",
+            ),
+            (not_a_tree, "index t_id: "),
+        ] {
+            match Catalog::restore(bpm.clone(), &snapshot) {
+                Err(CatalogError::IndexOpenError(msg)) => {
+                    assert!(msg.starts_with(expected), "{msg}")
+                }
+                other => panic!("expected an index error, got {:?}", other.err()),
+            }
+        }
+        let err = Catalog::restore(bpm, &not_a_heap).err().unwrap();
+        assert!(
+            err.to_string()
+                .starts_with("opening a table failed: table t: "),
+            "{err}"
+        );
     }
 }

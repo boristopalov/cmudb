@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, Write};
+use std::process::ExitCode;
 
 use cmudb::catalog::{Schema, Value};
 use cmudb::database::Row;
@@ -6,9 +7,40 @@ use cmudb::{Database, DdlOp, StatementResult};
 
 const NUM_FRAMES: usize = 64;
 
-fn main() {
-    let db = Database::scratch(NUM_FRAMES).expect("failed to create a temporary database");
+const USAGE: &str = "usage: cmudb [DIR]\n\n\
+Opens the database stored in directory DIR, creating it if it is missing, and keeps it\n\
+there across runs. Without DIR, runs on a temporary database that is deleted on exit.";
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let db = match args.as_slice() {
+        [] => Database::scratch(NUM_FRAMES).map_err(|e| e.to_string()),
+        [flag] if flag == "-h" || flag == "--help" => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        [dir] => Database::open(dir, NUM_FRAMES)
+            .map_err(|e| format!("cannot open the database in {dir}: {e}")),
+        _ => {
+            eprintln!("{USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let db = match db {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     run_shell(&db);
+    match db.close() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: writing the database to disk failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn run_shell(db: &Database) {

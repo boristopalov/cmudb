@@ -125,9 +125,14 @@ Changed:
 - Removing dead index entries and reclaiming deleted heap slots during GC. Until then,
   every key-changing update, delete and aborted insert leaves a B+ tree entry behind, and
   the uniqueness check scans all entries for a key, so heavy churn on one key gets slower.
-- A page format version. The table page layout changed with this work (slot entries grew
-  from 9 to 17 bytes). Nothing is persisted across runs today, since the shell and the
-  catalog live in a temp dir and in memory, so no old file can be misread yet.
+- Recovery of versions left uncommitted on disk. `Database::open` resumes `last_commit_ts`
+  and the transaction id counter from the data file, and closing a database rolls back the
+  block `BEGIN` left open, so committed rows are visible after a reopen and rolled-back ones
+  are not. Undo chains are not stored: after a reopen nothing is running, so only the newest
+  version of each row matters. A transaction still running on the transaction manager when the
+  database is written (or a process killed mid-commit) leaves its versions stamped with its
+  id; no new transaction gets that id, so they stay invisible, but their rows stay locked
+  against writers. Undoing them needs a WAL.
 - `CREATE`/`DROP` are not transactional. `CREATE INDEX` fills the new index from the
   newest version of each row, outside any transaction. If another transaction has an
   uncommitted update or delete open at that moment, the index can miss the row once that
