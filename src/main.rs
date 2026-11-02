@@ -7,7 +7,7 @@ use cmudb::create_buffer_pool_manager;
 use cmudb::disk::{DiskManager, DiskScheduler};
 use cmudb::parser::Binder;
 use cmudb::planner::Planner;
-use cmudb::processor::executor::Executor;
+use cmudb::processor::executor::{Executor, RowCursor};
 use cmudb::processor::executor_factory::create_executor;
 use cmudb::processor::plan::Plan;
 use cmudb::replacer::ArcReplacer;
@@ -106,39 +106,42 @@ fn run(
 fn execute(plan: &Plan, exec: &mut dyn Executor) -> Result<(), String> {
     match plan {
         Plan::Insert(_) => {
-            if let Some((tup, _)) = exec.next().map_err(|e| format!("exec: {}", e.0))? {
+            if let Some((tup, _)) = RowCursor::new(exec)
+                .next_row()
+                .map_err(|e| format!("exec: {}", e.0))?
+            {
                 let n = i32::from_ne_bytes(tup.data.as_slice().try_into().unwrap_or([0, 0, 0, 0]));
                 println!("INSERT {n}");
             }
         }
         Plan::Update(_) => {
             let mut n = 0;
-            while exec.next().map_err(|e| format!("exec: {}", e.0))?.is_some() {
-                n += 1;
+            while let Some(batch) = exec.next_batch().map_err(|e| format!("exec: {}", e.0))? {
+                n += batch.len();
             }
             println!("UPDATE {n}");
         }
         Plan::Delete(_) => {
             let mut n = 0;
-            while exec.next().map_err(|e| format!("exec: {}", e.0))?.is_some() {
-                n += 1;
+            while let Some(batch) = exec.next_batch().map_err(|e| format!("exec: {}", e.0))? {
+                n += batch.len();
             }
             println!("DELETE {n}");
         }
         Plan::CreateTable(p) => {
-            exec.next().map_err(|e| format!("exec: {}", e.0))?;
+            exec.next_batch().map_err(|e| format!("exec: {}", e.0))?;
             println!("CREATE TABLE {}", p.table_name);
         }
         Plan::CreateIndex(p) => {
-            exec.next().map_err(|e| format!("exec: {}", e.0))?;
+            exec.next_batch().map_err(|e| format!("exec: {}", e.0))?;
             println!("CREATE INDEX {}", p.index_name);
         }
         Plan::DropTable(_) => {
-            exec.next().map_err(|e| format!("exec: {}", e.0))?;
+            exec.next_batch().map_err(|e| format!("exec: {}", e.0))?;
             println!("DROP TABLE");
         }
         Plan::DropIndex(_) => {
-            exec.next().map_err(|e| format!("exec: {}", e.0))?;
+            exec.next_batch().map_err(|e| format!("exec: {}", e.0))?;
             println!("DROP INDEX");
         }
         _ => print_rows(exec)?,
@@ -151,7 +154,8 @@ fn print_rows(exec: &mut dyn Executor) -> Result<(), String> {
     let headers: Vec<String> = schema.cols.iter().map(|c| c.name.clone()).collect();
 
     let mut rows: Vec<Vec<String>> = Vec::new();
-    while let Some((tup, _)) = exec.next().map_err(|e| format!("exec: {}", e.0))? {
+    for row in RowCursor::new(exec) {
+        let (tup, _) = row.map_err(|e| format!("exec: {}", e.0))?;
         let mut row = Vec::with_capacity(schema.cols.len());
         for i in 0..schema.cols.len() {
             let cell = match schema.get_value(&tup, i) {

@@ -1,76 +1,101 @@
 use crate::buffer_pool::BufferPoolManager;
 use crate::catalog::Catalog;
 use crate::processor::executor::{
-    AggregationExecutor, CreateIndexExecutor, CreateTableExecutor, DeleteExecutor,
-    DropIndexExecutor, DropTableExecutor, Executor, ExternalMergeSortExecutor, FilterExecutor,
-    HashJoinExecutor, IndexScanExecutor, InsertExecutor, LimitExecutor, NestedIndexJoinExecutor,
-    NestedLoopJoinExecutor, ProjectionExecutor, SeqScanExecutor, SortExecutor, UpdateExecutor,
-    ValuesExecutor, WindowFunctionExecutor,
+    AggregationExecutor, CreateIndexExecutor, CreateTableExecutor, DEFAULT_BATCH_SIZE,
+    DeleteExecutor, DropIndexExecutor, DropTableExecutor, Executor, ExternalMergeSortExecutor,
+    FilterExecutor, HashJoinExecutor, IndexScanExecutor, InsertExecutor, LimitExecutor,
+    NestedIndexJoinExecutor, NestedLoopJoinExecutor, ProjectionExecutor, SeqScanExecutor,
+    SortExecutor, UpdateExecutor, ValuesExecutor, WindowFunctionExecutor,
 };
 use crate::processor::plan::Plan;
 use std::sync::Arc;
 
+/// Builds the executor tree for `plan`, exchanging batches of up to [`DEFAULT_BATCH_SIZE`] rows.
 pub fn create_executor<'a>(
     catalog: &'a Catalog,
     bpm: &Arc<BufferPoolManager>,
     plan: &'a Plan,
 ) -> Box<dyn Executor + 'a> {
+    create_executor_with_batch_size(catalog, bpm, plan, DEFAULT_BATCH_SIZE)
+}
+
+/// Builds the executor tree for `plan`, with every row-producing executor in the tree
+/// targeting `batch_size` rows per batch.
+pub fn create_executor_with_batch_size<'a>(
+    catalog: &'a Catalog,
+    bpm: &Arc<BufferPoolManager>,
+    plan: &'a Plan,
+    batch_size: usize,
+) -> Box<dyn Executor + 'a> {
+    assert!(batch_size > 0, "batch size must be at least 1");
+    let build = |child: &'a Plan| create_executor_with_batch_size(catalog, bpm, child, batch_size);
     match plan {
-        Plan::SeqScan(p) => Box::new(SeqScanExecutor::new(catalog, p)),
+        Plan::SeqScan(p) => Box::new(SeqScanExecutor::new(catalog, p, batch_size)),
         Plan::Insert(p) => {
-            let child = create_executor(catalog, bpm, &p.child);
+            let child = build(&p.child);
             Box::new(InsertExecutor::new(catalog, p, child))
         }
-        Plan::Values(p) => Box::new(ValuesExecutor::new(p)),
+        Plan::Values(p) => Box::new(ValuesExecutor::new(p, batch_size)),
         Plan::Update(p) => {
-            let child = create_executor(catalog, bpm, &p.child);
+            let child = build(&p.child);
             Box::new(UpdateExecutor::new(catalog, p, child))
         }
         Plan::Delete(p) => {
-            let child = create_executor(catalog, bpm, &p.child);
+            let child = build(&p.child);
             Box::new(DeleteExecutor::new(catalog, p, child))
         }
-        Plan::IndexScan(p) => Box::new(IndexScanExecutor::new(catalog, p)),
+        Plan::IndexScan(p) => Box::new(IndexScanExecutor::new(catalog, p, batch_size)),
         Plan::Aggregation(p) => {
-            let child = create_executor(catalog, bpm, &p.child);
-            Box::new(AggregationExecutor::new(p, child))
+            let child = build(&p.child);
+            Box::new(AggregationExecutor::new(p, child, batch_size))
         }
         Plan::NestedLoopJoin(p) => {
-            let left = create_executor(catalog, bpm, &p.left);
-            let right = create_executor(catalog, bpm, &p.right);
-            Box::new(NestedLoopJoinExecutor::new(p, left, right))
+            let left = build(&p.left);
+            let right = build(&p.right);
+            Box::new(NestedLoopJoinExecutor::new(p, left, right, batch_size))
         }
         Plan::NestedIndexJoin(p) => {
-            let child = create_executor(catalog, bpm, &p.child);
-            Box::new(NestedIndexJoinExecutor::new(catalog, p, child))
+            let child = build(&p.child);
+            Box::new(NestedIndexJoinExecutor::new(catalog, p, child, batch_size))
         }
         Plan::HashJoin(p) => {
-            let left = create_executor(catalog, bpm, &p.left);
-            let right = create_executor(catalog, bpm, &p.right);
-            Box::new(HashJoinExecutor::new(p, left, right, bpm.clone()))
+            let left = build(&p.left);
+            let right = build(&p.right);
+            Box::new(HashJoinExecutor::new(
+                p,
+                left,
+                right,
+                bpm.clone(),
+                batch_size,
+            ))
         }
         Plan::Sort(p) => {
-            let child = create_executor(catalog, bpm, &p.child);
-            Box::new(SortExecutor::new(p, child))
+            let child = build(&p.child);
+            Box::new(SortExecutor::new(p, child, batch_size))
         }
         Plan::ExternalMergeSort(p) => {
-            let child = create_executor(catalog, bpm, &p.child);
-            Box::new(ExternalMergeSortExecutor::new(p, child, bpm.clone()))
+            let child = build(&p.child);
+            Box::new(ExternalMergeSortExecutor::new(
+                p,
+                child,
+                bpm.clone(),
+                batch_size,
+            ))
         }
         Plan::Limit(p) => {
-            let child = create_executor(catalog, bpm, &p.child);
+            let child = build(&p.child);
             Box::new(LimitExecutor::new(p, child))
         }
         Plan::WindowFunction(p) => {
-            let child = create_executor(catalog, bpm, &p.child);
-            Box::new(WindowFunctionExecutor::new(p, child))
+            let child = build(&p.child);
+            Box::new(WindowFunctionExecutor::new(p, child, batch_size))
         }
         Plan::Filter(p) => {
-            let child = create_executor(catalog, bpm, &p.child);
+            let child = build(&p.child);
             Box::new(FilterExecutor::new(p, child))
         }
         Plan::Projection(p) => {
-            let child = create_executor(catalog, bpm, &p.child);
+            let child = build(&p.child);
             Box::new(ProjectionExecutor::new(p, child))
         }
         Plan::CreateTable(p) => Box::new(CreateTableExecutor::new(catalog, p)),
@@ -86,6 +111,7 @@ mod tests {
     use crate::catalog::{Catalog, DataType, Schema, Value};
     use crate::create_buffer_pool_manager;
     use crate::disk::{DiskManager, DiskScheduler};
+    use crate::processor::executor::collect_rows;
     use crate::processor::plan::{Expression, InsertPlanNode, SeqScanPlanNode, ValuesPlanNode};
     use crate::replacer::ArcReplacer;
     use std::sync::Arc;
@@ -138,10 +164,12 @@ mod tests {
 
         let mut insert_exec = create_executor(&catalog, &bpm, &insert_plan);
         insert_exec.open().expect("open insert");
-        let (count_tuple, _) = insert_exec
-            .next()
-            .expect("insert next")
+        let batch = insert_exec
+            .next_batch()
+            .expect("insert next_batch")
             .expect("insert produces a count tuple");
+        assert_eq!(batch.len(), 1);
+        let (count_tuple, _) = batch.into_iter().next().unwrap();
         let count = i32::from_ne_bytes(count_tuple.data.as_slice().try_into().unwrap());
         assert_eq!(count, 3, "insert should report 3 rows");
         drop(insert_exec);
@@ -154,7 +182,7 @@ mod tests {
         scan_exec.open().expect("open scan");
 
         let mut got = Vec::new();
-        while let Some((tuple, _rid)) = scan_exec.next().expect("scan next") {
+        for (tuple, _rid) in collect_rows(&mut *scan_exec).expect("scan") {
             let row: Vec<Option<Value>> = (0..make_schema().cols.len())
                 .map(|i| make_schema().get_value(&tuple, i).expect("decode"))
                 .collect();
