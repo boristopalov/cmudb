@@ -365,6 +365,16 @@ mod tests {
         .expect_err("a new version too short for the indexed column is an error");
 
         assert!(is_short_tuple_error(&err), "unexpected error: {err}");
+        let (written_by, data) = t
+            .table
+            .heap
+            .read_with(t.short_rid, |meta, bytes| (meta.ts, bytes.to_vec()))
+            .unwrap();
+        assert_eq!(
+            (written_by, data),
+            (txn.id(), short_tuple(2).data),
+            "the slot holds the new version before the key error"
+        );
         assert_eq!(
             txn.state(),
             TransactionState::Tainted,
