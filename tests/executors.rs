@@ -540,7 +540,10 @@ fn drop_index_then_drop_table() {
         index_oid: Some(index_oid),
         if_exists: false,
     });
-    assert!(db.run_plan(&again).is_err());
+    assert!(matches!(
+        db.plan_error(&again),
+        QueryError::Execute(ExecutorError::IndexNotFound { oid }) if oid == index_oid
+    ));
     let again = Plan::DropIndex(DropIndexPlanNode {
         index_oid: Some(index_oid),
         if_exists: true,
@@ -560,7 +563,10 @@ fn drop_index_then_drop_table() {
         table_oid: Some(table_oid),
         if_exists: false,
     });
-    assert!(db.run_plan(&again).is_err());
+    assert!(matches!(
+        db.plan_error(&again),
+        QueryError::Execute(ExecutorError::TableNotFound { oid }) if oid == table_oid
+    ));
     let again = Plan::DropTable(DropTablePlanNode {
         table_oid: Some(table_oid),
         if_exists: true,
