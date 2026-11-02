@@ -258,8 +258,8 @@ impl<'a> Planner<'a> {
         filter: Option<Expression>,
     ) -> (Plan, Option<Expression>) {
         if let Some((col_idx, value)) = filter.as_ref().and_then(column_equals_constant)
-            && value.data_type() == ts.schema.cols[col_idx as usize].dtype
-            && let Some(index_oid) = self.index_for_cols(ts.oid, &[col_idx as usize])
+            && value.data_type() == ts.schema.cols[col_idx.index()].dtype
+            && let Some(index_oid) = self.index_for_cols(ts.oid, &[col_idx.index()])
         {
             return (
                 Plan::IndexScan(IndexScanPlanNode {
@@ -428,7 +428,7 @@ fn aggregation_output_schema(
 /// `(col_idx, value)` when `filter` is `col = value` or `value = col` on the scanned table.
 /// An index lookup encodes `value` with its own type, so callers use the index only when
 /// `value` has the column's type; mixed INT and FLOAT equality goes through a filtered scan.
-fn column_equals_constant(filter: &Expression) -> Option<(u32, Value)> {
+fn column_equals_constant(filter: &Expression) -> Option<(ColIdx, Value)> {
     let Expression::Binary {
         left,
         right,
@@ -439,7 +439,7 @@ fn column_equals_constant(filter: &Expression) -> Option<(u32, Value)> {
     };
     match (left.as_ref(), right.as_ref()) {
         (Expression::Column { col, .. }, Expression::Constant(Some(v)))
-        | (Expression::Constant(Some(v)), Expression::Column { col, .. }) => Some((col.0, *v)),
+        | (Expression::Constant(Some(v)), Expression::Column { col, .. }) => Some((*col, *v)),
         _ => None,
     }
 }
@@ -573,11 +573,11 @@ mod tests {
         let three = || Expression::Constant(Some(Value::INT(3)));
         assert_eq!(
             column_equals_constant(&eq(column(2), three())),
-            Some((2, Value::INT(3)))
+            Some((ColIdx(2), Value::INT(3)))
         );
         assert_eq!(
             column_equals_constant(&eq(three(), column(2))),
-            Some((2, Value::INT(3)))
+            Some((ColIdx(2), Value::INT(3)))
         );
         assert_eq!(
             column_equals_constant(&eq(column(2), Expression::Constant(None))),
