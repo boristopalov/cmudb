@@ -41,7 +41,7 @@ impl From<TableHeapError> for ExecutorError {
 
 impl From<IndexError> for ExecutorError {
     fn from(e: IndexError) -> Self {
-        ExecutorError(format!("index error: {:?}", e))
+        ExecutorError(format!("index error: {e}"))
     }
 }
 
@@ -2208,7 +2208,16 @@ fn flush_peer_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::InsertError;
     use crate::processor::plan::{ColIdx, Plan};
+
+    #[test]
+    fn wrapped_storage_errors_read_as_their_display_text() {
+        let index = ExecutorError::from(IndexError::Insert(InsertError::DuplicateKey));
+        assert_eq!(index.0, "index error: insert failed: key already exists");
+        let heap = ExecutorError::from(TableHeapError::NewPageWithoutId);
+        assert_eq!(heap.0, "table heap error: new page has no page_id");
+    }
 
     fn int_schema(names: &[&str]) -> Schema {
         Schema::new(
