@@ -1136,6 +1136,54 @@ fn entries_with_key(index: &TableIndex, key: Value) -> Result<TableIndexIter, In
     index.scan(Bound::Included(&probe[..]), Bound::Included(&probe[..]))
 }
 
+/// A scratch heap of spilled rows, such as a sort run or a hash join partition.
+/// [`SpillHeap::free`] deletes its pages; dropping a heap that was not freed deletes them
+/// too and logs a failure, since `Drop` cannot return it.
+struct SpillHeap {
+    heap: Option<TableHeap>,
+}
+
+impl SpillHeap {
+    const FREED: &'static str = "a spill heap holds its pages until free consumes it";
+
+    fn new(bpm: Arc<BufferPoolManager>) -> Result<Self, TableHeapError> {
+        Ok(Self {
+            heap: Some(TableHeap::new(bpm)?),
+        })
+    }
+
+    fn insert(&self, t: &Tuple) -> Result<(), TableHeapError> {
+        self.heap.as_ref().expect(Self::FREED).insert(t).map(drop)
+    }
+
+    fn iter(&self) -> TableHeapIterator {
+        self.heap.as_ref().expect(Self::FREED).iter()
+    }
+
+    /// Deletes the heap's pages. On failure it keeps the pages it could not delete, and
+    /// dropping it tries again.
+    fn free(mut self) -> Result<(), TableHeapError> {
+        let heap = self.heap.take().expect(Self::FREED);
+        heap.free().map_err(|FreeError { error, rest }| {
+            self.heap = Some(rest);
+            error
+        })
+    }
+}
+
+impl Drop for SpillHeap {
+    fn drop(&mut self) {
+        if let Some(heap) = self.heap.take()
+            && let Err(e) = heap.free()
+        {
+            warn!(
+                "could not free the pages of a dropped spill heap from page {}: {}",
+                e.rest.first_page_id, e.error
+            );
+        }
+    }
+}
+
 /// Number of on-disk partitions each hash join input is split into.
 const HASH_JOIN_PARTITIONS: usize = 64;
 
@@ -1147,19 +1195,19 @@ struct BuildRow {
 
 /// Grace hash join: `open` spills both inputs into [`HASH_JOIN_PARTITIONS`] partitions by
 /// key hash, then `next` joins one partition pair at a time with an in-memory build table
-/// over the left partition. A NULL key matches nothing.
+/// over the left partition, freeing each pair's pages once it is joined. `close` frees the
+/// pairs not joined yet. A NULL key matches nothing.
 pub struct HashJoinExecutor<'a> {
     plan: &'a HashJoinPlanNode,
     left: Box<dyn Executor + 'a>,
     right: Box<dyn Executor + 'a>,
     bpm: Arc<BufferPoolManager>,
     batch_size: usize,
-    left_partitions: Vec<TableHeap>,
-    right_partitions: Vec<TableHeap>,
+    left_partitions: VecDeque<SpillHeap>,
+    right_partitions: VecDeque<SpillHeap>,
 
     right_partition_iter: Option<TableHeapIterator>,
     build_table: Option<HashMap<ExprKey, Vec<BuildRow>>>,
-    partition_cursor: usize,
     matches_buffer: VecDeque<Tuple>,
 }
 
@@ -1177,21 +1225,20 @@ impl<'a> HashJoinExecutor<'a> {
             right,
             bpm,
             batch_size,
-            left_partitions: Vec::new(),
-            right_partitions: Vec::new(),
+            left_partitions: VecDeque::new(),
+            right_partitions: VecDeque::new(),
             right_partition_iter: None,
             build_table: None,
-            partition_cursor: 0,
             matches_buffer: VecDeque::new(),
         }
     }
 
     fn build_partition(
         &self,
-        partition: usize,
+        partition: &SpillHeap,
     ) -> Result<HashMap<ExprKey, Vec<BuildRow>>, ExecutorError> {
         let mut table: HashMap<ExprKey, Vec<BuildRow>> = HashMap::new();
-        for item in self.left_partitions[partition].iter() {
+        for item in partition.iter() {
             let (tuple, _) = item?;
             let key = eval_key(&self.plan.left_exprs, &tuple, self.left.schema())?;
             table.entry(key).or_default().push(BuildRow {
@@ -1201,6 +1248,27 @@ impl<'a> HashJoinExecutor<'a> {
         }
         Ok(table)
     }
+
+    /// Frees the partition pair at the front of the queues, which has just been joined.
+    fn free_joined_pair(&mut self) -> Result<(), ExecutorError> {
+        self.right_partition_iter = None;
+        self.build_table = None;
+        let left = self.left_partitions.pop_front();
+        let right = self.right_partitions.pop_front();
+        free_all(left.into_iter().chain(right))
+    }
+}
+
+/// Frees every heap, carrying on past failures, and returns the first one.
+fn free_all(heaps: impl IntoIterator<Item = SpillHeap>) -> Result<(), ExecutorError> {
+    let mut first_failure = Ok(());
+    for heap in heaps {
+        let freed = heap.free();
+        if first_failure.is_ok() {
+            first_failure = freed;
+        }
+    }
+    first_failure.map_err(ExecutorError::from)
 }
 
 fn partition_of(key: &ExprKey) -> usize {
@@ -1212,7 +1280,7 @@ fn partition_of(key: &ExprKey) -> usize {
 fn spill_into_partitions(
     input: &mut dyn Executor,
     key_exprs: &[Expression],
-    partitions: &[TableHeap],
+    partitions: &VecDeque<SpillHeap>,
 ) -> Result<(), ExecutorError> {
     while let Some(batch) = input.next_batch()? {
         for (tuple, _) in batch {
@@ -1228,9 +1296,10 @@ impl<'a> Executor for HashJoinExecutor<'a> {
         self.left.open()?;
         self.right.open()?;
         for _ in 0..HASH_JOIN_PARTITIONS {
-            self.left_partitions.push(TableHeap::new(self.bpm.clone())?);
+            self.left_partitions
+                .push_back(SpillHeap::new(self.bpm.clone())?);
             self.right_partitions
-                .push(TableHeap::new(self.bpm.clone())?);
+                .push_back(SpillHeap::new(self.bpm.clone())?);
         }
         spill_into_partitions(
             self.left.as_mut(),
@@ -1258,18 +1327,20 @@ impl<'a> Executor for HashJoinExecutor<'a> {
                 break;
             }
 
-            if self.partition_cursor >= self.left_partitions.len() {
+            let (Some(left_partition), Some(right_partition)) =
+                (self.left_partitions.front(), self.right_partitions.front())
+            else {
                 break;
             };
 
             let build_table = match self.build_table.take() {
                 Some(table) => table,
-                None => self.build_partition(self.partition_cursor)?,
+                None => self.build_partition(left_partition)?,
             };
             let build_table = self.build_table.insert(build_table);
             let right_rows = self
                 .right_partition_iter
-                .get_or_insert_with(|| self.right_partitions[self.partition_cursor].iter());
+                .get_or_insert_with(|| right_partition.iter());
 
             let Some(item) = right_rows.next() else {
                 if matches!(self.plan.join_type, JoinType::Left) {
@@ -1280,9 +1351,7 @@ impl<'a> Executor for HashJoinExecutor<'a> {
                             .push_back(self.plan.schema.encode_tuple(&values)?);
                     }
                 }
-                self.right_partition_iter = None;
-                self.partition_cursor += 1;
-                self.build_table = None;
+                self.free_joined_pair()?;
                 continue;
             };
 
@@ -1307,7 +1376,11 @@ impl<'a> Executor for HashJoinExecutor<'a> {
     }
 
     fn close(&mut self) -> Result<(), ExecutorError> {
-        Ok(())
+        self.right_partition_iter = None;
+        self.build_table = None;
+        let left = std::mem::take(&mut self.left_partitions);
+        let right = std::mem::take(&mut self.right_partitions);
+        free_all(left.into_iter().chain(right))
     }
     fn schema(&self) -> &Schema {
         &self.plan.schema
@@ -1375,55 +1448,8 @@ enum SortedOutput {
     InMemory(VecIter<Tuple>),
     Spilled {
         iter: TableHeapIterator,
-        run: SpillRun,
+        run: SpillHeap,
     },
-}
-
-/// A sorted run in a scratch heap. [`SpillRun::free`] deletes its pages; dropping a run that
-/// was not freed deletes them too and logs a failure, since `Drop` cannot return it.
-struct SpillRun {
-    heap: Option<TableHeap>,
-}
-
-impl SpillRun {
-    const FREED: &'static str = "a spill run holds its heap until free consumes the run";
-
-    fn new(bpm: Arc<BufferPoolManager>) -> Result<Self, TableHeapError> {
-        Ok(Self {
-            heap: Some(TableHeap::new(bpm)?),
-        })
-    }
-
-    fn insert(&self, t: &Tuple) -> Result<(), TableHeapError> {
-        self.heap.as_ref().expect(Self::FREED).insert(t).map(drop)
-    }
-
-    fn iter(&self) -> TableHeapIterator {
-        self.heap.as_ref().expect(Self::FREED).iter()
-    }
-
-    /// Deletes the run's pages. On failure the run keeps the pages it could not delete, and
-    /// dropping it tries again.
-    fn free(mut self) -> Result<(), TableHeapError> {
-        let heap = self.heap.take().expect(Self::FREED);
-        heap.free().map_err(|FreeError { error, rest }| {
-            self.heap = Some(rest);
-            error
-        })
-    }
-}
-
-impl Drop for SpillRun {
-    fn drop(&mut self) {
-        if let Some(heap) = self.heap.take()
-            && let Err(e) = heap.free()
-        {
-            warn!(
-                "could not free the pages of a dropped sort run from page {}: {}",
-                e.rest.first_page_id, e.error
-            );
-        }
-    }
 }
 
 impl<'a> ExternalMergeSortExecutor<'a> {
@@ -1529,18 +1555,18 @@ impl<'a> ExternalMergeSortExecutor<'a> {
         sorted_by_exprs(rows, |t| t, &self.plan.order_by_exprs, &self.plan.schema)
     }
 
-    fn spill_sorted_run(&self, rows: &mut Vec<Tuple>) -> Result<SpillRun, ExecutorError> {
+    fn spill_sorted_run(&self, rows: &mut Vec<Tuple>) -> Result<SpillHeap, ExecutorError> {
         let sorted = self.sort_in_memory(std::mem::take(rows))?;
-        let run = SpillRun::new(self.bpm.clone())?;
+        let run = SpillHeap::new(self.bpm.clone())?;
         for t in sorted {
             run.insert(&t)?;
         }
         Ok(run)
     }
 
-    fn merge_runs(&self, a: &SpillRun, b: &SpillRun) -> Result<SpillRun, ExecutorError> {
+    fn merge_runs(&self, a: &SpillHeap, b: &SpillHeap) -> Result<SpillHeap, ExecutorError> {
         let (order_by, schema) = (&self.plan.order_by_exprs, &self.plan.schema);
-        let out = SpillRun::new(self.bpm.clone())?;
+        let out = SpillHeap::new(self.bpm.clone())?;
         let mut a_rows = a.iter();
         let mut b_rows = b.iter();
         let next_keyed =
@@ -1572,7 +1598,7 @@ impl<'a> ExternalMergeSortExecutor<'a> {
     }
 
     /// Merges `runs` pairwise into one run, freeing each run once it has been merged.
-    fn merge_all(&self, mut runs: Vec<SpillRun>) -> Result<SpillRun, ExecutorError> {
+    fn merge_all(&self, mut runs: Vec<SpillHeap>) -> Result<SpillHeap, ExecutorError> {
         while runs.len() > 1 {
             let mut next_runs = Vec::with_capacity(runs.len().div_ceil(2));
             let mut pending = runs.into_iter();
@@ -1594,7 +1620,7 @@ impl<'a> ExternalMergeSortExecutor<'a> {
 
     /// Reads the child to the end, spilling a sorted run each time the buffered tuple bytes
     /// pass the memory budget. Returns the runs and the rows still buffered.
-    fn read_input(&mut self) -> Result<(Vec<SpillRun>, Vec<Tuple>), ExecutorError> {
+    fn read_input(&mut self) -> Result<(Vec<SpillHeap>, Vec<Tuple>), ExecutorError> {
         let mut runs = Vec::new();
         let mut buffered = Vec::new();
         let mut buffered_bytes: usize = 0;
@@ -2716,5 +2742,108 @@ mod tests {
         let mut agg = AggregationExecutor::new(&agg_plan, values_child(&rows), DEFAULT_BATCH_SIZE);
         let err = agg.next_batch().unwrap_err();
         assert!(err.0.contains("before open"), "{}", err.0);
+    }
+
+    fn values_hash_join(left: &[&[i32]], right: &[&[i32]]) -> HashJoinPlanNode {
+        let side = int_schema(&["k"]);
+        HashJoinPlanNode {
+            schema: int_schema(&["lk", "rk"]),
+            left: Box::new(values_plan(&side, left)),
+            right: Box::new(values_plan(&side, right)),
+            left_exprs: vec![col(0)],
+            right_exprs: vec![col(0)],
+            join_type: JoinType::Inner,
+        }
+    }
+
+    fn hash_join_exec<'a>(
+        plan: &'a HashJoinPlanNode,
+        bpm: &Arc<BufferPoolManager>,
+    ) -> HashJoinExecutor<'a> {
+        HashJoinExecutor::new(
+            plan,
+            values_child(&plan.left),
+            values_child(&plan.right),
+            bpm.clone(),
+            DEFAULT_BATCH_SIZE,
+        )
+    }
+
+    #[test]
+    fn hash_join_frees_each_partition_pair_once_it_is_joined() {
+        let (bpm, _dir) = crate::testing::bpm(16);
+        let plan = values_hash_join(&[&[1], &[2], &[3]], &[&[2], &[3], &[4]]);
+        let mut exec = hash_join_exec(&plan, &bpm);
+        exec.open().unwrap();
+        assert_eq!(bpm.live_page_count(), 2 * HASH_JOIN_PARTITIONS);
+
+        let mut joined = 0;
+        while let Some(batch) = exec.next_batch().unwrap() {
+            joined += batch.len();
+        }
+        assert_eq!(joined, 2);
+        assert_eq!(
+            bpm.live_page_count(),
+            0,
+            "joined partitions kept their pages"
+        );
+        exec.close().unwrap();
+        assert_eq!(bpm.live_page_count(), 0);
+    }
+
+    #[test]
+    fn closing_a_hash_join_before_it_finishes_frees_the_partitions_left() {
+        let (bpm, _dir) = crate::testing::bpm(16);
+        let rows: Vec<[i32; 1]> = (0..200).map(|k| [k]).collect();
+        let rows: Vec<&[i32]> = rows.iter().map(|r| &r[..]).collect();
+        let plan = values_hash_join(&rows, &rows);
+        let mut exec = HashJoinExecutor::new(
+            &plan,
+            values_child(&plan.left),
+            values_child(&plan.right),
+            bpm.clone(),
+            1,
+        );
+        exec.open().unwrap();
+        exec.next_batch().unwrap().expect("a first match");
+        assert!(bpm.live_page_count() > 0);
+
+        exec.close().unwrap();
+        assert_eq!(bpm.live_page_count(), 0);
+    }
+
+    #[test]
+    fn dropping_an_opened_hash_join_without_closing_it_frees_its_partitions() {
+        let (bpm, _dir) = crate::testing::bpm(16);
+        let plan = values_hash_join(&[&[1]], &[&[1]]);
+        let mut exec = hash_join_exec(&plan, &bpm);
+        exec.open().unwrap();
+        assert_eq!(bpm.live_page_count(), 2 * HASH_JOIN_PARTITIONS);
+        drop(exec);
+        assert_eq!(bpm.live_page_count(), 0);
+    }
+
+    #[test]
+    fn closing_a_hash_join_reports_a_partition_it_could_not_free() {
+        let (bpm, _dir) = crate::testing::bpm(16);
+        let plan = values_hash_join(&[&[1]], &[&[1]]);
+        let mut exec = hash_join_exec(&plan, &bpm);
+        exec.open().unwrap();
+        let first_page = exec
+            .left_partitions
+            .back()
+            .and_then(|p| p.heap.as_ref())
+            .map(|h| h.first_page_id)
+            .unwrap();
+        let pin = bpm.read_page(first_page).unwrap();
+
+        let err = exec.close().unwrap_err();
+        assert!(err.0.contains("pinned"), "{err:?}");
+        assert_eq!(
+            bpm.live_page_count(),
+            1,
+            "close stopped at the pinned page instead of freeing the other partitions"
+        );
+        drop(pin);
     }
 }

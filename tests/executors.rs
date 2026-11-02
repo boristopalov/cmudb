@@ -115,6 +115,47 @@ fn hash_join_handles_empty_inputs() {
 }
 
 #[test]
+fn repeated_hash_joins_reuse_their_spill_pages_instead_of_growing_the_database() {
+    let db = two_tables();
+    let live_before = db.bpm().live_page_count();
+    assert_eq!(
+        db.run_plan(&hash_join(&db, JoinType::Inner)).unwrap().len(),
+        4
+    );
+    assert_eq!(
+        db.bpm().live_page_count(),
+        live_before,
+        "the join kept spill pages after it finished"
+    );
+    let high_water = db.bpm().allocated_page_count();
+    for _ in 0..3 {
+        assert_eq!(
+            db.run_plan(&hash_join(&db, JoinType::Left)).unwrap().len(),
+            6
+        );
+    }
+    assert_eq!(
+        db.bpm().allocated_page_count(),
+        high_water,
+        "later joins allocated new page ids instead of reusing the first join's"
+    );
+    assert_eq!(db.bpm().live_page_count(), live_before);
+}
+
+#[test]
+fn a_hash_join_stopped_early_by_a_limit_still_frees_its_spill_pages() {
+    let db = two_tables();
+    let live_before = db.bpm().live_page_count();
+    let plan = Plan::Limit(LimitPlanNode {
+        schema: join_schema(&["k", "a"], &["k", "b"]),
+        limit: 1,
+        child: Box::new(hash_join(&db, JoinType::Inner)),
+    });
+    assert_eq!(db.run_plan(&plan).unwrap().len(), 1);
+    assert_eq!(db.bpm().live_page_count(), live_before);
+}
+
+#[test]
 fn external_merge_sort_orders_by_multiple_keys() {
     let db = Db::new(64);
     db.exec("CREATE TABLE t (a INTEGER, b INTEGER)");
