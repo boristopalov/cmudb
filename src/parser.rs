@@ -12,7 +12,9 @@ use sqlparser::ast::{
 };
 
 use crate::catalog::{Catalog, DataType, Schema, Value};
-use crate::processor::plan::{AggType, Expression, JoinType, Op, SortDirection, SortExpr};
+use crate::processor::plan::{
+    AggType, Expression, JoinType, NullOrdering, Op, SortDirection, SortExpr,
+};
 
 /// Argument bound for `COUNT(*)`. COUNT skips NULL arguments, so a non-NULL constant makes it count
 /// every row.
@@ -379,11 +381,6 @@ impl<'a> Binder<'a> {
     }
 
     fn resolve_sort_expr(&self, oe: &OrderByExpr, scope: &Scope) -> Result<SortExpr, BinderError> {
-        if oe.options.nulls_first.is_some() {
-            return Err(BinderError(
-                "ORDER BY ... NULLS FIRST/LAST is not supported".into(),
-            ));
-        }
         if oe.with_fill.is_some() {
             return Err(BinderError(
                 "ORDER BY ... WITH FILL is not supported".into(),
@@ -393,9 +390,11 @@ impl<'a> Binder<'a> {
             Some(false) => SortDirection::Descending,
             Some(true) | None => SortDirection::Ascending,
         };
-        Ok(SortExpr {
-            expr: self.resolve_expr(&oe.expr, scope)?,
-            direction,
+        let sort = SortExpr::new(self.resolve_expr(&oe.expr, scope)?, direction);
+        Ok(match oe.options.nulls_first {
+            Some(true) => sort.with_nulls(NullOrdering::First),
+            Some(false) => sort.with_nulls(NullOrdering::Last),
+            None => sort,
         })
     }
 
