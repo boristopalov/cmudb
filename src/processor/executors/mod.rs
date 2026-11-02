@@ -9,7 +9,7 @@ mod sort;
 pub(crate) mod test_support;
 
 pub use aggregate::{AggregationExecutor, WindowFunctionExecutor};
-pub use ddl::{CreateIndexExecutor, CreateTableExecutor, DropIndexExecutor, DropTableExecutor};
+pub use ddl::{DdlExecutor, DdlOp};
 pub use dml::{DeleteExecutor, InsertExecutor, UpdateExecutor};
 pub use join::{HashJoinExecutor, NestedIndexJoinExecutor, NestedLoopJoinExecutor};
 pub use pipeline::{FilterExecutor, LimitExecutor, ProjectionExecutor};
