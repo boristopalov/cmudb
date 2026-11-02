@@ -124,10 +124,19 @@ fn insert(c: &mut Criterion) {
 
 fn lookup_and_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("b_plus_tree");
-    let (tree, _bpm, _dir) = make_tree();
+    let (tree, bpm, _dir) = make_tree();
     insert_all(&tree, &shuffled(LOOKUP_KEYS));
     let probes = shuffled(LOOKUP_KEYS);
     assert_tree_holds(&tree, LOOKUP_KEYS);
+    let tree_pages = bpm
+        .new_page()
+        .expect("new page")
+        .page_id()
+        .expect("page id");
+    assert!(
+        tree_pages < POOL_FRAMES && (0..tree_pages).all(|p| bpm.is_resident(p)),
+        "the 100k-key tree ({tree_pages} pages) fits in the {POOL_FRAMES}-frame pool, so lookups and scans never read from disk"
+    );
     assert_eq!(
         count_entries(
             &tree,

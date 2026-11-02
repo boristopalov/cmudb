@@ -37,7 +37,10 @@ cargo bench --features bench --bench index -- search   # filter by name
 
 Criterion keeps the previous run in `target/criterion` and prints the change against it, so
 to compare a branch, run the same bench on the base branch first and then on the branch.
-Only treat a change as real when it is larger than the run-to-run spread (the bracketed range).
+The bracketed range is one run's confidence interval, and separate runs on the same machine
+differ by more than that: `insert_seq_10k` measured 246 ms here and 271 ms in another run.
+Run each side two or three times and only treat a change as real when it is clearly larger
+than the gap between those runs, roughly 10% or more.
 When you run them, every bench first checks what it reads: the heap and B+ tree return every
 inserted row and key, and each query returns the expected rows. The join and index query
 benches also check that the planner still picks the plan they are named after, so a change
@@ -74,5 +77,7 @@ criterion's 95% interval):
 | query/insert_1k_rows | 4.9 ms (4.7 to 5.2) | 4.9 µs |
 
 The table heap benches use a 64-frame pool on a heap of about 270 pages, so scans and random
-gets include disk reads and evictions. The bench asserts that the heap is larger than the pool. The B+ tree benches use a 1024-frame pool, so their cost is
-mostly decoding whole pages rather than I/O.
+gets include disk reads and evictions. The bench asserts that the heap is larger than the pool,
+and that every read in `read_miss_evict` misses. The B+ tree lookup and scan benches use a
+1024-frame pool and assert that the whole 100k-key tree stays in it, so their cost is decoding
+pages rather than I/O.

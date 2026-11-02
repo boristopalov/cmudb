@@ -102,6 +102,14 @@ fn buffer_pool(c: &mut Criterion) {
 
     let cold = allocate_pages(&bpm, COLD_PAGES);
     let mut j = 0;
+    for _ in 0..2 * cold.len() {
+        j = (j + 1) % cold.len();
+        assert!(
+            !bpm.is_resident(cold[j]),
+            "read_miss_evict only measures misses if every read in the cycle misses"
+        );
+        drop(bpm.read_page(cold[j]).expect("read"));
+    }
     group.bench_function("read_miss_evict", |b| {
         b.iter(|| {
             j = (j + 1) % cold.len();

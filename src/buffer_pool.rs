@@ -504,6 +504,11 @@ impl BufferPoolManager {
         self.next_page_id.fetch_add(1, Ordering::AcqRel)
     }
 
+    /// Reports whether `page_id` currently sits in a frame, so a read of it would not touch disk.
+    pub fn is_resident(&self, page_id: usize) -> bool {
+        self.meta.lock().page_table.contains_key(&page_id)
+    }
+
     pub fn flush_page(&self, page_id: usize) -> Result<(), BpmError> {
         info!("flush_page: flushing page page_id={page_id}");
         let Some(frame_id) = self.meta.lock().page_table.get(&page_id).copied() else {
@@ -534,6 +539,21 @@ mod tests {
             DiskScheduler::new(dm),
         );
         (Arc::new(bpm), dir)
+    }
+
+    #[test]
+    fn a_page_stops_being_resident_once_it_is_evicted() {
+        let (bpm, _dir) = make_bpm(2);
+        let first = bpm.new_page().unwrap().page_id().unwrap();
+        assert!(bpm.is_resident(first));
+        assert!(!bpm.is_resident(first + 100));
+        let second = bpm.new_page().unwrap().page_id().unwrap();
+        let third = bpm.new_page().unwrap().page_id().unwrap();
+        assert!(bpm.is_resident(second));
+        assert!(bpm.is_resident(third));
+        assert!(!bpm.is_resident(first));
+        drop(bpm.read_page(first).unwrap());
+        assert!(bpm.is_resident(first));
     }
 
     fn finishes_within(limit: Duration, work: impl FnOnce() + Send + 'static) -> bool {
