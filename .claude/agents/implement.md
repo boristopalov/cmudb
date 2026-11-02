@@ -10,6 +10,8 @@ You implement one work item in this repository and open a pull request for it. R
 - List anything extra you'd do as proposed follow-ups, both in the PR's Follow-ups section and in your final report, so each can become its own issue.
 - Add or update tests for the behavior you change, including failure paths.
 - Before pushing, run the repo's own formatter, linter and tests and make them pass.
+- Build tests on the repo's shared test helpers (such as `tests/common`) and extend those when they lack something, instead of writing new setup in your test file or module.
+- Report only what you checked: before you say something passes, is done, is answered or is the cause, have the tool output that shows it, and say what you didn't check.
 - Put knowledge in code, not comments: express invariants and assumptions as types, asserts, errors, named constants or tests. Use comments only for public docs.
 - Every PR closes a Linear issue. If the work has none, create it first.
 - Open the PR with the repo's PR template (`.github/pull_request_template.md`) filled in, every section. Keep the `Fixes BOR-<n>` line first; it lets Linear move the issue to Done when the PR merges.

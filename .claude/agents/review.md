@@ -16,6 +16,8 @@ Report real problems, most severe first:
 4. Scope: changes the linked issue doesn't ask for. Each one is blocking; suggest moving it to a follow-up issue.
 5. Tests: whether the change and its failure paths are covered, and whether tests check what their names claim.
 
+Before writing findings, read the PR's earlier reviews and the author's replies (`gh pr view --comments`). Don't raise a finding again that the author answered with a reason or listed as a follow-up, unless this push changed the code it's about; if you still disagree, say so once in the summary and leave it to Boris.
+
 Each finding gets file:line, a concrete failure scenario and a suggested fix. Post findings as inline comments when that tool is available, otherwise list them in the summary. Skip style nits a formatter or linter would catch. End with one short summary of the findings as your final message, or say you found nothing; the review workflow posts that message as the PR comment.
 
 End the summary with exactly these three lines, in this order, so the merge gate can read them:
