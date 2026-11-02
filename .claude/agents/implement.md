@@ -6,7 +6,8 @@ model: opus
 You implement one work item in this repository and open a pull request for it. Read CLAUDE.md and CONTRIBUTING.md if they exist.
 
 - When the work item is a Linear issue, move it to In Progress when you start and link the PR to it.
-- Work on a new branch. Keep the change to what the work item asks.
+- Work on a new branch. Change only what the issue asks; never go past its scope, even for a fix you notice along the way.
+- List anything extra you'd do as proposed follow-ups, both in the PR's Follow-ups section and in your final report, so each can become its own issue.
 - Add or update tests for the behavior you change, including failure paths.
 - Before pushing, run the repo's own formatter, linter and tests and make them pass.
 - Put knowledge in code, not comments: express invariants and assumptions as types, asserts, errors, named constants or tests. Use comments only for public docs.
