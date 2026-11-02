@@ -223,27 +223,6 @@ fn order_by_desc_puts_nulls_last() {
 }
 
 #[test]
-fn order_by_nulls_first_or_last_overrides_the_default_placement() {
-    let db = emp_db();
-    assert_eq!(
-        db.exec("SELECT id FROM emp ORDER BY bonus DESC NULLS FIRST"),
-        vec![vec![int(3)], vec![int(4)], vec![int(2)], vec![int(1)]]
-    );
-    assert_eq!(
-        db.exec("SELECT id FROM emp ORDER BY bonus NULLS LAST"),
-        vec![vec![int(1)], vec![int(2)], vec![int(4)], vec![int(3)]]
-    );
-    assert_eq!(
-        db.exec("SELECT id FROM emp ORDER BY bonus ASC NULLS FIRST"),
-        vec![vec![int(3)], vec![int(1)], vec![int(2)], vec![int(4)]]
-    );
-    assert_eq!(
-        db.exec("SELECT id FROM emp ORDER BY bonus DESC NULLS LAST"),
-        vec![vec![int(4)], vec![int(2)], vec![int(1)], vec![int(3)]]
-    );
-}
-
-#[test]
 fn order_by_desc_applies_after_group_by() {
     let db = emp_db();
     assert_eq!(
@@ -256,6 +235,14 @@ fn order_by_desc_applies_after_group_by() {
 fn order_by_options_that_are_not_supported_are_rejected() {
     let db = emp_db();
     for (sql, expected) in [
+        (
+            "SELECT id FROM emp ORDER BY bonus NULLS FIRST",
+            "NULLS FIRST/LAST",
+        ),
+        (
+            "SELECT id FROM emp ORDER BY bonus DESC NULLS LAST",
+            "NULLS FIRST/LAST",
+        ),
         ("SELECT id FROM emp ORDER BY id WITH FILL", "WITH FILL"),
         ("SELECT id FROM emp ORDER BY id INTERPOLATE", "INTERPOLATE"),
     ] {

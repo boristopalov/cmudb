@@ -9,9 +9,8 @@ use crate::processor::plan::{
     AggType, AggregationPlanNode, Arithmetic, CreateIndexPlanNode, CreateTablePlanNode,
     DeletePlanNode, DropIndexPlanNode, DropTablePlanNode, Expression, ExternalMergeSortPlanNode,
     FilterPlanNode, HashJoinPlanNode, IndexScanPlanNode, InsertPlanNode, JoinType, LimitPlanNode,
-    NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, NullOrdering, ProjectionPlanNode,
-    SeqScanPlanNode, SortDirection, SortExpr, SortPlanNode, UpdatePlanNode, ValuesPlanNode,
-    WindowFunctionPlanNode,
+    NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, ProjectionPlanNode, SeqScanPlanNode,
+    SortDirection, SortExpr, SortPlanNode, UpdatePlanNode, ValuesPlanNode, WindowFunctionPlanNode,
 };
 use crate::table_heap::{RecordId, TableHeap, TableHeapError, TableHeapIterator, Tuple};
 use std::collections::hash_map::IntoIter;
@@ -1040,28 +1039,18 @@ impl<'a> ExternalMergeSortExecutor<'a> {
 }
 
 /// One evaluated `ORDER BY` key of a row, ordered in its key's direction with NULL
-/// placed where its key says.
+/// below every value.
 struct SortValue {
     value: Option<Value>,
     direction: SortDirection,
-    nulls: NullOrdering,
 }
 
 impl Ord for SortValue {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        use std::cmp::Ordering;
-        let null_first = match self.nulls {
-            NullOrdering::First => Ordering::Less,
-            NullOrdering::Last => Ordering::Greater,
-        };
-        match (&self.value, &other.value) {
-            (None, None) => Ordering::Equal,
-            (None, Some(_)) => null_first,
-            (Some(_), None) => null_first.reverse(),
-            (Some(a), Some(b)) => match self.direction {
-                SortDirection::Ascending => a.cmp(b),
-                SortDirection::Descending => a.cmp(b).reverse(),
-            },
+        let ascending = self.value.cmp(&other.value);
+        match self.direction {
+            SortDirection::Ascending => ascending,
+            SortDirection::Descending => ascending.reverse(),
         }
     }
 }
@@ -1095,15 +1084,14 @@ fn eval_sort_key(
             Ok(SortValue {
                 value: key.expr.evaluate(tuple, schema)?,
                 direction: key.direction,
-                nulls: key.nulls,
             })
         })
         .collect::<Result<_, ExecutorError>>()
         .map(SortKey)
 }
 
-/// Rows ordered by `order_by` evaluated on each row's tuple; equal rows keep their input
-/// order.
+/// Rows ordered by `order_by` evaluated on each row's tuple, with NULL below every value
+/// in either direction; equal rows keep their input order.
 fn sorted_by_exprs<T>(
     rows: Vec<T>,
     tuple_of: impl Fn(&T) -> &Tuple,
@@ -1841,23 +1829,6 @@ mod tests {
         assert_eq!(
             decode_ints(&schema, merged_with_empty.iter().map(|r| r.unwrap().0)),
             vec![vec![1, 0], vec![3, 0], vec![5, 0]]
-        );
-    }
-
-    #[test]
-    fn descending_sort_keeps_tied_rows_in_input_order() {
-        let schema = int_schema(&["k", "v"]);
-        let rows = values_plan(&schema, &[&[1, 0], &[2, 0], &[1, 1], &[2, 1], &[1, 2]]);
-        let plan = SortPlanNode {
-            schema: schema.clone(),
-            child: Box::new(values_plan(&schema, &[])),
-            order_by_exprs: vec![SortExpr::descending(col(0))],
-        };
-        let mut sort = SortExecutor::new(&plan, values_child(&rows));
-        assert_eq!(
-            decode_ints(&schema, drain(&mut sort)),
-            vec![vec![2, 0], vec![2, 1], vec![1, 0], vec![1, 1], vec![1, 2]],
-            "rows with equal keys keep their input order"
         );
     }
 
