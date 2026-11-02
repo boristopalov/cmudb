@@ -166,7 +166,13 @@ impl PageStore {
 pub struct DiskManager {
     num_writes: AtomicU32,
     store: Mutex<PageStore>,
+    #[cfg(any(test, feature = "testing"))]
+    injected_write_failures: AtomicU32,
 }
+
+/// The message of the I/O error a write fails with after [`DiskManager::fail_next_writes`].
+#[cfg(any(test, feature = "testing"))]
+pub const INJECTED_WRITE_FAILURE: &str = "injected write failure";
 
 fn create_log_file_if_missing(log_path: &Path) -> io::Result<()> {
     OpenOptions::new()
@@ -193,7 +199,34 @@ impl DiskManager {
                 page_offsets: HashMap::new(),
                 free_offsets: Vec::new(),
             }),
+            #[cfg(any(test, feature = "testing"))]
+            injected_write_failures: AtomicU32::new(0),
         })
+    }
+
+    /// Makes the next `count` calls to [`DiskManager::write_page`] fail with an
+    /// [`io::ErrorKind::Other`] error carrying [`INJECTED_WRITE_FAILURE`], writing nothing.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn fail_next_writes(&self, count: u32) {
+        self.injected_write_failures.store(count, Ordering::Release);
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    fn take_injected_write_failure(&self) -> io::Result<()> {
+        let consumed = self.injected_write_failures.try_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |remaining| remaining.checked_sub(1),
+        );
+        match consumed {
+            Ok(_) => Err(io::Error::other(INJECTED_WRITE_FAILURE)),
+            Err(_) => Ok(()),
+        }
+    }
+
+    #[cfg(not(any(test, feature = "testing")))]
+    fn take_injected_write_failure(&self) -> io::Result<()> {
+        Ok(())
     }
 
     pub fn read_page(&self, id: usize, mut buf: PageData) -> io::Result<PageData> {
@@ -210,6 +243,7 @@ impl DiskManager {
     }
 
     pub fn write_page(&self, id: usize, data: PageData) -> io::Result<PageData> {
+        self.take_injected_write_failure()?;
         let mut store = self.store.lock();
         let offset = store.offset_for_write(id)?;
         if let Err(e) = store.db_file.write_all_at(&*data, offset) {
@@ -255,6 +289,23 @@ mod tests {
         );
         assert_eq!(*dm.read_page(7, page(0)).unwrap(), [0xCD; PAGE_SIZE]);
         assert_eq!(dm.num_writes.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn an_injected_write_failure_writes_nothing_and_fails_only_the_requested_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let dm = manager(&dir);
+        dm.write_page(1, page(1)).unwrap();
+        dm.fail_next_writes(1);
+
+        let err = dm.write_page(1, page(2)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), INJECTED_WRITE_FAILURE);
+        assert_eq!(*dm.read_page(1, page(0)).unwrap(), [1; PAGE_SIZE]);
+        assert_eq!(dm.num_writes.load(Ordering::Acquire), 1);
+
+        dm.write_page(1, page(3)).unwrap();
+        assert_eq!(*dm.read_page(1, page(0)).unwrap(), [3; PAGE_SIZE]);
     }
 
     #[test]
