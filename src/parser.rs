@@ -801,12 +801,6 @@ impl<'a> Binder<'a> {
             }
 
             SetExpr::Select(s) => {
-                if !s.named_window.is_empty() {
-                    return Err(Unsupported::NamedWindow.into());
-                }
-                if s.qualify.is_some() {
-                    return Err(Unsupported::Qualify.into());
-                }
                 reject_unsupported_select_clauses(s)?;
                 let (scope, join) = self.build_select_scope(&s.from)?;
                 let filters = s
@@ -1336,8 +1330,8 @@ fn reject_unsupported_select_clauses(s: &Select) -> Result<(), BinderError> {
         distribute_by,
         sort_by,
         having,
-        named_window: _,
-        qualify: _,
+        named_window,
+        qualify,
         window_before_qualify: _,
         value_table_mode: _,
         flavor: _,
@@ -1352,6 +1346,8 @@ fn reject_unsupported_select_clauses(s: &Select) -> Result<(), BinderError> {
         (!distribute_by.is_empty(), Unsupported::DistributeBy),
         (!sort_by.is_empty(), Unsupported::SortBy),
         (!lateral_views.is_empty(), Unsupported::LateralView),
+        (!named_window.is_empty(), Unsupported::NamedWindow),
+        (qualify.is_some(), Unsupported::Qualify),
     ];
     match unsupported.into_iter().find(|&(present, _)| present) {
         Some((_, feature)) => Err(feature.into()),
