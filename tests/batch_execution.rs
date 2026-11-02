@@ -16,7 +16,7 @@ use cmudb::processor::plan::{
     AggType, AggregationPlanNode, ColumnAssignment, DeletePlanNode, Expression,
     ExternalMergeSortPlanNode, FilterPlanNode, HashJoinPlanNode, IndexScanPlanNode, InsertPlanNode,
     JoinType, LimitPlanNode, NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, Op, Plan,
-    ProjectionPlanNode, SeqScanPlanNode, SortPlanNode, UpdatePlanNode, ValuesPlanNode,
+    ProjectionPlanNode, SeqScanPlanNode, SortExpr, SortPlanNode, UpdatePlanNode, ValuesPlanNode,
     WindowFunctionPlanNode,
 };
 use cmudb::replacer::ArcReplacer;
@@ -398,7 +398,10 @@ fn aggregation_groups_span_batches() {
 #[test]
 fn sorts_emit_in_order_across_batches() {
     let env = setup();
-    let order_by = vec![col(0, 1), col(0, 0)];
+    let order_by = vec![
+        SortExpr::ascending(col(0, 1)),
+        SortExpr::ascending(col(0, 0)),
+    ];
     let mut expected = l_rows();
     expected.sort_by_key(|r| (r[1], r[0]));
 

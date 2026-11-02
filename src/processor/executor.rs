@@ -2088,7 +2088,7 @@ mod tests {
             child: Box::new(values_plan(&schema, &[])),
             order_by_exprs: vec![SortExpr::descending(col(0))],
         };
-        let mut sort = SortExecutor::new(&plan, values_child(&rows));
+        let mut sort = SortExecutor::new(&plan, values_child(&rows), DEFAULT_BATCH_SIZE);
         assert_eq!(
             decode_ints(&schema, drain(&mut sort)),
             vec![vec![2, 0], vec![2, 1], vec![1, 0], vec![1, 1], vec![1, 2]],
@@ -2105,7 +2105,12 @@ mod tests {
             child: Box::new(values_plan(&schema, &[])),
             order_by_exprs: vec![SortExpr::descending(col(0))],
         };
-        let exec = ExternalMergeSortExecutor::new(&plan, values_child(&plan.child), bpm);
+        let exec = ExternalMergeSortExecutor::new(
+            &plan,
+            values_child(&plan.child),
+            bpm,
+            DEFAULT_BATCH_SIZE,
+        );
 
         let mut a = int_rows(&schema, &[&[5, 0], &[1, 0], &[3, 0]]);
         let mut b = int_rows(&schema, &[&[4, 1], &[1, 1], &[9, 1]]);
