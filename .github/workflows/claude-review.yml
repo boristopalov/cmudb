@@ -12,10 +12,11 @@ on:
 
 jobs:
   review:
-    uses: boristopalov/agent-factory/.github/workflows/review.yml@main
+    uses: boristopalov/agent-factory/.github/workflows/review.yml@claude/review-runs-tests
     with:
       pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
       hint: |
+        Before reviewing, run cargo build and cargo test and report in the summary whether they ran and passed.
         cmudb is a Rust DBMS modeled on CMU's BusTub (buffer pool, disk scheduler,
         table heap, B+ tree index with latch crabbing, binder/planner/executors).
         Also check:
