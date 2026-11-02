@@ -1312,17 +1312,46 @@ fn ident_name(name: &ObjectName) -> Result<String, BinderError> {
 
 /// Rejects the clauses of `s` the binder does not bind, so a query using one fails instead of
 /// running without it.
+///
+/// Destructures every field of `Select`, so a clause added by a sqlparser upgrade fails to
+/// compile here until it is bound or rejected.
 fn reject_unsupported_select_clauses(s: &Select) -> Result<(), BinderError> {
+    let Select {
+        select_token: _,
+        optimizer_hints: _,
+        distinct: _,
+        select_modifiers: _,
+        top,
+        top_before_distinct: _,
+        projection: _,
+        exclude: _,
+        into,
+        from: _,
+        lateral_views,
+        prewhere,
+        selection: _,
+        connect_by,
+        group_by: _,
+        cluster_by,
+        distribute_by,
+        sort_by,
+        having,
+        named_window: _,
+        qualify: _,
+        window_before_qualify: _,
+        value_table_mode: _,
+        flavor: _,
+    } = s;
     let unsupported = [
-        (s.having.is_some(), Unsupported::Having),
-        (s.top.is_some(), Unsupported::Top),
-        (s.into.is_some(), Unsupported::SelectInto),
-        (s.prewhere.is_some(), Unsupported::Prewhere),
-        (!s.connect_by.is_empty(), Unsupported::ConnectBy),
-        (!s.cluster_by.is_empty(), Unsupported::ClusterBy),
-        (!s.distribute_by.is_empty(), Unsupported::DistributeBy),
-        (!s.sort_by.is_empty(), Unsupported::SortBy),
-        (!s.lateral_views.is_empty(), Unsupported::LateralView),
+        (having.is_some(), Unsupported::Having),
+        (top.is_some(), Unsupported::Top),
+        (into.is_some(), Unsupported::SelectInto),
+        (prewhere.is_some(), Unsupported::Prewhere),
+        (!connect_by.is_empty(), Unsupported::ConnectBy),
+        (!cluster_by.is_empty(), Unsupported::ClusterBy),
+        (!distribute_by.is_empty(), Unsupported::DistributeBy),
+        (!sort_by.is_empty(), Unsupported::SortBy),
+        (!lateral_views.is_empty(), Unsupported::LateralView),
     ];
     match unsupported.into_iter().find(|&(present, _)| present) {
         Some((_, feature)) => Err(feature.into()),
