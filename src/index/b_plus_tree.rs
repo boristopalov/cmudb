@@ -1996,7 +1996,7 @@ mod tests {
             }
 
             fn fresh_tree() -> (BPlusTree, Vec<AtomicBool>, tempfile::TempDir) {
-                let (bpm, tmp) = make_bpm(FRAMES);
+                let (bpm, tmp) = crate::testing::bpm(FRAMES);
                 let tree = BPlusTree::new("idx".to_string(), KEY_LEN as u32, bpm).unwrap();
                 assert_eq!(
                     tree.internal_max_size, 4,
