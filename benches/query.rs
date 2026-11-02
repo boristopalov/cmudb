@@ -33,8 +33,16 @@ fn insert_rows(db: &Db, table: &str, rows: usize, f: impl Fn(usize) -> String + 
     }
 }
 
+fn v_of(id: usize) -> usize {
+    (id * 7919) % ROWS
+}
+
 fn row_t(i: usize) -> String {
-    format!("({i}, {})", (i * 7919) % ROWS)
+    format!("({i}, {})", v_of(i))
+}
+
+fn t_rows() -> Vec<Vec<i32>> {
+    (0..ROWS).map(|i| vec![i as i32, v_of(i) as i32]).collect()
 }
 
 fn row_u(i: usize) -> String {
@@ -42,7 +50,12 @@ fn row_u(i: usize) -> String {
 }
 
 fn sum_of_v() -> i32 {
-    (0..ROWS).map(|i| ((i * 7919) % ROWS) as i32).sum()
+    (0..ROWS).map(|i| v_of(i) as i32).sum()
+}
+
+fn sorted_by_v(mut rows: Vec<Vec<i32>>) -> Vec<Vec<i32>> {
+    rows.sort_unstable_by_key(|r| r[1]);
+    rows
 }
 
 fn loaded_db() -> Db {
@@ -57,10 +70,9 @@ fn loaded_db() -> Db {
 
 /// What a benchmark query has to return, checked once before it is timed.
 enum Expect {
-    Rows(usize),
     Count(i32),
     Exact(Vec<Vec<i32>>),
-    SortedBy { rows: usize, col: usize },
+    Unordered(Vec<Vec<i32>>),
 }
 
 /// One timed read query, with the result and plan it has to produce.
@@ -107,17 +119,14 @@ fn check_case(db: &Db, case: &Case) {
     }
     let rows: Vec<Row> = db.exec(case.sql);
     match &case.expect {
-        Expect::Rows(n) => assert_eq!(rows.len(), *n, "{}: row count", case.name),
         Expect::Count(n) => assert_eq!(rows, vec![vec![int(*n)]], "{}: COUNT(*)", case.name),
         Expect::Exact(want) => assert_eq!(&ints(&rows), want, "{}: result", case.name),
-        Expect::SortedBy { rows: n, col } => {
-            let got = ints(&rows);
-            assert_eq!(got.len(), *n, "{}: row count", case.name);
-            assert!(
-                got.windows(2).all(|w| w[0][*col] <= w[1][*col]),
-                "{}: rows are sorted by column {col}",
-                case.name
-            );
+        Expect::Unordered(want) => {
+            let mut got = ints(&rows);
+            let mut want = want.clone();
+            got.sort_unstable();
+            want.sort_unstable();
+            assert_eq!(got, want, "{}: result rows", case.name);
         }
     }
 }
@@ -128,14 +137,14 @@ fn cases() -> Vec<Case> {
             name: "seq_scan_10k",
             sql: "SELECT * FROM t",
             elements: ROWS,
-            expect: Expect::Rows(ROWS),
+            expect: Expect::Unordered(t_rows()),
             plan: None,
         },
         Case {
             name: "filter_10pct_of_10k",
             sql: "SELECT * FROM t WHERE v < 1000",
             elements: ROWS,
-            expect: Expect::Rows(ROWS / 10),
+            expect: Expect::Unordered(t_rows().into_iter().filter(|r| r[1] < 1000).collect()),
             plan: None,
         },
         Case {
@@ -149,7 +158,7 @@ fn cases() -> Vec<Case> {
             name: "sort_10k",
             sql: "SELECT * FROM t ORDER BY v",
             elements: ROWS,
-            expect: Expect::SortedBy { rows: ROWS, col: 1 },
+            expect: Expect::Exact(sorted_by_v(t_rows())),
             plan: None,
         },
         Case {
@@ -170,7 +179,7 @@ fn cases() -> Vec<Case> {
             name: "index_point_lookup",
             sql: "SELECT * FROM t WHERE id = 4242",
             elements: 1,
-            expect: Expect::Rows(1),
+            expect: Expect::Exact(vec![vec![4242, v_of(4242) as i32]]),
             plan: Some(|p| matches!(p, Plan::IndexScan(_))),
         },
     ]
@@ -191,6 +200,15 @@ fn writes(c: &mut Criterion) {
     let mut group = c.benchmark_group("query");
     group.throughput(Throughput::Elements(INSERT_CHUNK as u64));
     let sql = format!("INSERT INTO t VALUES {}", values(0..INSERT_CHUNK, row_t));
+    let check = Db::new(POOL_FRAMES);
+    check.exec("CREATE TABLE t (id INTEGER, v INTEGER)");
+    check.exec(&sql);
+    let mut stored = ints(&check.exec("SELECT * FROM t"));
+    stored.sort_unstable();
+    let want: Vec<Vec<i32>> = (0..INSERT_CHUNK)
+        .map(|i| vec![i as i32, v_of(i) as i32])
+        .collect();
+    assert_eq!(stored, want, "insert_1k_rows: INSERT stores every row");
     group.bench_function("insert_1k_rows", |b| {
         b.iter_batched(
             || {

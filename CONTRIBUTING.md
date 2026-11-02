@@ -12,6 +12,16 @@ cargo test
 cargo llvm-cov --fail-under-lines 80   # needs cargo-llvm-cov
 ```
 
+Benchmarks in `benches/` stay out of CI on purpose: they sit behind the `bench` feature, so
+none of the commands above builds them. When you change an API they use, or the benches
+themselves, check them locally. The second command runs each bench once without timing it,
+including the checks it makes on its results:
+
+```sh
+cargo clippy --all-targets --features bench -- -D warnings
+cargo bench --features bench -- --test
+```
+
 Unit tests live next to the code in `#[cfg(test)] mod tests`. Integration and
 end-to-end tests live in `tests/`; `tests/common` runs SQL text through the
 whole engine and `tests/cli.rs` drives the `cmudb` shell binary.
