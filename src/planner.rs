@@ -308,13 +308,13 @@ impl<'a> Planner<'a> {
         filter: Option<Expression>,
     ) -> (Plan, Option<Expression>) {
         if let Some((col_idx, value)) = filter.as_ref().and_then(column_equals_constant)
-            && value.data_type() == ts.schema.cols[col_idx.index()].dtype
+            && is_index_key_of(&value, ts.schema.cols[col_idx.index()].dtype)
             && let Some(index_oid) = self.index_for_cols(ts.oid, &[col_idx.index()])
         {
             return (
                 Plan::IndexScan(IndexScanPlanNode {
                     schema: ts.schema.clone(),
-                    start: Bound::Included(vec![value]),
+                    start: Bound::Included(vec![value.clone()]),
                     end: Bound::Included(vec![value]),
                     index_oid,
                 }),
@@ -473,8 +473,9 @@ fn hash_join_keys(
     right: &Schema,
 ) -> Result<HashJoinKeys, JoinPredicate> {
     let key_columns = |part: &JoinPredicate| {
-        left_right_equi_join(part)
-            .filter(|&(l, r)| left.cols[l.index()].dtype == right.cols[r.index()].dtype)
+        left_right_equi_join(part).filter(|&(l, r)| {
+            left.cols[l.index()].dtype.value_type() == right.cols[r.index()].dtype.value_type()
+        })
     };
     let parts = conjuncts(&predicate);
     if !parts.iter().any(|part| key_columns(part).is_some()) {
@@ -675,9 +676,15 @@ fn aggregation_output_schema(
     Schema::new(group_cols.chain(agg_cols).collect())
 }
 
+/// True when an index on a column of type `dtype` can look `value` up: `value` has the
+/// column's type, or is a string a `VARCHAR` column of that length holds. An index lookup encodes
+/// `value` with its own type, and a longer string than the column holds has no key there.
+fn is_index_key_of(value: &Value, dtype: DataType) -> bool {
+    value.clone().coerce_to(dtype).as_ref() == Ok(value)
+}
+
 /// `(col_idx, value)` when `filter` is `col = value` or `value = col` on the scanned table.
-/// An index lookup encodes `value` with its own type, so callers use the index only when
-/// `value` has the column's type. The binder converts a numeric constant to the column's type
+/// Callers use an index only when [`is_index_key_of`] holds. The binder converts a numeric constant to the column's type
 /// when it converts exactly, so `f = 1` on a FLOAT column has a FLOAT constant here.
 fn column_equals_constant(filter: &Expression) -> Option<(ColIdx, Value)> {
     let Expression::Binary {
@@ -690,7 +697,9 @@ fn column_equals_constant(filter: &Expression) -> Option<(ColIdx, Value)> {
     };
     match (left.as_ref(), right.as_ref()) {
         (Expression::Column { col, .. }, Expression::Constant(Some(v)))
-        | (Expression::Constant(Some(v)), Expression::Column { col, .. }) => Some((*col, *v)),
+        | (Expression::Constant(Some(v)), Expression::Column { col, .. }) => {
+            Some((*col, v.clone()))
+        }
         _ => None,
     }
 }

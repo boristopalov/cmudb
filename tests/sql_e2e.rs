@@ -1081,9 +1081,9 @@ fn binder_errors_are_reported() {
             },
         ),
         (
-            "SELECT 'text'",
+            "SELECT $$text$$",
             BinderError::UnsupportedLiteral {
-                literal: "'text'".into(),
+                literal: "$$text$$".into(),
             },
         ),
         (
@@ -1101,9 +1101,9 @@ fn binder_errors_are_reported() {
             unsupported(Unsupported::CompoundIdentifier),
         ),
         (
-            "CREATE TABLE s (name TEXT)",
+            "CREATE TABLE s (name CHAR(3))",
             BinderError::UnsupportedType {
-                type_name: "TEXT".into(),
+                type_name: "CHAR(3)".into(),
             },
         ),
         (
@@ -1315,6 +1315,17 @@ fn drop_if_exists_skips_a_missing_table_or_index() {
 struct TypeCase {
     sql_type: &'static str,
     values: Vec<(&'static str, Value)>,
+    indexable: bool,
+}
+
+/// Distinct strings in ascending (byte) order, as SQL literals and as values.
+fn text_values() -> Vec<(&'static str, Value)> {
+    vec![
+        ("''", Value::text("")),
+        ("'Zed'", Value::text("Zed")),
+        ("'apple'", Value::text("apple")),
+        ("'it''s naïve'", Value::text("it's naïve")),
+    ]
 }
 
 fn type_cases() -> Vec<TypeCase> {
@@ -1327,6 +1338,7 @@ fn type_cases() -> Vec<TypeCase> {
                 ("0", Value::INT(0)),
                 ("2147483647", Value::INT(i32::MAX)),
             ],
+            indexable: true,
         },
         TypeCase {
             sql_type: "BIGINT",
@@ -1335,6 +1347,7 @@ fn type_cases() -> Vec<TypeCase> {
                 ("1", Value::BIGINT(1)),
                 ("9000000000", Value::BIGINT(9_000_000_000)),
             ],
+            indexable: true,
         },
         TypeCase {
             sql_type: "FLOAT",
@@ -1343,6 +1356,7 @@ fn type_cases() -> Vec<TypeCase> {
                 ("2", Value::float(2.0)),
                 ("16777217.0", Value::float(16_777_217.0)),
             ],
+            indexable: true,
         },
         TypeCase {
             sql_type: "BOOLEAN",
@@ -1350,6 +1364,7 @@ fn type_cases() -> Vec<TypeCase> {
                 ("false", Value::BOOLEAN(false)),
                 ("true", Value::BOOLEAN(true)),
             ],
+            indexable: true,
         },
         TypeCase {
             sql_type: "TIMESTAMP",
@@ -1361,12 +1376,23 @@ fn type_cases() -> Vec<TypeCase> {
                     ts("2024-02-29 12:00:00.5"),
                 ),
             ],
+            indexable: true,
+        },
+        TypeCase {
+            sql_type: "TEXT",
+            values: text_values(),
+            indexable: false,
+        },
+        TypeCase {
+            sql_type: "VARCHAR(12)",
+            values: text_values(),
+            indexable: true,
         },
     ]
 }
 
 fn single_values(rows: Vec<Row>) -> Vec<Option<Value>> {
-    rows.into_iter().map(|r| r[0]).collect()
+    rows.into_iter().map(|r| r[0].clone()).collect()
 }
 
 #[test]
@@ -1374,8 +1400,8 @@ fn every_column_type_inserts_compares_sorts_groups_aggregates_and_updates() {
     for case in type_cases() {
         let ty = case.sql_type;
         let values = &case.values;
-        let (lo_sql, lo) = values[0];
-        let (hi_sql, hi) = values[values.len() - 1];
+        let (lo_sql, lo) = values[0].clone();
+        let (hi_sql, hi) = values[values.len() - 1].clone();
         let db = Db::new(64);
         db.exec(&format!("CREATE TABLE t (k INT, v {ty})"));
         for (k, (sql, _)) in values.iter().enumerate().rev() {
@@ -1395,8 +1421,8 @@ fn every_column_type_inserts_compares_sorts_groups_aggregates_and_updates() {
             vec![[values.len() as i32 - 1]],
             "{ty}: WHERE >"
         );
-        let mut expected_order: Vec<Option<Value>> = vec![Some(lo)];
-        expected_order.extend(values.iter().map(|(_, v)| Some(*v)));
+        let mut expected_order: Vec<Option<Value>> = vec![Some(lo.clone())];
+        expected_order.extend(values.iter().map(|(_, v)| Some(v.clone())));
         expected_order.push(None);
         assert_eq!(
             single_values(db.exec("SELECT v FROM t ORDER BY v")),
@@ -1407,7 +1433,7 @@ fn every_column_type_inserts_compares_sorts_groups_aggregates_and_updates() {
         groups.sort();
         let mut expected_groups: Vec<Row> = values
             .iter()
-            .map(|(_, v)| vec![Some(*v), int(if *v == lo { 2 } else { 1 })])
+            .map(|(_, v)| vec![Some(v.clone()), int(if *v == lo { 2 } else { 1 })])
             .collect();
         expected_groups.push(vec![None, int(1)]);
         expected_groups.sort();
@@ -1440,7 +1466,7 @@ fn every_column_type_inserts_compares_sorts_groups_aggregates_and_updates() {
 
 #[test]
 fn every_column_type_can_be_indexed_and_looked_up() {
-    for case in type_cases() {
+    for case in type_cases().into_iter().filter(|c| c.indexable) {
         let ty = case.sql_type;
         let values = &case.values;
         let db = Db::new(64);
@@ -1458,7 +1484,7 @@ fn every_column_type_can_be_indexed_and_looked_up() {
             );
             assert_eq!(ints(&db.exec(&query)), vec![[k as i32]], "{ty}: {query}");
         }
-        let (first_sql, _) = values[0];
+        let (first_sql, _) = values[0].clone();
         assert!(
             db.try_exec(&format!("INSERT INTO t VALUES (7, {first_sql})"))
                 .is_err(),
@@ -1559,7 +1585,7 @@ fn timestamps_compare_with_string_literals_and_print_readably() {
     let printed: Vec<String> = db
         .exec("SELECT at FROM ev ORDER BY at")
         .into_iter()
-        .map(|r| r[0].expect("not NULL").to_string())
+        .map(|r| r[0].as_ref().expect("not NULL").to_string())
         .collect();
     assert_eq!(
         printed,
@@ -1629,7 +1655,7 @@ fn type_errors_name_the_column_and_both_types() {
         ),
         (
             "SELECT i FROM t WHERE i = 'one'",
-            "unsupported literal: 'one'",
+            "operator `=` does not take INT and TEXT",
         ),
         (
             "CREATE TABLE z (at TIMESTAMP WITH TIME ZONE)",
@@ -1868,5 +1894,351 @@ fn identical_window_calls_read_one_window_column() {
             Plan::WindowFunction(w) if w.aggregates.len() == 1
         )),
         "RANK() over the same window is computed once"
+    );
+}
+
+fn texts(rows: &[Row]) -> Vec<Vec<Option<String>>> {
+    rows.iter()
+        .map(|r| {
+            r.iter()
+                .map(|v| match v {
+                    None => None,
+                    Some(Value::TEXT(s)) => Some(s.to_string()),
+                    Some(other) => panic!("expected TEXT, got {other:?}"),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn some(s: &str) -> Option<String> {
+    Some(s.to_string())
+}
+
+fn people_db() -> Db {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE people (id INT, name VARCHAR(10), team TEXT)");
+    db.exec("CREATE TABLE teams (name TEXT, floor INT)");
+    db.exec(
+        "INSERT INTO people VALUES (1, 'ann', 'db'), (2, 'bo', 'web'), (3, 'cy', 'db'), \
+         (4, 'dee', NULL), (5, 'O''Hara', 'ops')",
+    );
+    db.exec("INSERT INTO teams VALUES ('db', 3), ('web', 5), ('hr', 1)");
+    db
+}
+
+#[test]
+fn string_literals_filter_text_columns_in_where_insert_and_update() {
+    let db = people_db();
+    for (filter, expected) in [
+        ("name = 'bo'", vec![vec![2]]),
+        ("name <> 'bo'", vec![vec![1], vec![3], vec![4], vec![5]]),
+        ("name < 'bo'", vec![vec![1], vec![5]]),
+        ("name >= 'cy'", vec![vec![3], vec![4]]),
+        ("'db' = team", vec![vec![1], vec![3]]),
+        ("team > 'a' AND team < 'p'", vec![vec![1], vec![3], vec![5]]),
+        ("name = 'O''Hara'", vec![vec![5]]),
+        ("name = 'nobody at all'", vec![]),
+    ] {
+        assert_eq!(
+            sorted(ints(
+                &db.exec(&format!("SELECT id FROM people WHERE {filter}"))
+            )),
+            expected,
+            "WHERE {filter}"
+        );
+    }
+
+    db.exec("UPDATE people SET team = 'platform', name = 'ann b' WHERE name = 'ann'");
+    db.exec("UPDATE people SET team = NULL WHERE team = 'web'");
+    db.exec("UPDATE people SET team = 'x' WHERE id = 4");
+    assert_eq!(
+        texts(&db.exec("SELECT name, team FROM people ORDER BY id")),
+        vec![
+            vec![some("ann b"), some("platform")],
+            vec![some("bo"), None],
+            vec![some("cy"), some("db")],
+            vec![some("dee"), some("x")],
+            vec![some("O'Hara"), some("ops")],
+        ]
+    );
+    assert_eq!(
+        texts(&db.exec("SELECT 'it''s', '', 'ünï'")),
+        vec![vec![some("it's"), some(""), some("ünï")]]
+    );
+}
+
+#[test]
+fn text_columns_sort_group_aggregate_and_join() {
+    let db = people_db();
+    assert_eq!(
+        texts(&db.exec("SELECT name FROM people ORDER BY name DESC")),
+        vec![
+            vec![some("dee")],
+            vec![some("cy")],
+            vec![some("bo")],
+            vec![some("ann")],
+            vec![some("O'Hara")],
+        ],
+        "ORDER BY compares bytes, so upper case sorts first"
+    );
+    assert_eq!(
+        texts(&db.exec("SELECT team FROM people ORDER BY team NULLS FIRST")),
+        vec![
+            vec![None],
+            vec![some("db")],
+            vec![some("db")],
+            vec![some("ops")],
+            vec![some("web")],
+        ]
+    );
+    assert_eq!(
+        texts(&db.exec("SELECT MIN(name), MAX(name), MIN(team), MAX(team) FROM people")),
+        vec![vec![some("O'Hara"), some("dee"), some("db"), some("web")]]
+    );
+    let mut groups = db.exec("SELECT team, COUNT(*) FROM people GROUP BY team");
+    groups.sort();
+    assert_eq!(
+        groups,
+        vec![
+            vec![None, int(1)],
+            vec![text("db"), int(2)],
+            vec![text("ops"), int(1)],
+            vec![text("web"), int(1)],
+        ]
+    );
+    assert_eq!(
+        texts(&db.exec("SELECT DISTINCT team FROM people WHERE team <> 'ops' ORDER BY team")),
+        vec![vec![some("db")], vec![some("web")]]
+    );
+
+    for sql in [
+        "SELECT p.id, t.floor FROM people p JOIN teams t ON p.team = t.name",
+        "SELECT p.id, t.floor FROM people p LEFT JOIN teams t ON t.name = p.team",
+    ] {
+        let hashed = db.plan_of(sql);
+        assert!(plan_contains(&hashed, is_hash_join), "{sql}");
+        let nested = with_nested_loop_joins(db.plan_of(sql));
+        let expected = sorted_nullable(nullable_ints(&db.run_plan(&nested).unwrap()));
+        assert_eq!(
+            sorted_nullable(nullable_ints(&db.run_plan(&hashed).unwrap())),
+            expected,
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        sorted_nullable(nullable_ints(&db.exec(
+            "SELECT p.id, t.floor FROM people p LEFT JOIN teams t ON p.team = t.name"
+        ))),
+        vec![
+            vec![Some(1), Some(3)],
+            vec![Some(2), Some(5)],
+            vec![Some(3), Some(3)],
+            vec![Some(4), None],
+            vec![Some(5), None],
+        ],
+        "a NULL or unmatched text key joins nothing"
+    );
+}
+
+#[test]
+fn varchar_limits_count_characters_and_name_the_column() {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE t (short VARCHAR(3), long TEXT)");
+    db.exec("INSERT INTO t VALUES ('ééé', 'abcdef'), ('abc', 'x')");
+    let too_long = |chars: usize| {
+        format!("value of {chars} characters is too long for VARCHAR(3) column `short`")
+    };
+    for (sql, expected) in [
+        ("INSERT INTO t VALUES ('abcd', NULL)", too_long(4)),
+        ("UPDATE t SET short = 'éééé'", too_long(4)),
+    ] {
+        match db.query_error(sql) {
+            QueryError::Bind(e) => assert_eq!(e.to_string(), expected, "{sql}"),
+            other => panic!("{sql}: expected a bind error, got {other}"),
+        }
+    }
+    match db.exec_error("UPDATE t SET short = long") {
+        ExecutorError::Catalog(CatalogError::ColumnTooLong {
+            column,
+            max_chars: 3,
+            len: 6,
+        }) => assert_eq!(column, "short"),
+        other => panic!("expected the column limit, got {other:?}"),
+    }
+    db.exec("UPDATE t SET short = long WHERE long = 'x'");
+    assert_eq!(
+        texts(&db.exec("SELECT short FROM t ORDER BY short")),
+        vec![vec![some("x")], vec![some("ééé")]]
+    );
+}
+
+#[test]
+fn text_type_errors_are_clear() {
+    let db = people_db();
+    let cases = [
+        (
+            "SELECT name + 1 FROM people",
+            "operator `+` does not take VARCHAR(10) and INT",
+        ),
+        ("SELECT -team FROM people", "cannot negate a TEXT"),
+        (
+            "SELECT id FROM people WHERE id = 'one'",
+            "operator `=` does not take INT and TEXT",
+        ),
+        (
+            "SELECT SUM(name) FROM people",
+            "aggregate `SUM` does not take a VARCHAR(10) argument",
+        ),
+        (
+            "SELECT AVG(team) FROM people",
+            "aggregate `AVG` does not take a TEXT argument",
+        ),
+        (
+            "INSERT INTO people VALUES ('6', 'x', 'y')",
+            "column `id` is INT, got TEXT",
+        ),
+        (
+            "INSERT INTO people VALUES (6, 7, 'y')",
+            "column `name` is VARCHAR(10), got INT",
+        ),
+        (
+            "UPDATE people SET team = id",
+            "column `team` is TEXT, got INT",
+        ),
+        ("CREATE TABLE z (c CHAR(3))", "unsupported type: CHAR(3)"),
+        (
+            "CREATE TABLE z (c VARCHAR(0))",
+            "unsupported type: VARCHAR(0)",
+        ),
+    ];
+    let failures: Vec<String> = cases
+        .into_iter()
+        .filter_map(|(sql, expected)| match db.query_error(sql) {
+            QueryError::Bind(e) if e.to_string() == expected => None,
+            other => Some(format!("{sql}: expected {expected:?}, got {other}")),
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn varchar_columns_can_be_indexed_but_unbounded_text_cannot() {
+    let db = people_db();
+    let err = db
+        .try_exec("CREATE INDEX by_team ON people (team)")
+        .expect_err("TEXT has no key width");
+    assert!(
+        err.contains("column `team` is TEXT, which cannot be an index key"),
+        "{err}"
+    );
+    assert!(db.catalog().index_oid("people", "by_team").is_err());
+
+    db.exec("CREATE INDEX by_name ON people (name)");
+    let lookup = "SELECT id FROM people WHERE name = 'cy'";
+    assert!(plan_contains(&db.plan_of(lookup), |p| matches!(
+        p,
+        Plan::IndexScan(_)
+    )));
+    assert_eq!(ints(&db.exec(lookup)), vec![[3]]);
+    let longer_than_the_column = "SELECT id FROM people WHERE name = 'a name past ten'";
+    assert!(
+        !plan_contains(&db.plan_of(longer_than_the_column), |p| matches!(
+            p,
+            Plan::IndexScan(_)
+        )),
+        "a string longer than the column has no key in the index"
+    );
+    assert!(db.exec(longer_than_the_column).is_empty());
+    db.exec("UPDATE people SET name = 'cyril' WHERE id = 3");
+    assert_eq!(
+        ints(&db.exec("SELECT id FROM people WHERE name = 'cyril'")),
+        vec![[3]]
+    );
+    assert!(db.exec(lookup).is_empty());
+    assert!(
+        db.try_exec("INSERT INTO people VALUES (9, 'bo', NULL)")
+            .is_err(),
+        "the index keeps names unique"
+    );
+}
+
+#[test]
+fn rows_grow_and_shrink_in_place_and_a_rollback_restores_them() {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE t (id INT, note TEXT)");
+    for id in 0..300 {
+        db.exec(&format!("INSERT INTO t VALUES ({id}, 'n{id:03}')"));
+    }
+    for id in 0..300 {
+        db.exec(&format!(
+            "UPDATE t SET note = 'note{id:03}' WHERE id = {id}"
+        ));
+    }
+    assert_eq!(
+        texts(&db.exec("SELECT note FROM t WHERE id = 7 OR id = 299 ORDER BY id")),
+        vec![vec![some("note007")], vec![some("note299")]]
+    );
+
+    db.exec("BEGIN");
+    db.exec("UPDATE t SET note = 'x'");
+    db.exec("UPDATE t SET note = 'longer still, longer than every note so far' WHERE id = 7");
+    db.exec("ROLLBACK");
+    for id in [0, 7, 150, 299] {
+        assert_eq!(
+            texts(&db.exec(&format!("SELECT note FROM t WHERE id = {id}"))),
+            vec![vec![some(&format!("note{id:03}"))]],
+            "rollback writes the old image of row {id} back"
+        );
+    }
+    assert!(db.exec("SELECT id FROM t WHERE note = 'x'").is_empty());
+}
+
+#[test]
+fn a_row_too_large_for_a_page_is_refused_with_a_clear_error() {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE t (id INT, note TEXT)");
+    let huge = "y".repeat(9000);
+    let err = db
+        .try_exec(&format!("INSERT INTO t VALUES (1, '{huge}')"))
+        .expect_err("9000 bytes do not fit a page");
+    assert!(
+        err.contains("bytes does not fit in a page, which holds at most"),
+        "{err}"
+    );
+    assert!(db.exec("SELECT id FROM t").is_empty());
+}
+
+#[test]
+#[ignore = "known gap: a row that grows past its page's free space cannot move to another page (BOR-76)"]
+fn an_update_can_grow_every_row_of_a_full_page_past_the_reserve() {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE t (id INT, note TEXT)");
+    for id in 0..200 {
+        db.exec(&format!("INSERT INTO t VALUES ({id}, 'n')"));
+    }
+    let long = "z".repeat(200);
+    db.exec(&format!("UPDATE t SET note = '{long}'"));
+    assert_eq!(
+        ints(&db.exec(&format!("SELECT COUNT(*) FROM t WHERE note = '{long}'"))),
+        vec![[200]]
+    );
+}
+
+#[test]
+fn an_update_that_grows_rows_past_their_page_fails_and_changes_nothing() {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE t (id INT, note TEXT)");
+    for id in 0..200 {
+        db.exec(&format!("INSERT INTO t VALUES ({id}, 'n')"));
+    }
+    let long = "z".repeat(200);
+    let err = db
+        .try_exec(&format!("UPDATE t SET note = '{long}'"))
+        .expect_err("the first page cannot hold every row at 200 bytes");
+    assert!(err.contains("rows cannot move to another page"), "{err}");
+    assert_eq!(
+        ints(&db.exec("SELECT COUNT(*) FROM t WHERE note = 'n'")),
+        vec![[200]]
     );
 }

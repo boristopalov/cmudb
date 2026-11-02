@@ -119,8 +119,8 @@ fn print_rows(schema: &Schema, values: &[Row]) {
         .iter()
         .enumerate()
         .map(|(i, h)| {
-            let cell_max = rows.iter().map(|r| r[i].len()).max().unwrap_or(0);
-            h.len().max(cell_max)
+            let cell_max = rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0);
+            h.chars().count().max(cell_max)
         })
         .collect();
 

@@ -7,7 +7,7 @@
 //! offset 4   num_tuples         u16
 //! offset 6   num_deleted_tuples u16
 //! offset 8   free_space_offset  u32   (tuple data grows backwards from PAGE_SIZE)
-//! offset 12  slot directory     num_tuples * { offset u32, size u32, ts u64, is_deleted u8 }
+//! offset 12  slot directory     num_tuples * { offset u32, size u16, capacity u16, ts u64, is_deleted u8 }
 //! ...        free space
 //! free_space_offset..PAGE_SIZE  tuple bytes
 //! ```
@@ -15,6 +15,12 @@
 //! `TablePage<&[u8]>` reads straight out of a pinned frame and `TablePage<&mut [u8]>`
 //! writes straight into one: there is no intermediate decoded representation, so reading
 //! one tuple touches one slot instead of the whole directory.
+//!
+//! A slot owns the `capacity` bytes that end at its `offset`; its tuple is the first `size` of
+//! them. An update keeps the slot (and so the record id): a tuple no larger than the capacity is
+//! written in place, and a larger one gets a new region on the same page, after compacting the
+//! page when its free space is too small. Shrinking a tuple keeps its slot's capacity, so writing
+//! back an earlier image of the tuple, as an abort does, fits where it was.
 //!
 //! Each slot carries the MVCC metadata of the newest version of its tuple ([`TupleMeta`]):
 //! the timestamp that wrote it (a commit timestamp, or a transaction id while uncommitted)
@@ -35,10 +41,12 @@ pub enum TablePageError {
         directory_end: usize,
         free_space_offset: usize,
     },
-    /// A slot's byte range lies outside the page's tuple area.
+    /// A slot's byte range lies outside the page's tuple area, or its tuple is larger than its
+    /// capacity.
     SlotOutOfBounds {
         offset: u32,
         size: u32,
+        capacity: u32,
         tuple_area_start: u32,
     },
     /// The tuple and its slot do not fit in the page's free space.
@@ -51,8 +59,13 @@ pub enum TablePageError {
     AlreadyDeleted { slot: u32 },
     /// The deleted-tuple counter would overflow or drop below zero for a change to `slot`.
     CorruptDeletedCounter { count: u16, slot: u32 },
-    /// An in-place update would change the tuple's size.
-    SizeChange { slot: u32, old: u32, new: usize },
+    /// An update of `slot` to `len` bytes does not fit on the page, which has `available` bytes
+    /// left for it even after compaction. A row cannot move to another page.
+    UpdateDoesNotFit {
+        slot: u32,
+        len: usize,
+        available: usize,
+    },
 }
 
 impl fmt::Display for TablePageError {
@@ -71,10 +84,11 @@ impl fmt::Display for TablePageError {
             TablePageError::SlotOutOfBounds {
                 offset,
                 size,
+                capacity,
                 tuple_area_start,
             } => write!(
                 f,
-                "slot points outside tuple area (offset {offset}, size {size}, tuple area starts at {tuple_area_start})"
+                "slot points outside tuple area (offset {offset}, size {size}, capacity {capacity}, tuple area starts at {tuple_area_start})"
             ),
             TablePageError::DoesNotFit { len } => {
                 write!(f, "tuple of {len} bytes does not fit on page")
@@ -88,9 +102,13 @@ impl fmt::Display for TablePageError {
                 f,
                 "deleted-tuple counter {count} is corrupt for a change to slot {slot}"
             ),
-            TablePageError::SizeChange { slot, old, new } => write!(
+            TablePageError::UpdateDoesNotFit {
+                slot,
+                len,
+                available,
+            } => write!(
                 f,
-                "in-place update of slot {slot} changes its size from {old} to {new}"
+                "the updated row in slot {slot} needs {len} bytes but its page has {available} bytes left for it, and rows cannot move to another page"
             ),
         }
     }
@@ -109,15 +127,27 @@ pub struct TupleMeta {
 /// A single slot directory entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Slot {
-    /// End offset (exclusive) of the tuple's bytes within the page.
+    /// End offset (exclusive) of the slot's region within the page.
     pub offset: u32,
+    /// Length of the tuple, which starts where the region does.
     pub size: u32,
+    /// Length of the region, at least `size`.
+    pub capacity: u32,
     pub meta: TupleMeta,
 }
 
 impl Slot {
+    fn region_start(&self) -> u32 {
+        self.offset - self.capacity
+    }
+
+    fn region(&self) -> std::ops::Range<usize> {
+        self.region_start() as usize..self.offset as usize
+    }
+
     fn range(&self) -> std::ops::Range<usize> {
-        (self.offset - self.size) as usize..self.offset as usize
+        let start = self.region_start() as usize;
+        start..start + self.size as usize
     }
 }
 
@@ -131,6 +161,7 @@ const FREE_SPACE_OFF: usize = 8;
 
 const SLOT_OFFSET_OFF: usize = 0;
 const SLOT_SIZE_OFF: usize = 4;
+const SLOT_CAPACITY_OFF: usize = 6;
 const SLOT_TS_OFF: usize = 8;
 const SLOT_DELETED_OFF: usize = 16;
 
@@ -204,7 +235,8 @@ impl<B: AsRef<[u8]>> TablePage<B> {
         let b = self.bytes();
         Some(Slot {
             offset: get_u32_le(b, base + SLOT_OFFSET_OFF),
-            size: get_u32_le(b, base + SLOT_SIZE_OFF),
+            size: u32::from(get_u16_le(b, base + SLOT_SIZE_OFF)),
+            capacity: u32::from(get_u16_le(b, base + SLOT_CAPACITY_OFF)),
             meta: TupleMeta {
                 ts: get_u64_le(b, base + SLOT_TS_OFF),
                 is_deleted: b[base + SLOT_DELETED_OFF] != 0,
@@ -214,18 +246,34 @@ impl<B: AsRef<[u8]>> TablePage<B> {
 
     /// Borrows the tuple bytes described by `meta` directly out of the page.
     pub fn tuple_bytes(&self, meta: &Slot) -> Result<&[u8], TablePageError> {
+        self.check_region(meta)?;
+        Ok(&self.bytes()[meta.range()])
+    }
+
+    fn check_region(&self, meta: &Slot) -> Result<(), TablePageError> {
         let free = self.free_space_offset();
-        if meta.size > meta.offset
-            || meta.offset - meta.size < free
+        if meta.size > meta.capacity
+            || meta.capacity > meta.offset
+            || meta.region_start() < free
             || meta.offset as usize > PAGE_SIZE
         {
             return Err(TablePageError::SlotOutOfBounds {
                 offset: meta.offset,
                 size: meta.size,
+                capacity: meta.capacity,
                 tuple_area_start: free,
             });
         }
-        Ok(&self.bytes()[meta.range()])
+        Ok(())
+    }
+
+    fn free_bytes(&self) -> usize {
+        (self.free_space_offset() as usize).saturating_sub(self.directory_end())
+    }
+
+    /// Every slot of the page, in slot order.
+    fn slots(&self) -> impl Iterator<Item = Slot> + '_ {
+        (0..u32::from(self.num_tuples())).filter_map(|slot| self.slot(slot))
     }
 
     pub fn can_insert(&self, tuple_len: usize) -> bool {
@@ -276,15 +324,16 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> TablePage<B> {
             .checked_add(1)
             .ok_or(TablePageError::SlotCountOverflow)?;
         let offset = self.free_space_offset();
-        let size = data.len() as u32;
-        let start = offset - size;
+        let size = tuple_len(data)?;
+        let start = offset - u32::from(size);
         let base = Self::slot_base(slot);
         let deleted = self.num_deleted_tuples() + u16::from(meta.is_deleted);
 
         let b = self.bytes_mut();
         b[start as usize..offset as usize].copy_from_slice(data);
         put_u32_le(b, base + SLOT_OFFSET_OFF, offset);
-        put_u32_le(b, base + SLOT_SIZE_OFF, size);
+        put_u16_le(b, base + SLOT_SIZE_OFF, size);
+        put_u16_le(b, base + SLOT_CAPACITY_OFF, size);
         put_u64_le(b, base + SLOT_TS_OFF, meta.ts);
         b[base + SLOT_DELETED_OFF] = u8::from(meta.is_deleted);
         put_u16_le(b, NUM_TUPLES_OFF, new_num_tuples);
@@ -341,9 +390,11 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> TablePage<B> {
         Ok(())
     }
 
-    /// Overwrites the bytes and metadata of `slot` in place. The new tuple is exactly as large
-    /// as the old one, as cmudb's fixed-width rows are, or the update is refused. The slot's
-    /// range and the deleted-tuple counter are checked before anything is written.
+    /// Overwrites the bytes and metadata of `slot`, keeping the slot. A tuple that fits the
+    /// slot's capacity is written where the old one was; a larger one moves to a new region of
+    /// the page, compacting the page first when its free space is too small, and fails with
+    /// [`TablePageError::UpdateDoesNotFit`] when even that leaves too little room. The slot's
+    /// range, the room and the deleted-tuple counter are checked before anything is written.
     pub fn update_in_place(
         &mut self,
         slot: u32,
@@ -351,19 +402,109 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> TablePage<B> {
         data: &[u8],
     ) -> Result<(), TablePageError> {
         let current = self.existing_slot(slot)?;
-        if current.size as usize != data.len() {
-            return Err(TablePageError::SizeChange {
-                slot,
-                old: current.size,
-                new: data.len(),
-            });
-        }
-        self.tuple_bytes(&current)?;
+        self.check_region(&current)?;
+        let size = tuple_len(data)?;
+        let placement = self.place(&current, slot, data.len())?;
         self.update_meta(slot, meta)?;
-        let range = current.range();
-        self.bytes_mut()[range].copy_from_slice(data);
+        let region = match placement {
+            Placement::InPlace => current,
+            Placement::Free => self.claim_free_region(slot, size),
+            Placement::AfterCompaction => {
+                self.compact_without(slot);
+                self.claim_free_region(slot, size)
+            }
+        };
+        let start = region.region_start() as usize;
+        let base = Self::slot_base(slot);
+        let b = self.bytes_mut();
+        b[start..start + data.len()].copy_from_slice(data);
+        put_u16_le(b, base + SLOT_SIZE_OFF, size);
         Ok(())
     }
+
+    /// Where an update of `current` to `len` bytes goes.
+    fn place(&self, current: &Slot, slot: u32, len: usize) -> Result<Placement, TablePageError> {
+        if len <= current.capacity as usize {
+            return Ok(Placement::InPlace);
+        }
+        if len <= self.free_bytes() {
+            return Ok(Placement::Free);
+        }
+        let other_regions: usize = self
+            .slots()
+            .enumerate()
+            .filter(|&(i, _)| i as u32 != slot)
+            .map(|(_, s)| s.capacity as usize)
+            .sum();
+        let available = PAGE_SIZE - self.directory_end() - other_regions;
+        if len <= available {
+            Ok(Placement::AfterCompaction)
+        } else {
+            Err(TablePageError::UpdateDoesNotFit {
+                slot,
+                len,
+                available,
+            })
+        }
+    }
+
+    /// Gives `slot` a new region of `size` bytes at the start of the free space and returns the
+    /// slot as it now stands. The caller has checked that the free space holds `size` bytes.
+    fn claim_free_region(&mut self, slot: u32, size: u16) -> Slot {
+        let end = self.free_space_offset();
+        let start = end - u32::from(size);
+        let base = Self::slot_base(slot);
+        let b = self.bytes_mut();
+        put_u32_le(b, base + SLOT_OFFSET_OFF, end);
+        put_u16_le(b, base + SLOT_CAPACITY_OFF, size);
+        put_u32_le(b, FREE_SPACE_OFF, start);
+        self.slot(slot)
+            .expect("the slot was read before it was moved")
+    }
+
+    /// Packs every slot's region but `skip`'s against the end of the page, in slot order, and
+    /// leaves `skip` with an empty region, so that the free space is all the page has left.
+    fn compact_without(&mut self, skip: u32) {
+        let slots: Vec<Slot> = self.slots().collect();
+        let regions: Vec<Vec<u8>> = slots
+            .iter()
+            .map(|s| self.bytes()[s.region()].to_vec())
+            .collect();
+        let mut end = PAGE_SIZE as u32;
+        let b = self.bytes_mut();
+        for (i, (s, region)) in slots.iter().zip(regions).enumerate() {
+            let base = Self::slot_base(i as u32);
+            if i as u32 == skip {
+                put_u32_le(b, base + SLOT_OFFSET_OFF, end);
+                put_u16_le(b, base + SLOT_CAPACITY_OFF, 0);
+                continue;
+            }
+            let start = end - s.capacity;
+            b[start as usize..end as usize].copy_from_slice(&region);
+            put_u32_le(b, base + SLOT_OFFSET_OFF, end);
+            end = start;
+        }
+        put_u32_le(b, FREE_SPACE_OFF, end);
+    }
+}
+
+/// Where [`TablePage::update_in_place`] writes a tuple.
+enum Placement {
+    /// Over the old tuple, inside the slot's region.
+    InPlace,
+    /// In a new region taken from the free space.
+    Free,
+    /// In a new region taken from the free space once the page is compacted.
+    AfterCompaction,
+}
+
+/// The length of `data` as a slot stores it. Fails with [`TablePageError::DoesNotFit`] for a
+/// tuple longer than a page.
+fn tuple_len(data: &[u8]) -> Result<u16, TablePageError> {
+    u16::try_from(data.len())
+        .ok()
+        .filter(|&len| usize::from(len) <= TablePage::<&[u8]>::MAX_TUPLE_SIZE)
+        .ok_or(TablePageError::DoesNotFit { len: data.len() })
 }
 
 #[cfg(test)]
@@ -401,8 +542,9 @@ mod tests {
             m0.offset as usize, PAGE_SIZE,
             "tuples grow backwards from the end of the page"
         );
-        assert_eq!(m1.offset, m0.offset - m0.size);
-        assert_eq!(page.free_space_offset(), m1.offset - m1.size);
+        assert_eq!((m0.size, m0.capacity), (5, 5));
+        assert_eq!(m1.offset, m0.offset - m0.capacity);
+        assert_eq!(page.free_space_offset(), m1.offset - m1.capacity);
     }
 
     #[test]
@@ -456,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn update_in_place_rewrites_bytes_and_rejects_size_change() {
+    fn update_in_place_rewrites_bytes_and_keeps_the_slot_when_the_size_changes() {
         let mut buf = [0u8; PAGE_SIZE];
         let mut page = TablePage::init(&mut buf[..]);
         page.insert(b"old").unwrap();
@@ -466,19 +608,104 @@ mod tests {
             is_deleted: false,
         };
         page.update_in_place(0, meta, b"new").unwrap();
+        page.update_in_place(0, meta, b"a").unwrap();
+        let s0 = page.slot(0).unwrap();
+        assert_eq!(page.tuple_bytes(&s0).unwrap(), b"a");
         assert_eq!(
-            page.update_in_place(0, meta, b"long"),
-            Err(TablePageError::SizeChange {
-                slot: 0,
-                old: 3,
-                new: 4
+            (s0.offset, s0.capacity),
+            (PAGE_SIZE as u32, 3),
+            "a shorter tuple stays where it was and the slot keeps its capacity"
+        );
+
+        let free_before = page.free_space_offset();
+        page.update_in_place(0, meta, b"longer").unwrap();
+        let s0 = page.slot(0).unwrap();
+        assert_eq!(page.tuple_bytes(&s0).unwrap(), b"longer");
+        assert_eq!(s0.meta, meta);
+        assert_eq!(
+            (s0.offset, s0.capacity),
+            (free_before, 6),
+            "a longer tuple moves to a new region taken from the free space"
+        );
+        assert_eq!(page.free_space_offset(), free_before - 6);
+        let s1 = page.slot(1).unwrap();
+        assert_eq!(page.tuple_bytes(&s1).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn update_in_place_compacts_the_page_to_make_room_for_a_longer_tuple() {
+        let mut buf = [0u8; PAGE_SIZE];
+        let mut page = TablePage::init(&mut buf[..]);
+        let row = vec![1u8; 1000];
+        let mut slots = 0;
+        while page.can_insert(row.len()) {
+            page.insert(&row).unwrap();
+            slots += 1;
+        }
+        let meta = TupleMeta::default();
+        page.update_in_place(0, meta, b"short").unwrap();
+        page.mark_deleted(2).unwrap();
+        let grown = vec![2u8; 1000 + page.free_bytes() + 1];
+        assert_eq!(
+            page.update_in_place(1, meta, &grown),
+            Err(TablePageError::UpdateDoesNotFit {
+                slot: 1,
+                len: grown.len(),
+                available: grown.len() - 1,
+            }),
+            "slot 0 keeps its capacity, so compaction frees nothing"
+        );
+
+        let fits = vec![2u8; 1000 + page.free_bytes()];
+        page.update_in_place(1, meta, &fits).unwrap();
+        assert_eq!(page.free_space_offset() as usize, page.directory_end());
+        for slot in 0..slots {
+            let s = page.slot(slot).unwrap();
+            let expected: &[u8] = match slot {
+                0 => b"short",
+                1 => &fits,
+                _ => &row,
+            };
+            assert_eq!(page.tuple_bytes(&s).unwrap(), expected, "slot {slot}");
+        }
+        assert!(page.slot(2).unwrap().meta.is_deleted);
+        assert_eq!(page.num_deleted_tuples(), 1);
+
+        page.update_in_place(0, meta, &row)
+            .expect("an earlier image of a slot always fits its capacity");
+        let s0 = page.slot(0).unwrap();
+        assert_eq!(page.tuple_bytes(&s0).unwrap(), &row[..]);
+    }
+
+    #[test]
+    fn update_in_place_that_does_not_fit_writes_nothing() {
+        let mut buf = [0u8; PAGE_SIZE];
+        let mut page = TablePage::init(&mut buf[..]);
+        page.insert(b"old").unwrap();
+        let before = buf;
+        let mut page = TablePageMut::new(&mut buf[..]).unwrap();
+        let live = TupleMeta {
+            ts: 3,
+            is_deleted: false,
+        };
+        let too_long = vec![0u8; TablePageMut::MAX_TUPLE_SIZE + 1];
+        assert_eq!(
+            page.update_in_place(0, live, &too_long),
+            Err(TablePageError::DoesNotFit {
+                len: too_long.len()
             })
         );
-        let s0 = page.slot(0).unwrap();
-        let s1 = page.slot(1).unwrap();
-        assert_eq!(page.tuple_bytes(&s0).unwrap(), b"new");
-        assert_eq!(s0.meta, meta);
-        assert_eq!(page.tuple_bytes(&s1).unwrap(), b"keep");
+        let max = vec![0u8; TablePageMut::MAX_TUPLE_SIZE];
+        page.insert(b"x").unwrap();
+        assert!(matches!(
+            page.update_in_place(0, live, &max),
+            Err(TablePageError::UpdateDoesNotFit { slot: 0, .. })
+        ));
+        let after = TablePageRef::new(&buf[..]).unwrap();
+        let s0 = after.slot(0).unwrap();
+        assert_eq!(after.tuple_bytes(&s0).unwrap(), b"old");
+        assert_eq!(s0.meta, TupleMeta::default());
+        assert_eq!(buf[PAGE_SIZE - 3..], before[PAGE_SIZE - 3..]);
     }
 
     #[test]
@@ -614,6 +841,7 @@ mod tests {
         let bogus = Slot {
             offset: 10,
             size: 4,
+            capacity: 4,
             meta: TupleMeta::default(),
         };
         assert_eq!(
@@ -621,8 +849,17 @@ mod tests {
             Err(TablePageError::SlotOutOfBounds {
                 offset: 10,
                 size: 4,
+                capacity: 4,
                 tuple_area_start: page.free_space_offset()
             })
         );
+        let overfull = Slot {
+            size: 5,
+            ..page.slot(0).unwrap()
+        };
+        assert!(matches!(
+            page.tuple_bytes(&overfull),
+            Err(TablePageError::SlotOutOfBounds { size: 5, .. })
+        ));
     }
 }

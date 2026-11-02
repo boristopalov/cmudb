@@ -214,7 +214,7 @@ fn external_merge_sort_orders_by_multiple_keys() {
         order_by_exprs: vec![SortExpr::ascending(col(0)), SortExpr::ascending(col(1))],
     });
     let rows = db.run_plan(&plan).unwrap();
-    let keys: Vec<_> = rows.iter().map(|r| (r[0], r[1])).collect();
+    let keys: Vec<_> = rows.iter().map(|r| (r[0].clone(), r[1].clone())).collect();
     assert_eq!(
         keys,
         vec![
@@ -251,7 +251,7 @@ fn external_merge_sort_orders_mixed_directions_with_nulls_highest() {
         order_by_exprs: vec![SortExpr::descending(col(0)), SortExpr::ascending(col(1))],
     });
     let rows = db.run_plan(&plan).unwrap();
-    let keys: Vec<_> = rows.iter().map(|r| (r[0], r[1])).collect();
+    let keys: Vec<_> = rows.iter().map(|r| (r[0].clone(), r[1].clone())).collect();
     assert_eq!(
         keys,
         vec![
@@ -418,7 +418,7 @@ fn window_avg_over_ints_is_a_float() {
         .run_plan(&plan)
         .unwrap()
         .into_iter()
-        .map(|r| (r[0], r[2]))
+        .map(|r| (r[0].clone(), r[2].clone()))
         .collect();
     avgs.sort();
     avgs.dedup();

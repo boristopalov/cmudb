@@ -7,8 +7,8 @@ use std::fmt;
 use std::ops::Bound;
 
 use crate::buffer_pool::BpmError;
-use crate::catalog::CatalogError;
 use crate::catalog::index_schema::{IndexKey, IndexValue};
+use crate::catalog::{CatalogError, DataType};
 use crate::index::page_codec::PageCodecError;
 pub use b_plus_tree::*;
 pub type InsertResult = Result<(), IndexError>;
@@ -36,6 +36,11 @@ pub enum IndexError {
     Structure(&'static str),
     /// A key column could not be read from a table tuple.
     Catalog(CatalogError),
+    /// A key column has a type with no fixed key width, such as TEXT.
+    UnindexableColumn {
+        column: String,
+        dtype: DataType,
+    },
 }
 
 #[derive(Debug)]
@@ -87,6 +92,10 @@ impl fmt::Display for IndexError {
             IndexError::PageError(e) => write!(f, "page decode/encode error: {e}"),
             IndexError::Structure(msg) => write!(f, "b+ tree structure violated: {msg}"),
             IndexError::Catalog(e) => write!(f, "cannot read the key from the tuple: {e}"),
+            IndexError::UnindexableColumn { column, dtype } => write!(
+                f,
+                "column `{column}` is {dtype}, which cannot be an index key; declare it VARCHAR(n) to index it"
+            ),
         }
     }
 }

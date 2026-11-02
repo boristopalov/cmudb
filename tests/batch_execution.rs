@@ -303,10 +303,10 @@ fn expected_join(inner: &Rows, left_outer: bool) -> Rows {
     for l in l_rows() {
         let matches: Vec<_> = inner.iter().filter(|r| r[0] == l[1]).collect();
         if matches.is_empty() && left_outer {
-            out.push(vec![l[0], l[1], None, None]);
+            out.push(vec![l[0].clone(), l[1].clone(), None, None]);
         }
         for r in matches {
-            out.push(vec![l[0], l[1], r[0], r[1]]);
+            out.push(vec![l[0].clone(), l[1].clone(), r[0].clone(), r[1].clone()]);
         }
     }
     out
@@ -334,7 +334,12 @@ fn selective_filter_and_projection() {
     let expected: Rows = l_rows()
         .into_iter()
         .filter(|r| r[1] == int(2))
-        .map(|r| vec![r[0].map(|v| Value::INT(v.as_i64().unwrap() as i32 * 10))])
+        .map(|r| {
+            vec![
+                r[0].as_ref()
+                    .map(|v| Value::INT(v.as_i64().unwrap() as i32 * 10)),
+            ]
+        })
         .collect();
     assert_eq!(
         expected.len(),
@@ -427,10 +432,10 @@ fn aggregation_groups_span_batches() {
     });
     let mut groups: HashMap<i32, (i32, i32)> = HashMap::new();
     for r in l_rows() {
-        let (Some(Value::INT(id)), Some(Value::INT(k))) = (r[0], r[1]) else {
+        let (Some(Value::INT(id)), Some(Value::INT(k))) = (&r[0], &r[1]) else {
             unreachable!()
         };
-        let e = groups.entry(k).or_default();
+        let e = groups.entry(*k).or_default();
         e.0 += 1;
         e.1 += id;
     }
@@ -447,7 +452,7 @@ fn sorts_emit_in_order_across_batches() {
     let env = setup();
     let order_by = vec![SortExpr::ascending(col(1)), SortExpr::ascending(col(0))];
     let mut expected = l_rows();
-    expected.sort_by_key(|r| (r[1], r[0]));
+    expected.sort_by_key(|r| (r[1].clone(), r[0].clone()));
 
     let sort = Plan::Sort(SortPlanNode {
         schema: l_schema(),
@@ -506,7 +511,7 @@ fn window_function_output_spans_batches() {
                     _ => unreachable!(),
                 })
                 .sum();
-            vec![r[0], r[1], int(sum)]
+            vec![r[0].clone(), r[1].clone(), int(sum)]
         })
         .collect();
     assert_all_batch_sizes(&env, &plan, &expected, false);
@@ -550,8 +555,9 @@ fn update_and_delete_touch_every_row_once() {
             .into_iter()
             .map(|r| {
                 vec![
-                    r[0],
-                    r[1].map(|v| Value::INT(v.as_i64().unwrap() as i32 + 100)),
+                    r[0].clone(),
+                    r[1].as_ref()
+                        .map(|v| Value::INT(v.as_i64().unwrap() as i32 + 100)),
                 ]
             })
             .collect();

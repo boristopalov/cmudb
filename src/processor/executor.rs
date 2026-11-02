@@ -927,7 +927,7 @@ impl AggState {
         let Some(v) = v else { return Ok(()) };
         match self {
             Self::Count(count) => *count += 1,
-            Self::Sum(current) => *current = Some(add_to(*current, sum_operand(v))?),
+            Self::Sum(current) => *current = Some(add_to(current.take(), sum_operand(v))?),
             Self::Avg { sum, count } => {
                 let operand = v.as_f64().ok_or(ExecutorError::ArithmeticOperands {
                     op: Arithmetic::Add,
@@ -937,8 +937,8 @@ impl AggState {
                 *sum += operand;
                 *count += 1;
             }
-            Self::Max(current) => *current = Some(current.map_or(v, |c| c.max(v))),
-            Self::Min(current) => *current = Some(current.map_or(v, |c| c.min(v))),
+            Self::Max(current) => *current = Some(current.take().map_or(v.clone(), |c| c.max(v))),
+            Self::Min(current) => *current = Some(current.take().map_or(v.clone(), |c| c.min(v))),
             Self::Rank(_) => {}
         }
         Ok(())
@@ -947,7 +947,7 @@ impl AggState {
     /// The aggregate over the values folded in so far. AVG is a FLOAT for every input type.
     fn value(&self) -> Result<Option<Value>, ExecutorError> {
         Ok(match self {
-            Self::Sum(v) | Self::Max(v) | Self::Min(v) => *v,
+            Self::Sum(v) | Self::Max(v) | Self::Min(v) => v.clone(),
             Self::Count(c) | Self::Rank(c) => Some(Value::INT(*c)),
             Self::Avg { count: 0, .. } => None,
             Self::Avg { sum, count } => Some(Value::float(*sum / *count as f64)),

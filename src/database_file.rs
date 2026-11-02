@@ -25,8 +25,10 @@ pub const HEADER_PAGE_ID: usize = 0;
 /// The first bytes of the header page of every cmudb data file.
 const HEADER_MAGIC: [u8; 8] = *b"CMUDB\0db";
 
-/// The version of this layout. A data file written with another version is refused.
-pub const FORMAT_VERSION: u32 = 1;
+/// The version of this layout and of the table and index pages the data file holds. A data file
+/// written with another version is refused. Version 2 gave each table page slot a capacity, so
+/// rows can change length.
+pub const FORMAT_VERSION: u32 = 2;
 
 const HEADER_VERSION_OFF: usize = 8;
 const HEADER_META_PAGE_OFF: usize = 12;
@@ -48,6 +50,9 @@ const TYPE_TAG_INT: u8 = 1;
 const TYPE_TAG_FLOAT: u8 = 2;
 const TYPE_TAG_TIMESTAMP: u8 = 3;
 const TYPE_TAG_BIGINT: u8 = 4;
+const TYPE_TAG_TEXT: u8 = 5;
+/// Followed by the type's character limit, a `u32`.
+const TYPE_TAG_VARCHAR: u8 = 6;
 
 const INDEX_TAG_BPLUS_TREE: u8 = 0;
 
@@ -240,7 +245,12 @@ fn encode_type(w: &mut Writer, dtype: DataType) {
         DataType::FLOAT => TYPE_TAG_FLOAT,
         DataType::TIMESTAMP => TYPE_TAG_TIMESTAMP,
         DataType::BIGINT => TYPE_TAG_BIGINT,
+        DataType::TEXT => TYPE_TAG_TEXT,
+        DataType::VARCHAR(_) => TYPE_TAG_VARCHAR,
     });
+    if let DataType::VARCHAR(max_chars) = dtype {
+        w.u32(max_chars);
+    }
 }
 
 fn decode_type(r: &mut Reader<'_>) -> Result<DataType, PersistError> {
@@ -250,6 +260,8 @@ fn decode_type(r: &mut Reader<'_>) -> Result<DataType, PersistError> {
         TYPE_TAG_FLOAT => Ok(DataType::FLOAT),
         TYPE_TAG_TIMESTAMP => Ok(DataType::TIMESTAMP),
         TYPE_TAG_BIGINT => Ok(DataType::BIGINT),
+        TYPE_TAG_TEXT => Ok(DataType::TEXT),
+        TYPE_TAG_VARCHAR => Ok(DataType::VARCHAR(r.u32()?)),
         tag => Err(PersistError::UnknownColumnType(tag)),
     }
 }
@@ -448,6 +460,8 @@ mod tests {
                             (DataType::BOOLEAN, "ok".into()),
                             (DataType::FLOAT, "f".into()),
                             (DataType::TIMESTAMP, "at".into()),
+                            (DataType::TEXT, "note".into()),
+                            (DataType::VARCHAR(20), "name".into()),
                         ],
                         first_page_id: 2,
                     },
@@ -504,12 +518,27 @@ mod tests {
             (DataType::FLOAT, TYPE_TAG_FLOAT),
             (DataType::TIMESTAMP, TYPE_TAG_TIMESTAMP),
             (DataType::BIGINT, TYPE_TAG_BIGINT),
+            (DataType::TEXT, TYPE_TAG_TEXT),
         ] {
             let mut w = Writer::default();
             encode_type(&mut w, dtype);
             assert_eq!(w.0, vec![tag], "tag of {dtype:?}");
             assert_eq!(decode_type(&mut Reader(&w.0)).unwrap(), dtype);
         }
+        let mut w = Writer::default();
+        encode_type(&mut w, DataType::VARCHAR(300));
+        assert_eq!(
+            w.0,
+            [&[TYPE_TAG_VARCHAR][..], &300u32.to_le_bytes()].concat()
+        );
+        assert_eq!(
+            decode_type(&mut Reader(&w.0)).unwrap(),
+            DataType::VARCHAR(300)
+        );
+        assert!(matches!(
+            decode_type(&mut Reader(&[TYPE_TAG_VARCHAR, 1])),
+            Err(PersistError::CorruptMeta(_))
+        ));
         assert!(matches!(
             decode_type(&mut Reader(&[200])),
             Err(PersistError::UnknownColumnType(200))
@@ -606,7 +635,7 @@ mod tests {
             ),
             (
                 PersistError::UnsupportedFormat(7),
-                "the data file has format version 7, but this cmudb reads version 1",
+                "the data file has format version 7, but this cmudb reads version 2",
             ),
             (
                 PersistError::CorruptMeta("x"),

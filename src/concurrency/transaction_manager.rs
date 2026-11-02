@@ -529,7 +529,11 @@ mod tests {
         let rid = insert_committed(&heap, b"abcd");
         let txn = mgr.begin(IsolationLevel::SnapshotIsolation);
         overwrite(&mgr, &heap, &txn, rid);
-        mgr.push_version(rid, TupleMeta::default(), vec![0; 3]);
+        mgr.push_version(
+            rid,
+            TupleMeta::default(),
+            vec![0; crate::table_page::TablePageRef::MAX_TUPLE_SIZE + 1],
+        );
         assert_eq!(mgr.version_chain_len(rid), 2);
 
         let err = mgr.abort(&txn).unwrap_err();
@@ -611,7 +615,11 @@ mod tests {
                         ts: txn.id(),
                         is_deleted: false,
                     },
-                    data: Some(vec![0; bytes.len() + 1]),
+                    data: Some(vec![
+                        0;
+                        bytes.len()
+                            + crate::table_page::TablePageRef::MAX_TUPLE_SIZE
+                    ]),
                 };
                 Ok::<_, TableHeapError>((write, (meta, bytes.to_vec())))
             },

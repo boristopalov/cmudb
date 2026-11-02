@@ -41,7 +41,10 @@ impl fmt::Display for TableHeapError {
             ),
             TableHeapError::Deleted { rid } => write!(f, "record {rid} has been deleted"),
             TableHeapError::TooLarge { size, max } => {
-                write!(f, "tuple of size {size} exceeds maximum {max}")
+                write!(
+                    f,
+                    "a row of {size} bytes does not fit in a page, which holds at most {max}"
+                )
             }
             TableHeapError::Bpm(e) => write!(f, "buffer pool error: {e}"),
             TableHeapError::Page { page_id, source } => write!(f, "page {page_id}: {source}"),
@@ -119,6 +122,9 @@ pub struct TableHeap {
     /// The page where the table starts.
     pub first_page_id: usize,
     tail: Mutex<Tail>,
+    /// Free bytes an insert leaves on a page that already holds rows, so that rows there can
+    /// grow (see [`TablePage::update_in_place`]).
+    update_reserve: usize,
 }
 
 struct Tail {
@@ -254,7 +260,17 @@ impl TableHeap {
                 page_id,
                 num_tuples: 0,
             }),
+            update_reserve: 0,
         })
+    }
+
+    /// The heap with inserts leaving `bytes` free on every page that already holds a row, for
+    /// updates that make rows longer. A row inserted on a fresh page is stored whatever its size.
+    pub fn with_update_reserve(self, bytes: usize) -> Self {
+        Self {
+            update_reserve: bytes,
+            ..self
+        }
     }
 
     /// The heap whose pages start at `first_page_id`, as an earlier [`TableHeap::new`] over
@@ -286,6 +302,7 @@ impl TableHeap {
                 page_id: page_id as usize,
                 num_tuples,
             }),
+            update_reserve: 0,
         })
     }
 
@@ -360,7 +377,12 @@ impl TableHeap {
             let mut guard = self.bpm.write_page(tail.page_id)?;
             let mut page =
                 TablePageMut::new(guard.data_mut()).map_err(|e| e.on_page(tail_page_id))?;
-            if page.can_insert(t.data.len()) {
+            let reserve = if page.num_tuples() == 0 {
+                0
+            } else {
+                self.update_reserve
+            };
+            if page.can_insert(t.data.len().saturating_add(reserve)) {
                 Some(
                     page.insert_with_meta(meta, &t.data)
                         .map_err(|e| e.on_page(tail_page_id))?,
@@ -547,8 +569,9 @@ impl TableHeap {
         self.write_with(rid, |_, _| Ok(SlotWrite { meta, data: None }))
     }
 
-    /// Overwrites a tuple and its metadata in place, keeping its record id. The new tuple
-    /// is the same size as the old one, or the write fails.
+    /// Overwrites a tuple and its metadata in place, keeping its record id. The new tuple may be
+    /// longer or shorter than the old one; when its page has no room for it, the write fails with
+    /// [`TablePageError::UpdateDoesNotFit`] and changes nothing.
     pub fn update_in_place(
         &self,
         rid: RecordId,
@@ -627,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn update_in_place_keeps_rid_and_rejects_size_change() {
+    fn update_in_place_keeps_rid_when_the_size_changes() {
         let (heap, _dir) = make_heap();
         let rid = heap
             .insert(&Tuple {
@@ -649,13 +672,47 @@ mod tests {
         let (got_meta, got) = heap.get_with_meta(rid).expect("get");
         assert_eq!(got.data, b"after!");
         assert_eq!(got_meta, meta);
+        for data in [vec![3; 3], vec![4; 40]] {
+            heap.update_in_place(rid, meta, &Tuple { data: data.clone() })
+                .expect("update to another size");
+            assert_eq!(heap.get(rid).unwrap().1.data, data);
+        }
+        heap.insert(&Tuple { data: vec![5] }).unwrap();
+        let too_long = Tuple {
+            data: vec![0; TablePageRef::MAX_TUPLE_SIZE],
+        };
         assert!(matches!(
-            heap.update_in_place(rid, meta, &Tuple { data: vec![0; 3] }),
+            heap.update_in_place(rid, meta, &too_long),
             Err(TableHeapError::Page {
                 page_id,
-                source: TablePageError::SizeChange { old: 6, new: 3, .. },
-            }) if page_id == rid.page_id
+                source: TablePageError::UpdateDoesNotFit { len, .. },
+            }) if page_id == rid.page_id && len == too_long.data.len()
         ));
+    }
+
+    #[test]
+    fn an_update_reserve_keeps_room_on_each_page_for_rows_to_grow() {
+        let (heap, _dir) = make_heap();
+        let heap = heap.with_update_reserve(1000);
+        let row = Tuple { data: vec![1; 100] };
+        let rids: Vec<_> = (0..200).map(|_| heap.insert(&row).unwrap()).collect();
+        let first_page: Vec<_> = rids
+            .iter()
+            .filter(|r| r.page_id == rids[0].page_id)
+            .collect();
+        assert!(rids.iter().any(|r| r.page_id != rids[0].page_id));
+        let grown = Tuple {
+            data: vec![2; 100 + 1000 / first_page.len()],
+        };
+        for rid in &first_page {
+            heap.update_in_place(**rid, TupleMeta::default(), &grown)
+                .expect("the reserve holds every row of the page growing a little");
+        }
+        let big = Tuple {
+            data: vec![3; TablePageRef::MAX_TUPLE_SIZE],
+        };
+        let rid = heap.insert(&big).unwrap();
+        assert_eq!(rid.slot_id, 0, "a fresh page takes a row of any size");
     }
 
     #[test]
