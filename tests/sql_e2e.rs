@@ -795,7 +795,7 @@ fn insert_values_naming_a_column_is_a_bind_error_and_inserts_nothing() {
 }
 
 #[test]
-fn binder_and_planner_errors_are_reported() {
+fn binder_errors_are_reported() {
     let db = emp_db();
     db.exec("CREATE TABLE dept (id INTEGER, name INTEGER)");
     let unsupported = BinderError::Unsupported;
