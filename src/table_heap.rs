@@ -7,17 +7,60 @@ use std::fmt;
 use std::sync::Arc;
 
 #[derive(Debug)]
-pub struct TableHeapError(pub String);
+pub enum TableHeapError {
+    /// The record's slot is past the end of its page's slot directory.
+    SlotMissing { rid: RecordId, num_slots: u16 },
+    /// The newest version of the record is a deletion.
+    Deleted { rid: RecordId },
+    /// The tuple is larger than a table page can hold.
+    TooLarge { size: usize, max: usize },
+    /// The buffer pool could not hand out a page.
+    Bpm(BpmError),
+    /// A table page rejected a read or write.
+    Page {
+        page_id: u32,
+        source: TablePageError,
+    },
+    /// The buffer pool returned a new page without a page id.
+    NewPageWithoutId,
+    /// The page id does not fit in the `u32` that record ids and page links store.
+    PageIdOutOfRange { page_id: usize },
+}
 
-impl From<TablePageError> for TableHeapError {
-    fn from(err: TablePageError) -> Self {
-        TableHeapError(err.0)
+impl fmt::Display for TableHeapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TableHeapError::SlotMissing { rid, num_slots } => write!(
+                f,
+                "slot {} does not exist on page {} (page has {num_slots} slots)",
+                rid.slot_id, rid.page_id
+            ),
+            TableHeapError::Deleted { rid } => write!(f, "record {rid} has been deleted"),
+            TableHeapError::TooLarge { size, max } => {
+                write!(f, "tuple of size {size} exceeds maximum {max}")
+            }
+            TableHeapError::Bpm(e) => write!(f, "buffer pool error: {e}"),
+            TableHeapError::Page { page_id, source } => write!(f, "page {page_id}: {source}"),
+            TableHeapError::NewPageWithoutId => write!(f, "new page has no page_id"),
+            TableHeapError::PageIdOutOfRange { page_id } => {
+                write!(f, "page id {page_id} exceeds RID capacity")
+            }
+        }
     }
 }
 
 impl From<BpmError> for TableHeapError {
     fn from(err: BpmError) -> Self {
-        TableHeapError(format!("buffer pool error: {err}"))
+        TableHeapError::Bpm(err)
+    }
+}
+
+impl TablePageError {
+    fn on_page(self, page_id: u32) -> TableHeapError {
+        TableHeapError::Page {
+            page_id,
+            source: self,
+        }
     }
 }
 
@@ -91,10 +134,7 @@ impl TableHeapIterator {
                 Ok(g) => g,
                 Err(e) => {
                     self.finished = true;
-                    return Some(Err(TableHeapError(format!(
-                        "failed to read page {} during scan: {e}",
-                        self.current_page_id
-                    ))));
+                    return Some(Err(e.into()));
                 }
             };
 
@@ -102,10 +142,7 @@ impl TableHeapIterator {
                 Ok(p) => p,
                 Err(e) => {
                     self.finished = true;
-                    return Some(Err(TableHeapError(format!(
-                        "failed to read page {} during scan: {}",
-                        self.current_page_id, e.0
-                    ))));
+                    return Some(Err(e.on_page(self.current_page_id)));
                 }
             };
 
@@ -135,10 +172,7 @@ impl TableHeapIterator {
                     Ok(bytes) => bytes,
                     Err(e) => {
                         self.finished = true;
-                        return Some(Err(TableHeapError(format!(
-                            "corrupt slot {slot_id} on page {} during scan: {}",
-                            self.current_page_id, e.0
-                        ))));
+                        return Some(Err(e.on_page(self.current_page_id)));
                     }
                 };
                 let rid = RecordId {
@@ -182,9 +216,7 @@ pub struct SlotWrite {
 impl TableHeap {
     pub fn new(bpm: Arc<BufferPoolManager>) -> Result<Self, TableHeapError> {
         let page_id = {
-            let mut page_guard = bpm
-                .new_page()
-                .map_err(|e| TableHeapError(format!("failed to allocate first page: {e}")))?;
+            let mut page_guard = bpm.new_page()?;
             let page_id = record_page_id(page_guard.page_id())?;
             TablePageMut::init(page_guard.data_mut());
             page_id as usize
@@ -234,34 +266,41 @@ impl TableHeap {
         tail: &mut MutexGuard<'_, Tail>,
     ) -> Result<RecordId, TableHeapError> {
         if t.data.len() > TablePageRef::MAX_TUPLE_SIZE {
-            return Err(TableHeapError(format!(
-                "tuple of size {} exceeds maximum {}",
-                t.data.len(),
-                TablePageRef::MAX_TUPLE_SIZE
-            )));
+            return Err(TableHeapError::TooLarge {
+                size: t.data.len(),
+                max: TablePageRef::MAX_TUPLE_SIZE,
+            });
         }
+        let tail_page_id = tail.page_id as u32;
         let slot_id = {
             let mut guard = self.bpm.write_page(tail.page_id)?;
-            let mut page = TablePageMut::new(guard.data_mut())?;
+            let mut page =
+                TablePageMut::new(guard.data_mut()).map_err(|e| e.on_page(tail_page_id))?;
             if page.can_insert(t.data.len()) {
-                Some(page.insert_with_meta(meta, &t.data)?)
+                Some(
+                    page.insert_with_meta(meta, &t.data)
+                        .map_err(|e| e.on_page(tail_page_id))?,
+                )
             } else {
                 None
             }
         };
         let (page_id, slot_id) = match slot_id {
-            Some(slot_id) => (tail.page_id as u32, slot_id),
+            Some(slot_id) => (tail_page_id, slot_id),
             None => {
                 let (new_id, slot_id) = {
                     let mut guard = self.bpm.new_page()?;
                     let page_id = record_page_id(guard.page_id())?;
-                    let slot_id =
-                        TablePage::init(guard.data_mut()).insert_with_meta(meta, &t.data)?;
+                    let slot_id = TablePage::init(guard.data_mut())
+                        .insert_with_meta(meta, &t.data)
+                        .map_err(|e| e.on_page(page_id))?;
                     (page_id, slot_id)
                 };
                 {
                     let mut guard = self.bpm.write_page(tail.page_id)?;
-                    TablePageMut::new(guard.data_mut())?.set_next_page_id(new_id);
+                    TablePageMut::new(guard.data_mut())
+                        .map_err(|e| e.on_page(tail_page_id))?
+                        .set_next_page_id(new_id);
                 }
                 (new_id, slot_id)
             }
@@ -278,7 +317,7 @@ impl TableHeap {
     pub fn delete(&self, rid: &RecordId) -> Result<(), TableHeapError> {
         self.write_with(*rid, |meta, _| {
             if meta.is_deleted {
-                return Err(TableHeapError(format!("record {rid} already deleted")));
+                return Err(TableHeapError::Deleted { rid: *rid });
             }
             Ok(SlotWrite {
                 meta: TupleMeta {
@@ -294,7 +333,7 @@ impl TableHeap {
     pub fn get(&self, rid: RecordId) -> Result<(RecordId, Tuple), TableHeapError> {
         let (meta, tuple) = self.get_with_meta(rid)?;
         if meta.is_deleted {
-            return Err(TableHeapError(format!("record {rid} has been deleted")));
+            return Err(TableHeapError::Deleted { rid });
         }
         Ok((rid, tuple))
     }
@@ -341,22 +380,18 @@ impl TableHeap {
         rid: RecordId,
         f: impl FnOnce(TupleMeta, &[u8]) -> R,
     ) -> Result<R, TableHeapError> {
-        let page_guard = bpm.read_page(rid.page_id as usize).map_err(|e| {
-            TableHeapError(format!(
-                "failed to acquire read lock on page {} for read of {rid}: {e}",
-                rid.page_id
-            ))
-        })?;
-        let table_page = TablePageRef::new(page_guard.data())?;
-        let slot = table_page.slot(rid.slot_id).ok_or_else(|| {
-            TableHeapError(format!(
-                "slot {} does not exist on page {} (page has {} slots)",
-                rid.slot_id,
-                rid.page_id,
-                table_page.num_tuples()
-            ))
-        })?;
-        let bytes = table_page.tuple_bytes(&slot)?;
+        let page_guard = bpm.read_page(rid.page_id as usize)?;
+        let table_page =
+            TablePageRef::new(page_guard.data()).map_err(|e| e.on_page(rid.page_id))?;
+        let slot = table_page
+            .slot(rid.slot_id)
+            .ok_or_else(|| TableHeapError::SlotMissing {
+                rid,
+                num_slots: table_page.num_tuples(),
+            })?;
+        let bytes = table_page
+            .tuple_bytes(&slot)
+            .map_err(|e| e.on_page(rid.page_id))?;
         Ok(f(slot.meta, bytes))
     }
 
@@ -385,36 +420,28 @@ impl TableHeap {
     where
         E: From<TableHeapError>,
     {
-        let mut page_guard = bpm.write_page(rid.page_id as usize).map_err(|e| {
-            TableHeapError(format!(
-                "failed to acquire write lock on page {} for write of {rid}: {e}",
-                rid.page_id
-            ))
-        })?;
+        let mut page_guard = bpm
+            .write_page(rid.page_id as usize)
+            .map_err(TableHeapError::from)?;
         let mut table_page =
-            TablePageMut::new(page_guard.data_mut()).map_err(TableHeapError::from)?;
-        let slot = table_page.slot(rid.slot_id).ok_or_else(|| {
-            TableHeapError(format!(
-                "slot {} does not exist on page {} (page has {} slots)",
-                rid.slot_id,
-                rid.page_id,
-                table_page.num_tuples()
-            ))
-        })?;
+            TablePageMut::new(page_guard.data_mut()).map_err(|e| e.on_page(rid.page_id))?;
+        let slot = table_page
+            .slot(rid.slot_id)
+            .ok_or_else(|| TableHeapError::SlotMissing {
+                rid,
+                num_slots: table_page.num_tuples(),
+            })?;
         let (write, planned) = {
             let bytes = table_page
                 .tuple_bytes(&slot)
-                .map_err(TableHeapError::from)?;
+                .map_err(|e| e.on_page(rid.page_id))?;
             f(slot.meta, bytes)?
         };
         match write.data {
-            Some(data) => table_page
-                .update_in_place(rid.slot_id, write.meta, &data)
-                .map_err(TableHeapError::from)?,
-            None => table_page
-                .update_meta(rid.slot_id, write.meta)
-                .map_err(TableHeapError::from)?,
+            Some(data) => table_page.update_in_place(rid.slot_id, write.meta, &data),
+            None => table_page.update_meta(rid.slot_id, write.meta),
         }
+        .map_err(|e| e.on_page(rid.page_id))?;
         Ok(then(planned))
     }
 
@@ -455,11 +482,11 @@ impl TableHeap {
 
 /// Converts a buffer pool page id into the `u32` stored in record ids and page links.
 fn record_page_id(page_id: Option<usize>) -> Result<u32, TableHeapError> {
-    let page_id = page_id.ok_or_else(|| TableHeapError("new page has no page_id".to_string()))?;
+    let page_id = page_id.ok_or(TableHeapError::NewPageWithoutId)?;
     u32::try_from(page_id)
         .ok()
         .filter(|&id| id != NO_NEXT_PAGE)
-        .ok_or_else(|| TableHeapError(format!("page id {page_id} exceeds RID capacity")))
+        .ok_or(TableHeapError::PageIdOutOfRange { page_id })
 }
 
 #[cfg(test)]
@@ -506,11 +533,11 @@ mod tests {
             .expect("insert");
         heap.delete(&rid).expect("delete");
         assert!(
-            heap.get(rid).is_err(),
+            matches!(heap.get(rid), Err(TableHeapError::Deleted { rid: r }) if r == rid),
             "get should fail on a tombstoned record"
         );
         assert!(
-            heap.delete(&rid).is_err(),
+            matches!(heap.delete(&rid), Err(TableHeapError::Deleted { rid: r }) if r == rid),
             "double-delete should be rejected"
         );
     }
@@ -538,10 +565,13 @@ mod tests {
         let (got_meta, got) = heap.get_with_meta(rid).expect("get");
         assert_eq!(got.data, b"after!");
         assert_eq!(got_meta, meta);
-        assert!(
-            heap.update_in_place(rid, meta, &Tuple { data: vec![0; 3] })
-                .is_err()
-        );
+        assert!(matches!(
+            heap.update_in_place(rid, meta, &Tuple { data: vec![0; 3] }),
+            Err(TableHeapError::Page {
+                page_id,
+                source: TablePageError::SizeChange { old: 6, new: 3, .. },
+            }) if page_id == rid.page_id
+        ));
     }
 
     #[test]
@@ -552,9 +582,18 @@ mod tests {
                 data: b"keep".to_vec(),
             })
             .unwrap();
-        let res: Result<(), TableHeapError> =
-            heap.write_with(rid, |_, _| Err(TableHeapError("refused".to_string())));
-        assert!(res.is_err());
+        #[derive(Debug)]
+        enum WriteRefused {
+            Refused,
+            Heap,
+        }
+        impl From<TableHeapError> for WriteRefused {
+            fn from(_: TableHeapError) -> Self {
+                WriteRefused::Heap
+            }
+        }
+        let res = heap.write_with(rid, |_, _| Err(WriteRefused::Refused));
+        assert!(matches!(res, Err(WriteRefused::Refused)));
         let (meta, t) = heap.get_with_meta(rid).unwrap();
         assert_eq!(t.data, b"keep");
         assert_eq!(meta, TupleMeta::default());
@@ -593,7 +632,7 @@ mod tests {
             if i % 4 == 0 && !live.is_empty() {
                 let (rid, _) = live.remove(0);
                 heap.delete(&rid).expect("delete");
-                assert!(heap.get(rid).is_err());
+                assert!(matches!(heap.get(rid), Err(TableHeapError::Deleted { .. })));
             }
         }
 
@@ -601,6 +640,104 @@ mod tests {
             let (_, got) = heap.get(*rid).expect("final get");
             assert_eq!(&got.data, expected);
         }
+    }
+
+    #[test]
+    fn insert_rejects_a_tuple_larger_than_a_page() {
+        let (heap, _dir) = make_heap();
+        let too_big = Tuple {
+            data: vec![0; TablePageRef::MAX_TUPLE_SIZE + 1],
+        };
+        assert!(matches!(
+            heap.insert(&too_big),
+            Err(TableHeapError::TooLarge { size, max })
+                if size == TablePageRef::MAX_TUPLE_SIZE + 1 && max == TablePageRef::MAX_TUPLE_SIZE
+        ));
+    }
+
+    #[test]
+    fn reads_and_writes_of_a_missing_slot_report_slot_missing() {
+        let (heap, _dir) = make_heap();
+        let rid = heap
+            .insert(&Tuple {
+                data: b"only".to_vec(),
+            })
+            .unwrap();
+        let missing = RecordId {
+            slot_id: rid.slot_id + 1,
+            ..rid
+        };
+        assert!(matches!(
+            heap.get(missing),
+            Err(TableHeapError::SlotMissing { rid: r, num_slots: 1 }) if r == missing
+        ));
+        assert!(matches!(
+            heap.update_meta(missing, TupleMeta::default()),
+            Err(TableHeapError::SlotMissing { rid: r, num_slots: 1 }) if r == missing
+        ));
+    }
+
+    #[test]
+    fn a_corrupt_page_is_reported_with_its_page_id() {
+        let (heap, _dir) = make_heap();
+        let rid = heap
+            .insert(&Tuple {
+                data: b"row".to_vec(),
+            })
+            .unwrap();
+        {
+            let mut guard = heap.bpm.write_page(rid.page_id as usize).unwrap();
+            guard.data_mut().fill(u8::MAX);
+        }
+        let is_corrupt_header = |r: Result<_, TableHeapError>| {
+            matches!(
+                r,
+                Err(TableHeapError::Page {
+                    page_id,
+                    source: TablePageError::CorruptHeader { .. },
+                }) if page_id == rid.page_id
+            )
+        };
+        assert!(is_corrupt_header(heap.get(rid).map(|_| ())));
+        assert!(is_corrupt_header(heap.delete(&rid)));
+        assert!(is_corrupt_header(heap.iter().next().unwrap().map(|_| ())));
+    }
+
+    #[test]
+    fn errors_display_the_record_and_page_they_concern() {
+        let rid = RecordId {
+            page_id: 3,
+            slot_id: 4,
+        };
+        assert_eq!(
+            TableHeapError::Deleted { rid }.to_string(),
+            "record page_id: 3, slot_id: 4 has been deleted"
+        );
+        assert_eq!(
+            TableHeapError::Page {
+                page_id: 3,
+                source: TablePageError::AlreadyDeleted { slot: 4 },
+            }
+            .to_string(),
+            "page 3: slot 4 already deleted"
+        );
+        assert_eq!(
+            TableHeapError::Bpm(BpmError::NoFreeFrame).to_string(),
+            "buffer pool error: No free frame available"
+        );
+    }
+
+    #[test]
+    fn record_page_id_rejects_ids_that_do_not_fit_a_record_id() {
+        assert!(matches!(
+            record_page_id(None),
+            Err(TableHeapError::NewPageWithoutId)
+        ));
+        assert!(matches!(
+            record_page_id(Some(NO_NEXT_PAGE as usize)),
+            Err(TableHeapError::PageIdOutOfRange { page_id }) if page_id == NO_NEXT_PAGE as usize
+        ));
+        assert_eq!(record_page_id(Some(7)).unwrap(), 7);
     }
 
     #[test]

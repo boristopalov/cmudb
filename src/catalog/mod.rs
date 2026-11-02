@@ -79,8 +79,8 @@ impl Catalog {
             return Err(CatalogError::TableExists);
         }
 
-        let heap =
-            TableHeap::new(self.bpm.clone()).map_err(|e| CatalogError::TableCreationError(e.0))?;
+        let heap = TableHeap::new(self.bpm.clone())
+            .map_err(|e| CatalogError::TableCreationError(e.to_string()))?;
         let tinfo = TableInfo {
             name: name.clone(),
             schema,
@@ -170,7 +170,7 @@ impl Catalog {
         .map_err(|e| CatalogError::IndexCreationError(format!("failed to create index: {e}")))?;
         for row in table.heap.iter() {
             let (tuple, rid) = row.map_err(|e| {
-                CatalogError::IndexCreationError(format!("failed to scan table: {}", e.0))
+                CatalogError::IndexCreationError(format!("failed to scan table: {e}"))
             })?;
             let key = index.key_of_tuple(&tuple).map_err(|e| {
                 CatalogError::IndexCreationError(format!("failed to index row {rid}: {e}"))

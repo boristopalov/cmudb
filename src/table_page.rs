@@ -25,12 +25,74 @@ use crate::buf::{get_u16_le, get_u32_le, get_u64_le, put_u16_le, put_u32_le, put
 use crate::disk::PAGE_SIZE;
 use std::fmt;
 
-#[derive(Debug)]
-pub struct TablePageError(pub String);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TablePageError {
+    /// The buffer is not exactly one page long.
+    WrongSize { len: usize },
+    /// The header's slot directory runs into the tuple area, or the tuple area starts past
+    /// the end of the page.
+    CorruptHeader {
+        directory_end: usize,
+        free_space_offset: usize,
+    },
+    /// A slot's byte range lies outside the page's tuple area.
+    SlotOutOfBounds {
+        offset: u32,
+        size: u32,
+        tuple_area_start: u32,
+    },
+    /// The tuple and its slot do not fit in the page's free space.
+    DoesNotFit { len: usize },
+    /// The page already holds `u16::MAX` slots.
+    SlotCountOverflow,
+    /// The slot id is past the end of the slot directory.
+    SlotMissing { slot: u32, num_slots: u16 },
+    /// The slot is already a deletion marker.
+    AlreadyDeleted { slot: u32 },
+    /// The deleted-tuple counter would overflow or drop below zero for a change to `slot`.
+    CorruptDeletedCounter { count: u16, slot: u32 },
+    /// An in-place update would change the tuple's size.
+    SizeChange { slot: u32, old: u32, new: usize },
+}
 
 impl fmt::Display for TablePageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            TablePageError::WrongSize { len } => {
+                write!(f, "table page must be {PAGE_SIZE} bytes, got {len}")
+            }
+            TablePageError::CorruptHeader {
+                directory_end,
+                free_space_offset,
+            } => write!(
+                f,
+                "slot directory ends at {directory_end} but tuple area starts at {free_space_offset}"
+            ),
+            TablePageError::SlotOutOfBounds {
+                offset,
+                size,
+                tuple_area_start,
+            } => write!(
+                f,
+                "slot points outside tuple area (offset {offset}, size {size}, tuple area starts at {tuple_area_start})"
+            ),
+            TablePageError::DoesNotFit { len } => {
+                write!(f, "tuple of {len} bytes does not fit on page")
+            }
+            TablePageError::SlotCountOverflow => write!(f, "table page slot count overflow"),
+            TablePageError::SlotMissing { slot, num_slots } => {
+                write!(f, "slot {slot} does not exist (page has {num_slots} slots)")
+            }
+            TablePageError::AlreadyDeleted { slot } => write!(f, "slot {slot} already deleted"),
+            TablePageError::CorruptDeletedCounter { count, slot } => write!(
+                f,
+                "deleted-tuple counter {count} is corrupt for a change to slot {slot}"
+            ),
+            TablePageError::SizeChange { slot, old, new } => write!(
+                f,
+                "in-place update of slot {slot} changes its size from {old} to {new}"
+            ),
+        }
     }
 }
 
@@ -90,16 +152,15 @@ impl<B: AsRef<[u8]>> TablePage<B> {
         let page = Self { buf };
         let len = page.bytes().len();
         if len != PAGE_SIZE {
-            return Err(TablePageError(format!(
-                "table page must be {PAGE_SIZE} bytes, got {len}"
-            )));
+            return Err(TablePageError::WrongSize { len });
         }
         let directory_end = page.directory_end();
         let free = page.free_space_offset() as usize;
         if directory_end > free || free > PAGE_SIZE {
-            return Err(TablePageError(format!(
-                "slot directory ends at {directory_end} but tuple area starts at {free}"
-            )));
+            return Err(TablePageError::CorruptHeader {
+                directory_end,
+                free_space_offset: free,
+            });
         }
         Ok(page)
     }
@@ -158,10 +219,11 @@ impl<B: AsRef<[u8]>> TablePage<B> {
             || meta.offset - meta.size < free
             || meta.offset as usize > PAGE_SIZE
         {
-            return Err(TablePageError(format!(
-                "slot points outside tuple area (offset {}, size {}, tuple area starts at {free})",
-                meta.offset, meta.size
-            )));
+            return Err(TablePageError::SlotOutOfBounds {
+                offset: meta.offset,
+                size: meta.size,
+                tuple_area_start: free,
+            });
         }
         Ok(&self.bytes()[meta.range()])
     }
@@ -206,13 +268,13 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> TablePage<B> {
         data: &[u8],
     ) -> Result<u32, TablePageError> {
         if !self.can_insert(data.len()) {
-            return Err(TablePageError("tuple does not fit on page".to_string()));
+            return Err(TablePageError::DoesNotFit { len: data.len() });
         }
         let num_tuples = self.num_tuples();
         let slot = u32::from(num_tuples);
         let new_num_tuples = num_tuples
             .checked_add(1)
-            .ok_or_else(|| TablePageError("table page slot count overflow".to_string()))?;
+            .ok_or(TablePageError::SlotCountOverflow)?;
         let offset = self.free_space_offset();
         let size = data.len() as u32;
         let start = offset - size;
@@ -232,11 +294,9 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> TablePage<B> {
     }
 
     fn existing_slot(&self, slot: u32) -> Result<Slot, TablePageError> {
-        self.slot(slot).ok_or_else(|| {
-            TablePageError(format!(
-                "slot {slot} does not exist (page has {} slots)",
-                self.num_tuples()
-            ))
+        self.slot(slot).ok_or_else(|| TablePageError::SlotMissing {
+            slot,
+            num_slots: self.num_tuples(),
         })
     }
 
@@ -244,10 +304,13 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> TablePage<B> {
     pub fn mark_deleted(&mut self, slot: u32) -> Result<(), TablePageError> {
         let current = self.existing_slot(slot)?;
         if current.meta.is_deleted {
-            return Err(TablePageError(format!("slot {slot} already deleted")));
+            return Err(TablePageError::AlreadyDeleted { slot });
         }
         if self.num_deleted_tuples() == u16::MAX {
-            return Err(TablePageError("deleted-tuple counter overflow".to_string()));
+            return Err(TablePageError::CorruptDeletedCounter {
+                count: u16::MAX,
+                slot,
+            });
         }
         self.update_meta(
             slot,
@@ -269,11 +332,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> TablePage<B> {
             (true, false) => count.checked_sub(1),
             _ => Some(count),
         }
-        .ok_or_else(|| {
-            TablePageError(format!(
-                "deleted-tuple counter {count} is corrupt for a change to slot {slot}"
-            ))
-        })?;
+        .ok_or(TablePageError::CorruptDeletedCounter { count, slot })?;
         let base = Self::slot_base(slot);
         let b = self.bytes_mut();
         put_u64_le(b, base + SLOT_TS_OFF, meta.ts);
@@ -293,11 +352,11 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> TablePage<B> {
     ) -> Result<(), TablePageError> {
         let current = self.existing_slot(slot)?;
         if current.size as usize != data.len() {
-            return Err(TablePageError(format!(
-                "in-place update of slot {slot} changes its size from {} to {}",
-                current.size,
-                data.len()
-            )));
+            return Err(TablePageError::SizeChange {
+                slot,
+                old: current.size,
+                new: data.len(),
+            });
         }
         self.tuple_bytes(&current)?;
         self.update_meta(slot, meta)?;
@@ -353,8 +412,19 @@ mod tests {
         page.insert(b"x").unwrap();
         page.insert(b"y").unwrap();
         page.mark_deleted(1).unwrap();
-        assert!(page.mark_deleted(1).is_err(), "double delete rejected");
-        assert!(page.mark_deleted(2).is_err(), "missing slot rejected");
+        assert_eq!(
+            page.mark_deleted(1),
+            Err(TablePageError::AlreadyDeleted { slot: 1 }),
+            "double delete rejected"
+        );
+        assert_eq!(
+            page.mark_deleted(2),
+            Err(TablePageError::SlotMissing {
+                slot: 2,
+                num_slots: 2
+            }),
+            "missing slot rejected"
+        );
         assert_eq!(page.num_deleted_tuples(), 1);
         assert!(!page.slot(0).unwrap().meta.is_deleted);
         assert!(page.slot(1).unwrap().meta.is_deleted);
@@ -396,7 +466,14 @@ mod tests {
             is_deleted: false,
         };
         page.update_in_place(0, meta, b"new").unwrap();
-        assert!(page.update_in_place(0, meta, b"long").is_err());
+        assert_eq!(
+            page.update_in_place(0, meta, b"long"),
+            Err(TablePageError::SizeChange {
+                slot: 0,
+                old: 3,
+                new: 4
+            })
+        );
         let s0 = page.slot(0).unwrap();
         let s1 = page.slot(1).unwrap();
         assert_eq!(page.tuple_bytes(&s0).unwrap(), b"new");
@@ -411,8 +488,12 @@ mod tests {
         page.insert(b"x").unwrap();
         put_u16_le(&mut buf, NUM_DELETED_OFF, u16::MAX);
         let mut page = TablePageMut::new(&mut buf[..]).unwrap();
-        assert!(
-            page.mark_deleted(0).is_err(),
+        assert_eq!(
+            page.mark_deleted(0),
+            Err(TablePageError::CorruptDeletedCounter {
+                count: u16::MAX,
+                slot: 0
+            }),
             "counter overflow is reported"
         );
         assert!(
@@ -433,7 +514,10 @@ mod tests {
             is_deleted: false,
             ..page.slot(0).unwrap().meta
         };
-        assert!(page.update_meta(0, live).is_err());
+        assert_eq!(
+            page.update_meta(0, live),
+            Err(TablePageError::CorruptDeletedCounter { count: 0, slot: 0 })
+        );
         assert!(page.slot(0).unwrap().meta.is_deleted);
         assert_eq!(page.num_deleted_tuples(), 0);
     }
@@ -451,7 +535,10 @@ mod tests {
             is_deleted: false,
             ..before.meta
         };
-        assert!(page.update_in_place(0, live, b"new").is_err());
+        assert_eq!(
+            page.update_in_place(0, live, b"new"),
+            Err(TablePageError::CorruptDeletedCounter { count: 0, slot: 0 })
+        );
         let after = page.slot(0).unwrap();
         assert_eq!(after.meta, before.meta);
         assert_eq!(page.tuple_bytes(&after).unwrap(), b"old");
@@ -464,7 +551,7 @@ mod tests {
         let big = vec![1u8; TablePageMut::MAX_TUPLE_SIZE];
         page.insert(&big).unwrap();
         assert!(!page.can_insert(0));
-        assert!(page.insert(b"").is_err());
+        assert_eq!(page.insert(b""), Err(TablePageError::DoesNotFit { len: 0 }));
         let meta = page.slot(0).unwrap();
         assert_eq!(page.tuple_bytes(&meta).unwrap(), &big[..]);
     }
@@ -475,7 +562,13 @@ mod tests {
         TablePage::init(&mut buf[..]);
         put_u16_le(&mut buf, NUM_TUPLES_OFF, u16::MAX);
         assert!(
-            TablePageRef::new(&buf[..]).is_err(),
+            matches!(
+                TablePageRef::new(&buf[..]),
+                Err(TablePageError::CorruptHeader {
+                    free_space_offset: PAGE_SIZE,
+                    ..
+                })
+            ),
             "more slots than fit before the tuple area"
         );
     }
@@ -485,7 +578,32 @@ mod tests {
         let mut buf = [0u8; PAGE_SIZE];
         TablePage::init(&mut buf[..]);
         put_u32_le(&mut buf, FREE_SPACE_OFF, PAGE_SIZE as u32 + 1);
-        assert!(TablePageRef::new(&buf[..]).is_err());
+        assert!(matches!(
+            TablePageRef::new(&buf[..]),
+            Err(TablePageError::CorruptHeader {
+                free_space_offset,
+                ..
+            }) if free_space_offset == PAGE_SIZE + 1
+        ));
+    }
+
+    #[test]
+    fn new_rejects_a_buffer_that_is_not_one_page() {
+        let buf = [0u8; PAGE_SIZE - 1];
+        assert!(matches!(
+            TablePageRef::new(&buf[..]),
+            Err(TablePageError::WrongSize { len }) if len == PAGE_SIZE - 1
+        ));
+    }
+
+    #[test]
+    fn insert_rejects_a_page_with_u16_max_slots() {
+        let mut buf = [0u8; PAGE_SIZE];
+        TablePage::init(&mut buf[..]);
+        put_u16_le(&mut buf, NUM_TUPLES_OFF, u16::MAX);
+        put_u32_le(&mut buf, FREE_SPACE_OFF, u32::MAX);
+        let mut page = TablePage { buf: &mut buf[..] };
+        assert_eq!(page.insert(b""), Err(TablePageError::SlotCountOverflow));
     }
 
     #[test]
@@ -498,6 +616,13 @@ mod tests {
             size: 4,
             meta: TupleMeta::default(),
         };
-        assert!(page.tuple_bytes(&bogus).is_err());
+        assert_eq!(
+            page.tuple_bytes(&bogus),
+            Err(TablePageError::SlotOutOfBounds {
+                offset: 10,
+                size: 4,
+                tuple_area_start: page.free_space_offset()
+            })
+        );
     }
 }

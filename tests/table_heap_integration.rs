@@ -1,7 +1,7 @@
 use cmudb::buffer_pool::BufferPoolManager;
 use cmudb::disk::PAGE_SIZE;
-use cmudb::table_heap::{RecordId, TableHeap, TableHeapIterator, Tuple};
-use cmudb::table_page::{TablePageRef, TupleMeta};
+use cmudb::table_heap::{RecordId, TableHeap, TableHeapError, TableHeapIterator, Tuple};
+use cmudb::table_page::{TablePageError, TablePageRef, TupleMeta};
 use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use tempfile::TempDir;
@@ -94,11 +94,17 @@ fn oversized_insert_and_update_leave_page_bytes_and_original_row_unchanged() {
     let oversized = Tuple {
         data: vec![0xff; TablePageRef::MAX_TUPLE_SIZE + 1],
     };
-    assert!(heap.insert(&oversized).is_err());
-    assert!(
-        heap.update_in_place(rid, TupleMeta::default(), &oversized)
-            .is_err()
-    );
+    assert!(matches!(
+        heap.insert(&oversized),
+        Err(TableHeapError::TooLarge { .. })
+    ));
+    assert!(matches!(
+        heap.update_in_place(rid, TupleMeta::default(), &oversized),
+        Err(TableHeapError::Page {
+            source: TablePageError::SizeChange { .. },
+            ..
+        })
+    ));
     assert_eq!(heap.last_page_id(), heap.first_page_id);
     assert_eq!(bpm.read_page(heap.first_page_id).unwrap().data(), before);
     assert_eq!(heap.get(rid).unwrap().1.data, original.data);
@@ -117,11 +123,14 @@ fn unavailable_frame_during_insert_or_update_preserves_existing_rows() {
     let replacement = Tuple {
         data: vec![8; TablePageRef::MAX_TUPLE_SIZE],
     };
-    assert!(heap.insert(&replacement).is_err());
-    assert!(
-        heap.update_in_place(rid, TupleMeta::default(), &replacement)
-            .is_err()
-    );
+    assert!(matches!(
+        heap.insert(&replacement),
+        Err(TableHeapError::Bpm(_))
+    ));
+    assert!(matches!(
+        heap.update_in_place(rid, TupleMeta::default(), &replacement),
+        Err(TableHeapError::Bpm(_))
+    ));
     drop(pin_only_frame_so_heap_cannot_load_its_page);
     assert_eq!(heap.last_page_id(), heap.first_page_id);
     assert_eq!(heap.get(rid).unwrap().1.data, original.data);
@@ -226,16 +235,19 @@ fn updating_invalid_rid_does_not_append_a_replacement() {
     let (heap, _bpm, _dir) = make_heap(1);
     let tuple = Tuple { data: vec![1] };
     let rid = heap.insert(&tuple).unwrap();
-    assert!(
+    assert!(matches!(
         heap.update_in_place(
             RecordId { slot_id: 10, ..rid },
             TupleMeta::default(),
             &tuple
-        )
-        .is_err()
-    );
+        ),
+        Err(TableHeapError::SlotMissing { num_slots: 1, .. })
+    ));
     assert_eq!(rows(heap.iter()).len(), 1);
     heap.delete(&rid).unwrap();
-    assert!(heap.delete(&rid).is_err());
+    assert!(matches!(
+        heap.delete(&rid),
+        Err(TableHeapError::Deleted { rid: deleted }) if deleted == rid
+    ));
     assert!(rows(heap.iter()).is_empty());
 }

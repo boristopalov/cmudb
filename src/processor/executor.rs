@@ -34,7 +34,7 @@ impl From<CatalogError> for ExecutorError {
 
 impl From<TableHeapError> for ExecutorError {
     fn from(e: TableHeapError) -> Self {
-        ExecutorError(format!("table heap error: {:?}", e))
+        ExecutorError(format!("table heap error: {e}"))
     }
 }
 

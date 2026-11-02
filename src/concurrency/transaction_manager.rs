@@ -32,7 +32,7 @@ impl fmt::Display for TxnError {
 
 impl From<TableHeapError> for TxnError {
     fn from(e: TableHeapError) -> Self {
-        TxnError::Storage(e.0)
+        TxnError::Storage(e.to_string())
     }
 }
 

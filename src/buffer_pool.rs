@@ -154,11 +154,15 @@ impl<'a> Drop for PageMut<'a> {
 
 #[derive(Debug)]
 pub enum BpmError {
-    Poisoned,
     NoFreeFrame,
-    FrameMissing,
-    MutexPanic,
-    FramePinned,
+    /// The frame id is past the end of the pool's frames.
+    FrameOutOfRange {
+        frame_id: usize,
+    },
+    /// A flush asked for a page that is not in any frame.
+    PageNotCached {
+        page_id: usize,
+    },
     ChannelClosed,
     Io(io::Error),
     FrameInUse,
@@ -167,16 +171,18 @@ pub enum BpmError {
 impl fmt::Display for BpmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BpmError::Poisoned => write!(f, "Lock poisoned"),
             BpmError::NoFreeFrame => {
                 write!(f, "No free frame available")
             }
             BpmError::Io(e) => {
                 write!(f, "io error: {}", e)
             }
-            BpmError::FrameMissing => write!(f, "Frame missing"),
-            BpmError::MutexPanic => write!(f, "Mutex panicked"),
-            BpmError::FramePinned => write!(f, "Cannot evict a frame which is pinned"),
+            BpmError::FrameOutOfRange { frame_id } => {
+                write!(f, "Frame {frame_id} is out of range")
+            }
+            BpmError::PageNotCached { page_id } => {
+                write!(f, "Page {page_id} is not in the buffer pool")
+            }
             BpmError::ChannelClosed => write!(f, "Channel closed"),
             BpmError::FrameInUse => write!(f, "Frame in use"),
         }
@@ -338,7 +344,9 @@ impl BufferPoolManager {
     }
 
     fn frame(&self, frame_id: usize) -> Result<&RwLock<FrameHeader>, BpmError> {
-        self.frames.get(frame_id).ok_or(BpmError::FrameMissing)
+        self.frames
+            .get(frame_id)
+            .ok_or(BpmError::FrameOutOfRange { frame_id })
     }
 
     fn load_into_free_frame(
@@ -522,7 +530,7 @@ impl BufferPoolManager {
         info!("flush_page: flushing page page_id={page_id}");
         let Some(frame_id) = self.meta.lock().page_table.get(&page_id).copied() else {
             warn!("tried to flush page with page_id={page_id} but could not find its frame");
-            return Err(BpmError::FrameMissing);
+            return Err(BpmError::PageNotCached { page_id });
         };
 
         let frame = self.frame(frame_id)?.read();
@@ -612,9 +620,15 @@ mod tests {
                     for round in 0..3_000 {
                         let page_id = (worker * 7 + round) % page_count;
                         let reported_missing = if worker % 3 == 0 {
-                            matches!(bpm.write_page(page_id), Err(BpmError::FrameMissing))
+                            matches!(
+                                bpm.write_page(page_id),
+                                Err(BpmError::FrameOutOfRange { .. })
+                            )
                         } else {
-                            matches!(bpm.read_page(page_id), Err(BpmError::FrameMissing))
+                            matches!(
+                                bpm.read_page(page_id),
+                                Err(BpmError::FrameOutOfRange { .. })
+                            )
                         };
                         if reported_missing {
                             missing_frames.fetch_add(1, Ordering::Relaxed);
@@ -629,8 +643,31 @@ mod tests {
         assert_eq!(
             missing_frames.load(Ordering::Relaxed),
             0,
-            "a page that exists was reported as FrameMissing"
+            "a page that exists was reported as FrameOutOfRange"
         );
+    }
+
+    #[test]
+    fn flushing_a_page_that_is_not_cached_reports_it() {
+        let (bpm, _dir) = crate::testing::bpm(1);
+        let first = bpm.new_page().unwrap().page_id().unwrap();
+        let second = bpm.new_page().unwrap().page_id().unwrap();
+        assert!(!bpm.is_resident(first));
+        assert!(matches!(
+            bpm.flush_page(first),
+            Err(BpmError::PageNotCached { page_id }) if page_id == first
+        ));
+        assert!(bpm.flush_page(second).is_ok());
+    }
+
+    #[test]
+    fn a_frame_id_past_the_pool_is_out_of_range() {
+        let (bpm, _dir) = crate::testing::bpm(2);
+        assert!(bpm.frame(1).is_ok());
+        assert!(matches!(
+            bpm.frame(2),
+            Err(BpmError::FrameOutOfRange { frame_id: 2 })
+        ));
     }
 
     #[test]
