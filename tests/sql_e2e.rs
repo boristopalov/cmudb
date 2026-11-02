@@ -1273,6 +1273,11 @@ fn integer_literals_widen_into_bigint_and_float_columns() {
     db.exec("CREATE TABLE t (i INT, b BIGINT, f FLOAT)");
     db.exec("INSERT INTO t VALUES (1, 1, 1), (2, 2147483648, 2.5), (-2147483648, -3, -4)");
     db.exec("INSERT INTO t (f, i) VALUES (16777217, 5)");
+    db.exec("INSERT INTO t (i, b) VALUES (6, -9223372036854775808)");
+    assert_eq!(
+        db.exec("SELECT b FROM t WHERE i = 6"),
+        vec![vec![Some(Value::BIGINT(i64::MIN))]]
+    );
     assert_eq!(
         db.exec("SELECT * FROM t WHERE i = 5"),
         vec![vec![int(5), None, Some(Value::float(16_777_217.0))]]

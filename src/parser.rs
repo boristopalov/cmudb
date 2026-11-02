@@ -609,6 +609,13 @@ impl<'a> Binder<'a> {
                 op: op @ (UnaryOperator::Minus | UnaryOperator::Plus),
                 expr: inner,
             } => {
+                if let (UnaryOperator::Minus, Expr::Value(v)) = (op, inner.as_ref())
+                    && let SqlValue::Number(s, _) = &v.value
+                {
+                    return Ok(Expression::Constant(Some(number_literal(&format!(
+                        "-{s}"
+                    ))?)));
+                }
                 let inner = self.resolve_expr(inner, scope)?;
                 if let Some(t) = inner.dtype()
                     && !t.is_numeric()
@@ -1687,8 +1694,9 @@ fn number_literal(literal: &str) -> Result<Value, BinderError> {
     }
 }
 
-/// `-inner` for a numeric (or NULL) expression. A constant is negated here, so `-2147483648`
-/// is an INT; any other expression becomes `0 - inner`.
+/// `-inner` for a numeric (or NULL) expression. A constant is negated here; any other
+/// expression becomes `0 - inner`. `resolve_expr` reads a negative number literal such as
+/// `-9223372036854775808` as one literal before calling this.
 fn negate(inner: Expression) -> Result<Expression, BinderError> {
     match inner {
         Expression::Constant(None) => Ok(Expression::Constant(None)),
