@@ -10,70 +10,24 @@ on:
         required: true
         type: number
 
-concurrency:
-  group: claude-review-${{ github.event.pull_request.number || inputs.pr_number }}
-  cancel-in-progress: true
-
 jobs:
   review:
-    runs-on: ubuntu-latest
+    uses: boristopalov/agent-factory/.github/workflows/review.yml@main
+    with:
+      pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
+      hint: |
+        cmudb is a Rust DBMS modeled on CMU's BusTub (buffer pool, disk scheduler,
+        table heap, B+ tree index with latch crabbing, binder/planner/executors).
+        Also check:
+        - SQL semantics: NULL handling, joins, aggregates.
+        - Page and slot layout: off-by-one errors in offsets and sizes.
+        - Concurrency: latch and lock ordering, pins that are never released, guards
+          held across I/O or across calls that can re-enter the buffer pool.
+        - The comment policy in CONTRIBUTING.md: knowledge that should be in code
+          (types, asserts, Result errors, named constants, tests), not comments.
+    secrets: inherit
     permissions:
       contents: read
       pull-requests: write
       issues: read
       id-token: write
-    env:
-      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
-    steps:
-      - name: Check for the review token
-        id: token
-        env:
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-        run: |
-          if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::CLAUDE_CODE_OAUTH_TOKEN is not set (or this is a fork PR); skipping the Claude review."
-          fi
-
-      - uses: actions/checkout@v5
-        if: steps.token.outputs.present == 'true'
-        with:
-          fetch-depth: 0
-          ref: refs/pull/${{ env.PR_NUMBER }}/head
-
-      - uses: anthropics/claude-code-action@v1
-        if: steps.token.outputs.present == 'true'
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          prompt: |
-            REPO: ${{ github.repository }}
-            PR NUMBER: ${{ env.PR_NUMBER }}
-
-            You are reviewing a pull request to cmudb, a Rust DBMS modeled on CMU's BusTub
-            (buffer pool, disk scheduler, table heap, B+ tree index with latch crabbing,
-            binder/planner/executors). Read CONTRIBUTING.md first.
-
-            Review only the changes in this PR (use `gh pr diff`), reading surrounding code
-            as needed. Report real problems, most severe first:
-            1. Correctness: wrong results, SQL semantics (NULL handling, joins, aggregates),
-               off-by-one errors in page/slot layout, error paths that leave partial state.
-            2. Concurrency: latch and lock ordering, pins that are never released, guards held
-               across I/O or across calls that can re-enter the buffer pool, data races,
-               possible deadlocks.
-            3. Hidden knowledge: comments, or behavior a reader has to remember, that should be
-               expressed in code (types, asserts, Result errors, named constants, tests) per
-               the comment policy in CONTRIBUTING.md.
-            4. Tests: whether the change is covered, including failure paths, and whether the
-               tests check what their names claim.
-
-            Post each finding as an inline comment on the line it concerns, with a concrete
-            failure scenario and a suggested fix. If the inline comment tool is not available
-            (manual runs), put every finding in the summary comment instead, each with its
-            file:line. Skip style nits that fmt or clippy would catch. Finish with one short
-            top-level PR comment (`gh pr comment`) summarizing the findings, or saying that you
-            found none.
-          claude_args: >-
-            --max-turns 30
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob"
