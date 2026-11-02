@@ -128,11 +128,7 @@ fn lookup_and_scan(c: &mut Criterion) {
     insert_all(&tree, &shuffled(LOOKUP_KEYS));
     let probes = shuffled(LOOKUP_KEYS);
     assert_tree_holds(&tree, LOOKUP_KEYS);
-    let tree_pages = bpm
-        .new_page()
-        .expect("new page")
-        .page_id()
-        .expect("page id");
+    let tree_pages = bpm.allocated_page_count();
     assert!(
         tree_pages < POOL_FRAMES && (0..tree_pages).all(|p| bpm.is_resident(p)),
         "the 100k-key tree ({tree_pages} pages) fits in the {POOL_FRAMES}-frame pool, so lookups and scans never read from disk"

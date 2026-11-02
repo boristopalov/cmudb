@@ -504,6 +504,11 @@ impl BufferPoolManager {
         self.next_page_id.fetch_add(1, Ordering::AcqRel)
     }
 
+    /// Returns how many page ids this pool has handed out; ids run densely from 0.
+    pub fn allocated_page_count(&self) -> usize {
+        self.next_page_id.load(Ordering::Acquire)
+    }
+
     /// Reports whether `page_id` currently sits in a frame, so a read of it would not touch disk.
     pub fn is_resident(&self, page_id: usize) -> bool {
         self.meta.lock().page_table.contains_key(&page_id)
@@ -539,6 +544,17 @@ mod tests {
             DiskScheduler::new(dm),
         );
         (Arc::new(bpm), dir)
+    }
+
+    #[test]
+    fn allocated_page_count_counts_new_pages_without_allocating() {
+        let (bpm, _dir) = make_bpm(2);
+        assert_eq!(bpm.allocated_page_count(), 0);
+        for expected in 1..=3 {
+            drop(bpm.new_page().unwrap());
+            assert_eq!(bpm.allocated_page_count(), expected);
+            assert_eq!(bpm.allocated_page_count(), expected);
+        }
     }
 
     #[test]
