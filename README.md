@@ -73,7 +73,7 @@ cargo bench --features bench --bench index -- search   # filter by name
 Criterion keeps the previous run in `target/criterion` and prints the change against it, so
 to compare a branch, run the same bench on the base branch first and then on the branch.
 The bracketed range is one run's confidence interval, and separate runs on the same machine
-differ by more than that: `insert_seq_10k` measured 246 ms here and 271 ms in another run.
+differ by more than that: `sort_10k` ranged from 7.77 to 8.37 ms across three runs on one machine.
 Run each side two or three times and only treat a change as real when it is clearly larger
 than the gap between those runs, roughly 10% or more.
 When you run them, every bench first checks what it reads: the heap and B+ tree return every
@@ -85,34 +85,34 @@ The query benches run SQL through `cmudb::Database`, via the `tests/common` harn
 executor model the branch has. Their timings include parsing, binding and planning each
 statement, not just execution, which matters most for small queries like `index_point_lookup`.
 
-Baseline, one run on a 4 vCPU Xeon @ 2.80GHz cloud VM, rustc 1.97, release build, on the
-code as of the CI pull request, before batched execution, page views and MVCC (median, with
-criterion's 95% interval):
+Baseline, on commit d97bbc8: the median of three runs on a 4 vCPU Intel Xeon @ 2.10GHz cloud
+VM, rustc 1.99.1, release build. Time is the middle run's median, with the lowest and highest
+median of the three in brackets:
 
 | Benchmark | Time | Per element |
 |---|---|---|
-| buffer_pool/read_hit | 171 ns (166 to 176) | |
-| buffer_pool/write_hit | 164 ns (161 to 167) | |
-| buffer_pool/read_miss_evict | 48.2 µs (45.6 to 50.8) | |
-| table_heap/insert_10k (64 frames) | 12.6 ms (12.2 to 13.0) | 1.3 µs |
-| table_heap/scan_10k (64 frames) | 10.8 ms (10.3 to 11.5) | 1.1 µs |
-| table_heap/get_random | 27.2 µs (25.5 to 28.6) | |
-| b_plus_tree/insert_seq_10k | 246 ms (243 to 250) | 25 µs |
-| b_plus_tree/insert_random_10k | 240 ms (235 to 246) | 24 µs |
-| b_plus_tree/search_random_of_100k | 51.3 µs (50.1 to 53.0) | |
-| b_plus_tree/scan_range_1k_of_100k | 155 µs (153 to 156) | 155 ns |
-| b_plus_tree/scan_full_100k | 10.8 ms (10.2 to 11.3) | 108 ns |
-| query/seq_scan_10k | 21.9 ms (21.0 to 23.0) | 2.2 µs |
-| query/filter_10pct_of_10k | 18.6 ms (18.2 to 19.4) | 1.9 µs |
-| query/aggregate_10k | 20.2 ms (18.5 to 21.6) | 2.0 µs |
-| query/sort_10k | 24.3 ms (23.2 to 25.2) | 2.4 µs |
-| query/nested_loop_join_10k_x_100 (now hash_join_10k_x_100, not yet measured) | 60.9 ms (59.2 to 62.7) | |
-| query/index_join_100_into_10k | 2.4 ms (2.4 to 2.5) | 24 µs per outer row |
-| query/index_point_lookup | 33.8 µs (32.9 to 34.9) | |
-| query/insert_1k_rows | 4.9 ms (4.7 to 5.2) | 4.9 µs |
+| buffer_pool/read_hit | 129 ns (122 to 131) | |
+| buffer_pool/write_hit | 130 ns (119 to 132) | |
+| buffer_pool/read_miss_evict | 27.3 µs (26.6 to 27.8) | |
+| table_heap/insert_10k (64 frames) | 4.51 ms (4.32 to 4.66) | 451 ns |
+| table_heap/scan_10k (64 frames) | 5.84 ms (5.63 to 5.96) | 584 ns |
+| table_heap/get_random | 16 µs (15.7 to 16.7) | |
+| b_plus_tree/insert_seq_10k | 7.87 ms (7.62 to 8.12) | 787 ns |
+| b_plus_tree/insert_random_10k | 8.7 ms (8.7 to 8.71) | 870 ns |
+| b_plus_tree/search_random_of_100k | 617 ns (601 to 652) | |
+| b_plus_tree/scan_range_1k_of_100k | 41.8 µs (41 to 43) | 41.8 ns |
+| b_plus_tree/scan_full_100k | 3.65 ms (3.61 to 3.69) | 36.5 ns |
+| query/seq_scan_10k | 5.44 ms (5.15 to 5.53) | 544 ns |
+| query/filter_10pct_of_10k | 2.82 ms (2.77 to 2.84) | 282 ns |
+| query/aggregate_10k | 2.88 ms (2.82 to 2.92) | 288 ns |
+| query/sort_10k | 7.81 ms (7.77 to 8.37) | 781 ns |
+| query/hash_join_10k_x_100 | 9.66 ms (9.22 to 9.69) | |
+| query/index_join_100_into_10k | 237 µs (230 to 242) | 2.37 µs per outer row |
+| query/index_point_lookup | 9.64 µs (9.22 to 9.79) | |
+| query/insert_1k_rows | 2.52 ms (2.34 to 2.55) | 2.52 µs |
 
 The table heap benches use a 64-frame pool on a heap of about 270 pages, so scans and random
 gets include disk reads and evictions. The bench asserts that the heap is larger than the pool,
 and, before timing, that every read in two laps of `read_miss_evict`'s fixed cycle misses. The B+ tree lookup and scan benches use a
-1024-frame pool and assert that the whole 100k-key tree stays in it, so their cost is decoding
-pages rather than I/O.
+1024-frame pool and assert that the whole 100k-key tree stays in it, so their cost is buffer
+pool hits and page reads rather than I/O.
