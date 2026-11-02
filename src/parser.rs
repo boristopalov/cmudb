@@ -8,8 +8,8 @@ use sqlparser::ast::{
     CreateTable as SqlCreateTable, DataType as SqlDataType, Delete, Expr, FromTable, Function,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Insert, JoinConstraint,
     JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderByExpr, OrderByKind,
-    Query, SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins, Update,
-    Value as SqlValue, WindowSpec, WindowType,
+    Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
+    Update, Value as SqlValue, WindowSpec, WindowType,
 };
 
 use crate::catalog::{Catalog, DataType, Schema, Value};
@@ -320,6 +320,24 @@ pub enum Unsupported {
     WindowInAggregatingSelect,
     /// A `QUALIFY` filter on window function results.
     Qualify,
+    /// A `HAVING` filter on groups.
+    Having,
+    /// `SELECT TOP n`.
+    Top,
+    /// `SELECT ... INTO <table>`.
+    SelectInto,
+    /// `PREWHERE`.
+    Prewhere,
+    /// `START WITH ... CONNECT BY` hierarchical queries.
+    ConnectBy,
+    /// `CLUSTER BY`.
+    ClusterBy,
+    /// `DISTRIBUTE BY`.
+    DistributeBy,
+    /// `SORT BY`.
+    SortBy,
+    /// `LATERAL VIEW`.
+    LateralView,
     /// An INSERT target that is not a table name, such as a table function.
     InsertTarget,
     /// An INSERT with no source rows.
@@ -398,6 +416,15 @@ impl fmt::Display for Unsupported {
                 "window functions in a SELECT with GROUP BY or aggregate functions are not supported"
             }
             Unsupported::Qualify => "QUALIFY is not supported",
+            Unsupported::Having => "HAVING is not supported",
+            Unsupported::Top => "SELECT TOP is not supported; use LIMIT",
+            Unsupported::SelectInto => "SELECT ... INTO is not supported",
+            Unsupported::Prewhere => "PREWHERE is not supported; use WHERE",
+            Unsupported::ConnectBy => "CONNECT BY is not supported",
+            Unsupported::ClusterBy => "CLUSTER BY is not supported",
+            Unsupported::DistributeBy => "DISTRIBUTE BY is not supported",
+            Unsupported::SortBy => "SORT BY is not supported; use ORDER BY",
+            Unsupported::LateralView => "LATERAL VIEW is not supported",
             Unsupported::InsertTarget => "unsupported INSERT target",
             Unsupported::InsertWithoutSource => "INSERT without source",
             Unsupported::InsertSource => "INSERT requires VALUES",
@@ -774,12 +801,7 @@ impl<'a> Binder<'a> {
             }
 
             SetExpr::Select(s) => {
-                if !s.named_window.is_empty() {
-                    return Err(Unsupported::NamedWindow.into());
-                }
-                if s.qualify.is_some() {
-                    return Err(Unsupported::Qualify.into());
-                }
+                reject_unsupported_select_clauses(s)?;
                 let (scope, join) = self.build_select_scope(&s.from)?;
                 let filters = s
                     .selection
@@ -1279,6 +1301,57 @@ fn ident_name(name: &ObjectName) -> Result<String, BinderError> {
         _ => Err(BinderError::QualifiedName {
             name: name.to_string(),
         }),
+    }
+}
+
+/// Rejects the clauses of `s` the binder does not bind, so a query using one fails instead of
+/// running without it.
+///
+/// Destructures every field of `Select`, so a clause added by a sqlparser upgrade fails to
+/// compile here until it is bound or rejected.
+fn reject_unsupported_select_clauses(s: &Select) -> Result<(), BinderError> {
+    let Select {
+        select_token: _,
+        optimizer_hints: _,
+        distinct: _,
+        select_modifiers: _,
+        top,
+        top_before_distinct: _,
+        projection: _,
+        exclude: _,
+        into,
+        from: _,
+        lateral_views,
+        prewhere,
+        selection: _,
+        connect_by,
+        group_by: _,
+        cluster_by,
+        distribute_by,
+        sort_by,
+        having,
+        named_window,
+        qualify,
+        window_before_qualify: _,
+        value_table_mode: _,
+        flavor: _,
+    } = s;
+    let unsupported = [
+        (having.is_some(), Unsupported::Having),
+        (top.is_some(), Unsupported::Top),
+        (into.is_some(), Unsupported::SelectInto),
+        (prewhere.is_some(), Unsupported::Prewhere),
+        (!connect_by.is_empty(), Unsupported::ConnectBy),
+        (!cluster_by.is_empty(), Unsupported::ClusterBy),
+        (!distribute_by.is_empty(), Unsupported::DistributeBy),
+        (!sort_by.is_empty(), Unsupported::SortBy),
+        (!lateral_views.is_empty(), Unsupported::LateralView),
+        (!named_window.is_empty(), Unsupported::NamedWindow),
+        (qualify.is_some(), Unsupported::Qualify),
+    ];
+    match unsupported.into_iter().find(|&(present, _)| present) {
+        Some((_, feature)) => Err(feature.into()),
+        None => Ok(()),
     }
 }
 
