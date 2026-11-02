@@ -13,7 +13,7 @@ A SQL statement flows top to bottom:
 | Bind | `src/parser.rs` (`Binder`) | `BoundStatement`, names resolved against the catalog |
 | Plan | `src/planner.rs` (`Planner`) | `Plan` tree (`src/processor/plan.rs`) |
 | Build | `src/processor/executor_factory.rs` | `Box<dyn Executor>` tree |
-| Execute | `src/processor/executor.rs` | `Batch`es of rows, pulled with `next_batch` |
+| Execute | `src/processor/executor.rs` (trait, `Batch`, errors), `src/processor/executors/` (one file per family) | `Batch`es of rows, pulled with `next_batch` |
 | Access | `src/catalog/`, `src/table_heap.rs`, `src/index/`, `src/concurrency/` | tuples, index entries, visible versions |
 | Pages | `src/table_page.rs`, `src/index/page_view.rs` | typed views over a pinned frame's bytes |
 | Buffer pool | `src/buffer_pool.rs`, `src/replacer.rs` (ARC) | `PageRef` / `PageMut` guards |
@@ -69,8 +69,10 @@ typed `StatementResult` per statement. The shell (`src/main.rs`) only prints tho
 ## Adding an executor
 
 1. Add a plan node struct and a `Plan` variant in `src/processor/plan.rs`.
-2. Implement `Executor` in `src/processor/executor.rs`. `next_batch` never returns an empty
-   batch or more rows than its batch size, and keeps returning `None` once it has;
+2. Implement `Executor` in the family's file under `src/processor/executors/` (scan, dml, join,
+   aggregate, sort, pipeline, ddl) and re-export it from `executors/mod.rs`. `close` closes every
+   child (`executors/mod.rs` tests check this). `next_batch` never returns an empty batch or
+   more rows than its batch size, and keeps returning `None` once it has;
    `tests/batch_execution.rs` checks this across batch sizes.
 3. Add its arm to `create_executor_with_batch_size` in `executor_factory.rs`.
 4. Have `src/planner.rs` emit it, or, until it does, build its plan by hand in
