@@ -484,6 +484,116 @@ fn wildcard_options_are_rejected_instead_of_returning_every_column() {
 }
 
 #[test]
+fn query_clauses_the_binder_does_not_bind_are_rejected() {
+    let db = emp_db();
+    for (sql, expected) in [
+        ("WITH x AS (SELECT 1) SELECT id FROM emp", Unsupported::With),
+        (
+            "SELECT id FROM emp FETCH FIRST 1 ROWS ONLY",
+            Unsupported::Fetch,
+        ),
+        ("SELECT id FROM emp FOR UPDATE", Unsupported::LockingClause),
+        ("SELECT id FROM emp FOR SHARE", Unsupported::LockingClause),
+        ("SELECT id FROM emp FOR JSON AUTO", Unsupported::ForClause),
+        (
+            "SELECT id FROM emp SETTINGS max_threads = 1",
+            Unsupported::QuerySettings,
+        ),
+        ("SELECT id FROM emp FORMAT JSON", Unsupported::FormatClause),
+        (
+            "SELECT id FROM emp |> WHERE id = 1",
+            Unsupported::PipeOperator,
+        ),
+        (
+            "(SELECT id FROM emp) FETCH FIRST 1 ROWS ONLY",
+            Unsupported::Fetch,
+        ),
+        (
+            "(SELECT id FROM emp FOR UPDATE)",
+            Unsupported::LockingClause,
+        ),
+        ("VALUES (1) FETCH FIRST 1 ROWS ONLY", Unsupported::Fetch),
+    ] {
+        let err = db.bind_error(sql);
+        assert_eq!(err, BinderError::Unsupported(expected), "{sql}");
+        assert_eq!(err.to_string(), expected.to_string(), "{sql}");
+    }
+}
+
+#[test]
+fn order_by_and_limit_outside_a_select_are_rejected_instead_of_ignored() {
+    let db = emp_db();
+    for (sql, expected) in [
+        (
+            "(SELECT id FROM emp) ORDER BY id DESC",
+            Unsupported::OrderByWithoutSelect,
+        ),
+        (
+            "(SELECT id FROM emp) LIMIT 1",
+            Unsupported::LimitWithoutSelect,
+        ),
+        (
+            "VALUES (2), (1) ORDER BY 1",
+            Unsupported::OrderByWithoutSelect,
+        ),
+        ("VALUES (2), (1) LIMIT 1", Unsupported::LimitWithoutSelect),
+    ] {
+        assert_eq!(
+            db.bind_error(sql),
+            BinderError::Unsupported(expected),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn insert_source_clauses_the_binder_does_not_bind_are_rejected() {
+    let db = emp_db();
+    for (sql, expected) in [
+        (
+            "INSERT INTO emp VALUES (5, 10, 500, 5.0, true) LIMIT 1",
+            Unsupported::LimitWithoutSelect,
+        ),
+        (
+            "INSERT INTO emp VALUES (5, 10, 500, 5.0, true) ORDER BY 1",
+            Unsupported::OrderByWithoutSelect,
+        ),
+        (
+            "INSERT INTO emp VALUES (5, 10, 500, 5.0, true) FETCH FIRST 1 ROWS ONLY",
+            Unsupported::Fetch,
+        ),
+        (
+            "INSERT INTO emp SELECT * FROM emp LIMIT 1",
+            Unsupported::InsertSource,
+        ),
+        (
+            "INSERT INTO emp SELECT * FROM emp ORDER BY 1",
+            Unsupported::InsertSource,
+        ),
+    ] {
+        assert_eq!(
+            db.bind_error(sql),
+            BinderError::Unsupported(expected),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        ints(&db.exec("SELECT COUNT(*) FROM emp")),
+        vec![vec![4]],
+        "a rejected INSERT adds no rows"
+    );
+}
+
+#[test]
+fn parenthesized_select_keeps_its_own_order_by_and_limit() {
+    let db = emp_db();
+    assert_eq!(
+        ints(&db.exec("(SELECT id FROM emp ORDER BY id DESC LIMIT 2)")),
+        vec![vec![4], vec![3]]
+    );
+}
+
+#[test]
 fn values_statement() {
     let db = Db::new(8);
     assert_eq!(

@@ -440,6 +440,26 @@ pub enum Unsupported {
     WildcardIlike,
     /// `* AS <alias>`.
     WildcardAlias,
+    /// A `WITH` clause of common table expressions.
+    With,
+    /// `FETCH FIRST n ROWS`.
+    Fetch,
+    /// `FOR UPDATE` or `FOR SHARE` row locking.
+    LockingClause,
+    /// `FOR XML` or `FOR JSON` result formatting.
+    ForClause,
+    /// `SETTINGS key = value` on a query.
+    QuerySettings,
+    /// `FORMAT <name>` on a query.
+    FormatClause,
+    /// A pipe operator (`|>`) after a query.
+    PipeOperator,
+    /// ORDER BY on a query whose body is not a SELECT, such as VALUES, a parenthesized
+    /// query or an INSERT source.
+    OrderByWithoutSelect,
+    /// LIMIT on a query whose body is not a SELECT, such as VALUES, a parenthesized query or
+    /// an INSERT source.
+    LimitWithoutSelect,
     /// An INSERT target that is not a table name, such as a table function.
     InsertTarget,
     /// An INSERT with no source rows.
@@ -534,6 +554,15 @@ impl fmt::Display for Unsupported {
             Unsupported::WildcardRename => "SELECT * RENAME is not supported",
             Unsupported::WildcardIlike => "SELECT * ILIKE is not supported",
             Unsupported::WildcardAlias => "SELECT * AS <alias> is not supported",
+            Unsupported::With => "WITH (common table expressions) is not supported",
+            Unsupported::Fetch => "FETCH is not supported; use LIMIT",
+            Unsupported::LockingClause => "FOR UPDATE / FOR SHARE is not supported",
+            Unsupported::ForClause => "FOR XML / FOR JSON is not supported",
+            Unsupported::QuerySettings => "SETTINGS is not supported",
+            Unsupported::FormatClause => "FORMAT is not supported",
+            Unsupported::PipeOperator => "pipe operators (|>) are not supported",
+            Unsupported::OrderByWithoutSelect => "ORDER BY is only supported on a SELECT",
+            Unsupported::LimitWithoutSelect => "LIMIT is only supported on a SELECT",
             Unsupported::InsertTarget => "unsupported INSERT target",
             Unsupported::InsertWithoutSource => "INSERT without source",
             Unsupported::InsertSource => "INSERT requires VALUES",
@@ -993,10 +1022,15 @@ impl<'a> Binder<'a> {
     }
 
     fn resolve_select(&self, q: &Query) -> Result<BoundStatement, BinderError> {
+        reject_unsupported_query_clauses(q)?;
         match q.body.as_ref() {
-            SetExpr::Query(inner) => self.resolve_select(inner),
+            SetExpr::Query(inner) => {
+                reject_order_by_and_limit(q)?;
+                self.resolve_select(inner)
+            }
 
             SetExpr::Values(values) => {
+                reject_order_by_and_limit(q)?;
                 let empty = HashMap::new();
                 let rows = values
                     .rows
@@ -1261,9 +1295,11 @@ impl<'a> Binder<'a> {
             .source
             .as_ref()
             .ok_or(Unsupported::InsertWithoutSource)?;
+        reject_unsupported_query_clauses(source)?;
         let SetExpr::Values(values) = source.body.as_ref() else {
             return Err(Unsupported::InsertSource.into());
         };
+        reject_order_by_and_limit(source)?;
 
         let no_input_columns = HashMap::new();
         let rows = values
@@ -1578,7 +1614,51 @@ fn reject_unsupported_select_clauses(s: &Select) -> Result<(), BinderError> {
         (!named_window.is_empty(), Unsupported::NamedWindow),
         (qualify.is_some(), Unsupported::Qualify),
     ];
-    match unsupported.into_iter().find(|&(present, _)| present) {
+    first_unsupported(unsupported)
+}
+
+/// Rejects the query-level clauses of `q` the binder does not bind, so a query using one fails
+/// instead of running without it. ORDER BY and LIMIT are left to the caller.
+///
+/// Destructures every field of `Query`, so a clause added by a sqlparser upgrade fails to
+/// compile here until it is bound or rejected.
+fn reject_unsupported_query_clauses(q: &Query) -> Result<(), BinderError> {
+    let Query {
+        with,
+        body: _,
+        order_by: _,
+        limit_clause: _,
+        fetch,
+        locks,
+        for_clause,
+        settings,
+        format_clause,
+        pipe_operators,
+    } = q;
+    let unsupported = [
+        (with.is_some(), Unsupported::With),
+        (fetch.is_some(), Unsupported::Fetch),
+        (!locks.is_empty(), Unsupported::LockingClause),
+        (for_clause.is_some(), Unsupported::ForClause),
+        (settings.is_some(), Unsupported::QuerySettings),
+        (format_clause.is_some(), Unsupported::FormatClause),
+        (!pipe_operators.is_empty(), Unsupported::PipeOperator),
+    ];
+    first_unsupported(unsupported)
+}
+
+/// Rejects ORDER BY and LIMIT on `q`, for a query whose body the binder resolves without
+/// sorting or limiting it.
+fn reject_order_by_and_limit(q: &Query) -> Result<(), BinderError> {
+    first_unsupported([
+        (q.order_by.is_some(), Unsupported::OrderByWithoutSelect),
+        (q.limit_clause.is_some(), Unsupported::LimitWithoutSelect),
+    ])
+}
+
+/// Returns the first feature whose flag is set as an error, or `Ok` when none is.
+fn first_unsupported<const N: usize>(checks: [(bool, Unsupported); N]) -> Result<(), BinderError> {
+    match checks.into_iter().find(|&(present, _)| present) {
         Some((_, feature)) => Err(feature.into()),
         None => Ok(()),
     }
