@@ -125,11 +125,17 @@ gates:
 # wakes on every post and starts the implement agents.
 handoff:
   post_starts_with: "Loop handoff for the coordinator: Todo issues ready for implement agents:"
-  lists: Todo issues not In Progress, highest priority first, one line each with key, title and priority
+  lists: Todo issues, highest priority first, one line each with key, title and priority
   own_post: true             # never combined with a ping to Boris
   quiet_hours: ignored       # it's for the coordinator, not Boris
   skip_when: [list is empty, list unchanged since the last handoff post]
-  coordinator: { max_running: stages.implement.max_parallel, skip: issues with a running agent }
+  coordinator:
+    max_running: stages.implement.max_parallel
+    skip: issues with a running agent
+    # An unchanged list posts nothing, so issues left over when all slots were
+    # full would wait for the next change to Todo. When an implement agent
+    # finishes, the coordinator starts the next issue from the latest handoff.
+    on_agent_done: start the next issue from the latest handoff post
 
 # When the loop pings Boris. Everything else, agents handle.
 ping_boris:
