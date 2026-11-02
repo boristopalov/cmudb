@@ -88,6 +88,21 @@ pub struct Tuple {
     pub data: Vec<u8>,
 }
 
+/// Why [`TableHeap::free`] stopped, with the part of the heap it had not deleted yet.
+pub(crate) struct FreeError {
+    pub(crate) error: TableHeapError,
+    pub(crate) rest: TableHeap,
+}
+
+impl fmt::Debug for FreeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FreeError")
+            .field("error", &self.error)
+            .field("rest_first_page_id", &self.rest.first_page_id)
+            .finish()
+    }
+}
+
 pub struct TableHeap {
     bpm: Arc<BufferPoolManager>,
     /// The page where the table starts.
@@ -256,19 +271,29 @@ impl TableHeap {
     }
 
     /// Deletes every page of the heap from the buffer pool and from disk, consuming it. Meant
-    /// for scratch heaps such as spilled sort runs that no other reader holds.
-    pub fn free(self) -> Result<(), TableHeapError> {
-        let mut next = Some(record_page_id(Some(self.first_page_id))?);
-        while let Some(page_id) = next {
-            next = {
-                let guard = self.bpm.read_page(page_id as usize)?;
-                TablePageRef::new(guard.data())
-                    .map_err(|e| e.on_page(page_id))?
-                    .next_page_id()
-            };
-            self.bpm.delete_page(page_id as usize)?;
+    /// for scratch heaps such as spilled sort runs that no other reader holds. On failure the
+    /// pages not yet deleted come back in [`FreeError::rest`], so a later `free` can finish.
+    pub(crate) fn free(mut self) -> Result<(), FreeError> {
+        loop {
+            match self.free_first_page() {
+                Ok(Some(next)) => self.first_page_id = next as usize,
+                Ok(None) => return Ok(()),
+                Err(error) => return Err(FreeError { error, rest: self }),
+            }
         }
-        Ok(())
+    }
+
+    /// Deletes the heap's first page and returns the id of the page after it.
+    fn free_first_page(&self) -> Result<Option<u32>, TableHeapError> {
+        let page_id = record_page_id(Some(self.first_page_id))?;
+        let next = {
+            let guard = self.bpm.read_page(page_id as usize)?;
+            TablePageRef::new(guard.data())
+                .map_err(|e| e.on_page(page_id))?
+                .next_page_id()
+        };
+        self.bpm.delete_page(page_id as usize)?;
+        Ok(next)
     }
 
     pub fn last_page_id(&self) -> usize {
@@ -808,5 +833,35 @@ mod tests {
                 rid.page_id
             );
         }
+    }
+
+    #[test]
+    fn a_failed_free_returns_the_pages_it_did_not_delete_so_a_retry_finishes() {
+        let (bpm, _dir) = crate::testing::bpm(2);
+        let heap = TableHeap::new(bpm.clone()).unwrap();
+        let big = Tuple {
+            data: vec![1; TablePageRef::MAX_TUPLE_SIZE],
+        };
+        for _ in 0..3 {
+            heap.insert(&big).unwrap();
+        }
+        let first_page_id = heap.first_page_id;
+        let pins = [bpm.new_page().unwrap(), bpm.new_page().unwrap()];
+
+        let err = heap.free().unwrap_err();
+
+        assert!(
+            matches!(err.error, TableHeapError::Bpm(BpmError::NoFreeFrame)),
+            "{err:?}"
+        );
+        assert_eq!(err.rest.first_page_id, first_page_id);
+        assert_eq!(bpm.live_page_count(), 5, "no page was deleted");
+        drop(pins);
+        err.rest.free().unwrap();
+        assert_eq!(
+            bpm.live_page_count(),
+            2,
+            "only the two pinned pages are left"
+        );
     }
 }

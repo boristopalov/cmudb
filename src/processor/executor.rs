@@ -15,7 +15,7 @@ use crate::processor::plan::{
     ProjectionPlanNode, SeqScanPlanNode, SortDirection, SortExpr, SortPlanNode, UpdatePlanNode,
     ValuesPlanNode, WindowFunctionPlanNode,
 };
-use crate::table_heap::{RecordId, TableHeap, TableHeapError, TableHeapIterator, Tuple};
+use crate::table_heap::{FreeError, RecordId, TableHeap, TableHeapError, TableHeapIterator, Tuple};
 use log::warn;
 use std::collections::hash_map::IntoIter;
 use std::collections::{HashMap, VecDeque};
@@ -1402,8 +1402,14 @@ impl SpillRun {
         self.heap.as_ref().expect(Self::FREED).iter()
     }
 
+    /// Deletes the run's pages. On failure the run keeps the pages it could not delete, and
+    /// dropping it tries again.
     fn free(mut self) -> Result<(), TableHeapError> {
-        self.heap.take().expect(Self::FREED).free()
+        let heap = self.heap.take().expect(Self::FREED);
+        heap.free().map_err(|FreeError { error, rest }| {
+            self.heap = Some(rest);
+            error
+        })
     }
 }
 
@@ -1412,7 +1418,10 @@ impl Drop for SpillRun {
         if let Some(heap) = self.heap.take()
             && let Err(e) = heap.free()
         {
-            warn!("could not free the pages of a dropped sort run: {e}");
+            warn!(
+                "could not free the pages of a dropped sort run from page {}: {}",
+                e.rest.first_page_id, e.error
+            );
         }
     }
 }

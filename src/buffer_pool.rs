@@ -283,7 +283,7 @@ impl BufferPoolManager {
     /// frees its slot on disk for a later page. Fails with [`BpmError::PagePinned`] while a
     /// guard holds the page, and with [`BpmError::NoSuchPage`] for a page that is unallocated
     /// or already deleted. The id is not handed out again.
-    pub fn delete_page(&self, page_id: usize) -> Result<(), BpmError> {
+    pub(crate) fn delete_page(&self, page_id: usize) -> Result<(), BpmError> {
         let mut meta = self.meta.lock();
         let resident = match meta.page_table.get(&page_id).copied() {
             Some(frame_id) if meta.pins[frame_id] > 0 => {

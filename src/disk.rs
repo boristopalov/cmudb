@@ -143,15 +143,25 @@ impl PageStore {
         })
     }
 
-    fn offset_for_write(&mut self, id: usize) -> io::Result<u64> {
+    /// The offset page `id` is written at: its own slot, else the next freed slot, else the
+    /// end of the file. A freed slot leaves the free list only once [`PageStore::record_write`]
+    /// records a successful write into it.
+    fn offset_for_write(&self, id: usize) -> io::Result<u64> {
         if let Some(&offset) = self.page_offsets.get(&id) {
             return Ok(offset);
         }
-        if let Some(offset) = self.free_offsets.pop() {
+        if let Some(&offset) = self.free_offsets.last() {
             info!("write_page: reusing free offset={offset} for page_id={id}");
             return Ok(offset);
         }
         self.db_file.metadata().map(|m| m.len())
+    }
+
+    fn record_write(&mut self, id: usize, offset: u64) {
+        let newly_placed = self.page_offsets.insert(id, offset).is_none();
+        if newly_placed && self.free_offsets.last() == Some(&offset) {
+            self.free_offsets.pop();
+        }
     }
 
     fn log_page_mapping(&self, context: &str) {
@@ -252,7 +262,7 @@ impl DiskManager {
             ));
             return Err(e);
         }
-        store.page_offsets.insert(id, offset);
+        store.record_write(id, offset);
         info!("write_page: wrote page_id={id} at offset={offset}");
         self.num_writes.fetch_add(1, Ordering::AcqRel);
         Ok(data)
@@ -260,7 +270,7 @@ impl DiskManager {
 
     /// Forgets page `id` and hands its slot in the file to the next new page. Returns whether
     /// the page had been written; an unwritten page has no slot to free.
-    pub fn deallocate_page(&self, id: usize) -> bool {
+    pub(crate) fn deallocate_page(&self, id: usize) -> bool {
         let mut store = self.store.lock();
         let Some(offset) = store.page_offsets.remove(&id) else {
             return false;
@@ -362,6 +372,33 @@ mod tests {
         );
         assert_eq!(*dm.read_page(3, page(0)).unwrap(), [3; PAGE_SIZE]);
         assert_eq!(*dm.read_page(2, page(0)).unwrap(), [2; PAGE_SIZE]);
+    }
+
+    #[test]
+    fn a_failed_write_into_a_freed_slot_keeps_the_slot_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let dm = manager(&dir);
+        dm.write_page(1, page(1)).unwrap();
+        dm.write_page(2, page(2)).unwrap();
+        assert!(dm.deallocate_page(1));
+        let writable = std::mem::replace(
+            &mut dm.store.lock().db_file,
+            File::open(&path).expect("read-only handle"),
+        );
+
+        dm.write_page(3, page(3)).unwrap_err();
+
+        assert_eq!(
+            dm.store.lock().free_offsets,
+            vec![0],
+            "the freed slot was lost"
+        );
+        assert!(!dm.store.lock().page_offsets.contains_key(&3));
+        dm.store.lock().db_file = writable;
+        dm.write_page(3, page(3)).unwrap();
+        assert_eq!(dm.store.lock().page_offsets.get(&3), Some(&0));
+        assert!(dm.store.lock().free_offsets.is_empty());
     }
 
     fn finishes_within(limit: std::time::Duration, work: impl FnOnce() + Send + 'static) -> bool {
