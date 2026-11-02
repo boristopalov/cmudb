@@ -933,6 +933,11 @@ fn resolve_limit(clause: Option<&LimitClause>) -> Result<Option<u32>, BinderErro
                 .map(Some)
                 .map_err(|_| BinderError::InvalidLimit { limit: s.clone() })
         }
+        Some(LimitClause::LimitOffset {
+            limit: Some(_),
+            offset: None,
+            limit_by,
+        }) if limit_by.is_empty() => Err(Unsupported::LimitExpression.into()),
         _ => Err(Unsupported::LimitClause.into()),
     }
 }
@@ -1366,8 +1371,15 @@ mod tests {
                 limit: "99999999999".into()
             }
         );
+        for limit in ["a", "1 + 1", "-1", "'x'"] {
+            assert_eq!(
+                bind_error(&catalog, &format!("SELECT a FROM t LIMIT {limit}")),
+                BinderError::Unsupported(Unsupported::LimitExpression),
+                "LIMIT {limit}"
+            );
+        }
         assert_eq!(
-            bind_error(&catalog, "SELECT a FROM t LIMIT a"),
+            bind_error(&catalog, "SELECT a FROM t LIMIT 1 OFFSET 1"),
             BinderError::Unsupported(Unsupported::LimitClause)
         );
     }

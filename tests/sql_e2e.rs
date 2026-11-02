@@ -731,7 +731,7 @@ fn binder_and_planner_errors_are_reported() {
         ),
         (
             "SELECT id FROM emp LIMIT id",
-            unsupported(Unsupported::LimitClause),
+            unsupported(Unsupported::LimitExpression),
         ),
         (
             "SELECT foo.id FROM emp",
