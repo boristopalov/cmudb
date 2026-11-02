@@ -111,6 +111,11 @@ impl Layout {
         ])
     }
 
+    /// Whether a leaf with `entries` entries has room left in its page for a tombstone count.
+    pub fn leaf_has_tombstone_section(self, entries: usize) -> bool {
+        self.leaf_bytes(entries, 0).is_ok_and(|n| n <= PAGE_SIZE)
+    }
+
     /// Offset of child id `idx` in an internal page.
     pub fn internal_child_offset(self, idx: usize) -> usize {
         INTERNAL_FIXED_HEADER_BYTES + idx * PAGE_ID_ENCODED_BYTES
@@ -693,7 +698,11 @@ impl LeafPage {
             let sid = r.read_u64_le()?;
             entries.push((key, decode_record_id(pid, sid)?));
         }
-        let tombstones = Self::decode_tombstones(&mut r)?;
+        let tombstones = if layout.leaf_has_tombstone_section(size) {
+            Self::decode_tombstones(&mut r)?
+        } else {
+            VecDeque::new()
+        };
 
         let page = Self {
             max_size,
@@ -706,12 +715,8 @@ impl LeafPage {
         Ok(page)
     }
 
-    /// Reads the tombstone section after the entries, or none when the page has no room left
-    /// for its count.
+    /// Reads the tombstone count and slots that follow the entries.
     fn decode_tombstones(r: &mut BufReader<'_>) -> Result<VecDeque<u32>, PageCodecError> {
-        if r.remaining() < TOMBSTONE_COUNT_ENCODED_BYTES {
-            return Ok(VecDeque::new());
-        }
         let count = usize::try_from(r.read_u32_le()?)?;
         let needed = count
             .checked_mul(TOMBSTONE_SLOT_ENCODED_BYTES)
@@ -1671,6 +1676,14 @@ mod tests {
             layout(1).leaf_live_bytes(usize::MAX),
             Err(crate::index::page_codec::OVERFLOW)
         );
+        for entries in 0..PAGE_SIZE {
+            let live = layout(1).leaf_live_bytes(entries).unwrap();
+            assert_eq!(
+                layout(1).leaf_has_tombstone_section(entries),
+                live + TOMBSTONE_COUNT_ENCODED_BYTES <= PAGE_SIZE,
+                "{entries} entries"
+            );
+        }
     }
 
     #[test]

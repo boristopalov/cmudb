@@ -340,7 +340,7 @@ impl<B: AsRef<[u8]>> LeafPageView<B> {
     }
 
     fn has_tomb_section(&self) -> bool {
-        self.layout.leaf_tombstone_offset(self.size() as usize, 0) <= PAGE_SIZE
+        self.layout.leaf_has_tombstone_section(self.size() as usize)
     }
 
     /// One past the last byte the page's logical contents occupy.
