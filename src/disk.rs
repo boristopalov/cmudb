@@ -257,6 +257,18 @@ impl DiskManager {
         self.num_writes.fetch_add(1, Ordering::AcqRel);
         Ok(data)
     }
+
+    /// Forgets page `id` and hands its slot in the file to the next new page. Returns whether
+    /// the page had been written; an unwritten page has no slot to free.
+    pub fn deallocate_page(&self, id: usize) -> bool {
+        let mut store = self.store.lock();
+        let Some(offset) = store.page_offsets.remove(&id) else {
+            return false;
+        };
+        info!("deallocate_page: freed page_id={id} offset={offset}");
+        store.free_offsets.push(offset);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -323,6 +335,32 @@ mod tests {
         dm.store.lock().free_offsets.push(0);
         dm.write_page(2, page(2)).unwrap();
         assert_eq!(dm.store.lock().page_offsets.get(&2), Some(&0));
+        assert_eq!(*dm.read_page(2, page(0)).unwrap(), [2; PAGE_SIZE]);
+    }
+
+    #[test]
+    fn a_deallocated_page_is_gone_and_its_slot_goes_to_the_next_new_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let dm = manager(&dir);
+        dm.write_page(1, page(1)).unwrap();
+        dm.write_page(2, page(2)).unwrap();
+        let len = std::fs::metadata(dir.path().join("db")).unwrap().len();
+
+        assert!(dm.deallocate_page(1), "page 1 had been written");
+        assert!(!dm.deallocate_page(1), "page 1 was already freed");
+        assert!(!dm.deallocate_page(9), "page 9 was never written");
+        assert_eq!(
+            dm.read_page(1, page(0)).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+
+        dm.write_page(3, page(3)).unwrap();
+        assert_eq!(
+            std::fs::metadata(dir.path().join("db")).unwrap().len(),
+            len,
+            "the new page took the freed slot instead of growing the file"
+        );
+        assert_eq!(*dm.read_page(3, page(0)).unwrap(), [3; PAGE_SIZE]);
         assert_eq!(*dm.read_page(2, page(0)).unwrap(), [2; PAGE_SIZE]);
     }
 

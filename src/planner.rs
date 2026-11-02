@@ -8,10 +8,10 @@ use crate::parser::{
 };
 use crate::processor::plan::{
     AggType, AggregationPlanNode, ColIdx, ColumnAssignment, CreateIndexPlanNode,
-    CreateTablePlanNode, DeletePlanNode, Expression, FilterPlanNode, IndexScanPlanNode,
-    InsertPlanNode, JoinColumn, JoinPredicate, JoinType, LimitPlanNode, NestedIndexJoinPlanNode,
-    NestedLoopJoinPlanNode, Op, Plan, ProjectionPlanNode, SeqScanPlanNode, Side, SortPlanNode,
-    UpdatePlanNode, ValuesPlanNode,
+    CreateTablePlanNode, DeletePlanNode, Expression, ExternalMergeSortPlanNode, FilterPlanNode,
+    IndexScanPlanNode, InsertPlanNode, JoinColumn, JoinPredicate, JoinType, LimitPlanNode,
+    NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, Op, Plan, ProjectionPlanNode, SeqScanPlanNode,
+    Side, UpdatePlanNode, ValuesPlanNode,
 };
 
 /// Turns bound statements into plans, without statistics or a cost model.
@@ -19,7 +19,8 @@ use crate::processor::plan::{
 /// A `col = constant` filter on a table with a single-column index on `col` becomes an
 /// `IndexScan`; an inner `left.col = right.col` join whose right table has a single-column
 /// index on its join column becomes a `NestedIndexJoin`. Everything else is a `SeqScan`
-/// or a `NestedLoopJoin`.
+/// or a `NestedLoopJoin`. `ORDER BY` is an `ExternalMergeSort`, which sorts in memory until
+/// its input passes the executor's sort memory budget and spills sorted runs after that.
 pub struct Planner<'a> {
     catalog: &'a Catalog,
 }
@@ -107,7 +108,7 @@ impl<'a> Planner<'a> {
         }
 
         if let Some(order_by_exprs) = sort {
-            plan = Plan::Sort(SortPlanNode {
+            plan = Plan::ExternalMergeSort(ExternalMergeSortPlanNode {
                 schema: source_schema.clone(),
                 child: Box::new(plan),
                 order_by_exprs,

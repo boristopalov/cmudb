@@ -87,6 +87,7 @@ pub fn plan_contains(plan: &Plan, wanted: fn(&Plan) -> bool) -> bool {
             Plan::Projection(p) => plan_contains(&p.child, wanted),
             Plan::Aggregation(p) => plan_contains(&p.child, wanted),
             Plan::Sort(p) => plan_contains(&p.child, wanted),
+            Plan::ExternalMergeSort(p) => plan_contains(&p.child, wanted),
             Plan::Limit(p) => plan_contains(&p.child, wanted),
             _ => false,
         }

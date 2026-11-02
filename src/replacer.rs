@@ -130,6 +130,26 @@ impl ArcReplacer {
         );
     }
 
+    /// Stops tracking `frame_id` and the page it holds, leaving no ghost entry behind, for a
+    /// page that is deleted rather than evicted. Returns whether the frame was tracked.
+    pub fn remove(&mut self, frame_id: usize) -> bool {
+        let Some(idx) = self.frame_indices.remove(&frame_id) else {
+            return false;
+        };
+        let node = self.nodes[idx];
+        if node.evictable {
+            self.evictable_count -= 1;
+        }
+        info!(
+            "remove frame_id={frame_id} page_id={} list={:?}",
+            node.page_id, node.list
+        );
+        self.detach(idx);
+        self.page_indices.remove(&node.page_id);
+        self.unused_node_indices.push(idx);
+        true
+    }
+
     fn is_full(&self) -> bool {
         self.mru_list.length + self.mfu_list.length >= self.capacity
     }
@@ -727,6 +747,34 @@ mod tests {
         assert_eq!(arc_replacer.size(), 1);
         assert_eq!(arc_replacer.mru_ghost_list.length, 1);
         assert!(!arc_replacer.frame_indices.contains_key(&1));
+    }
+
+    #[test]
+    fn a_removed_frame_is_never_evicted_and_leaves_no_ghost() {
+        let mut arc_replacer = ArcReplacer::new(2);
+        arc_replacer.record_access(1, 10);
+        arc_replacer.record_access(2, 20);
+        arc_replacer.set_evictable(1, true);
+        arc_replacer.set_evictable(2, true);
+
+        assert!(arc_replacer.remove(1));
+        assert!(!arc_replacer.remove(1), "frame 1 is no longer tracked");
+        assert_eq!(arc_replacer.size(), 1);
+        assert!(
+            !arc_replacer.page_indices.contains_key(&10),
+            "page 10 left a ghost"
+        );
+        assert_eq!(arc_replacer.evict(), Some(2));
+        assert_eq!(arc_replacer.evict(), None);
+
+        arc_replacer.record_access(1, 30);
+        arc_replacer.record_access(2, 40);
+        arc_replacer.set_evictable(1, true);
+        assert_eq!(
+            arc_replacer.evict(),
+            Some(1),
+            "a removed frame is tracked again once a new page uses it"
+        );
     }
 
     #[test]

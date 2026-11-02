@@ -255,6 +255,22 @@ impl TableHeap {
         self.insert_locked(meta, t, &mut tail)
     }
 
+    /// Deletes every page of the heap from the buffer pool and from disk, consuming it. Meant
+    /// for scratch heaps such as spilled sort runs that no other reader holds.
+    pub fn free(self) -> Result<(), TableHeapError> {
+        let mut next = Some(record_page_id(Some(self.first_page_id))?);
+        while let Some(page_id) = next {
+            next = {
+                let guard = self.bpm.read_page(page_id as usize)?;
+                TablePageRef::new(guard.data())
+                    .map_err(|e| e.on_page(page_id))?
+                    .next_page_id()
+            };
+            self.bpm.delete_page(page_id as usize)?;
+        }
+        Ok(())
+    }
+
     pub fn last_page_id(&self) -> usize {
         self.tail.lock().page_id
     }
@@ -770,5 +786,27 @@ mod tests {
         drop(guard);
         let scanned: Vec<RecordId> = heap.iter().map(|r| r.unwrap().1).collect();
         assert_eq!(scanned, vec![first, second]);
+    }
+
+    #[test]
+    fn free_deletes_every_page_of_the_heap() {
+        let (heap, _dir) = make_heap();
+        let bpm = heap.bpm.clone();
+        let big = Tuple {
+            data: vec![1; TablePageRef::MAX_TUPLE_SIZE],
+        };
+        let rids: Vec<RecordId> = (0..3).map(|_| heap.insert(&big).unwrap()).collect();
+        assert_eq!(bpm.live_page_count(), 3, "one page per tuple");
+
+        heap.free().unwrap();
+
+        assert_eq!(bpm.live_page_count(), 0);
+        for rid in rids {
+            assert!(
+                bpm.read_page(rid.page_id as usize).is_err(),
+                "page {} survived",
+                rid.page_id
+            );
+        }
     }
 }

@@ -16,6 +16,7 @@ use crate::processor::plan::{
     ValuesPlanNode, WindowFunctionPlanNode,
 };
 use crate::table_heap::{RecordId, TableHeap, TableHeapError, TableHeapIterator, Tuple};
+use log::warn;
 use std::collections::hash_map::IntoIter;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -60,6 +61,9 @@ pub struct ExecutorContext<'a> {
     pub bpm: Arc<BufferPoolManager>,
     pub txn: Arc<Transaction>,
     pub txn_mgr: Arc<TransactionManager>,
+    /// Tuple bytes an `ORDER BY` sorts in memory; past this it spills sorted runs to scratch
+    /// pages in the buffer pool and merges them.
+    pub sort_memory_budget_bytes: usize,
 }
 
 impl<'a> ExecutorContext<'a> {
@@ -74,12 +78,24 @@ impl<'a> ExecutorContext<'a> {
             bpm,
             txn,
             txn_mgr,
+            sort_memory_budget_bytes: DEFAULT_SORT_MEMORY_BUDGET_BYTES,
+        }
+    }
+
+    /// The same context with `ORDER BY` spilling once its input passes `bytes` of tuple data.
+    pub fn with_sort_memory_budget(self, bytes: usize) -> Self {
+        Self {
+            sort_memory_budget_bytes: bytes,
+            ..self
         }
     }
 }
 
 /// Default number of rows an executor aims to put in each [`Batch`].
 pub const DEFAULT_BATCH_SIZE: usize = 1024;
+
+/// Default for [`ExecutorContext::sort_memory_budget_bytes`].
+pub const DEFAULT_SORT_MEMORY_BUDGET_BYTES: usize = 5_000 * PAGE_SIZE;
 
 /// A single row flowing through the executor tree, with the record id it came from, or
 /// [`RecordId::RESERVED`] for rows that do not map back to a table slot.
@@ -1343,12 +1359,62 @@ impl<'a> Executor for SortExecutor<'a> {
     }
 }
 
+/// Sorts its input in memory while the input's tuple bytes stay within its memory budget,
+/// and otherwise spills sorted runs to scratch heaps and merges them.
 pub struct ExternalMergeSortExecutor<'a> {
     plan: &'a ExternalMergeSortPlanNode,
     child: Box<dyn Executor + 'a>,
     bpm: Arc<BufferPoolManager>,
     batch_size: usize,
-    iter: Option<TableHeapIterator>,
+    memory_budget_bytes: usize,
+    output: Option<SortedOutput>,
+}
+
+/// Where an [`ExternalMergeSortExecutor`] reads its sorted rows from.
+enum SortedOutput {
+    InMemory(VecIter<Tuple>),
+    Spilled {
+        iter: TableHeapIterator,
+        run: SpillRun,
+    },
+}
+
+/// A sorted run in a scratch heap. [`SpillRun::free`] deletes its pages; dropping a run that
+/// was not freed deletes them too and logs a failure, since `Drop` cannot return it.
+struct SpillRun {
+    heap: Option<TableHeap>,
+}
+
+impl SpillRun {
+    const FREED: &'static str = "a spill run holds its heap until free consumes the run";
+
+    fn new(bpm: Arc<BufferPoolManager>) -> Result<Self, TableHeapError> {
+        Ok(Self {
+            heap: Some(TableHeap::new(bpm)?),
+        })
+    }
+
+    fn insert(&self, t: &Tuple) -> Result<(), TableHeapError> {
+        self.heap.as_ref().expect(Self::FREED).insert(t).map(drop)
+    }
+
+    fn iter(&self) -> TableHeapIterator {
+        self.heap.as_ref().expect(Self::FREED).iter()
+    }
+
+    fn free(mut self) -> Result<(), TableHeapError> {
+        self.heap.take().expect(Self::FREED).free()
+    }
+}
+
+impl Drop for SpillRun {
+    fn drop(&mut self) {
+        if let Some(heap) = self.heap.take()
+            && let Err(e) = heap.free()
+        {
+            warn!("could not free the pages of a dropped sort run: {e}");
+        }
+    }
 }
 
 impl<'a> ExternalMergeSortExecutor<'a> {
@@ -1357,13 +1423,15 @@ impl<'a> ExternalMergeSortExecutor<'a> {
         child: Box<dyn Executor + 'a>,
         bpm: Arc<BufferPoolManager>,
         batch_size: usize,
+        memory_budget_bytes: usize,
     ) -> Self {
         Self {
             plan,
             child,
             bpm,
             batch_size,
-            iter: None,
+            memory_budget_bytes,
+            output: None,
         }
     }
 }
@@ -1447,23 +1515,23 @@ fn sorted_by_exprs<T>(
     Ok(keyed.into_iter().map(|(_, row)| row).collect())
 }
 
-/// Input bytes the external merge sort sorts in memory before spilling them as one run.
-const SORT_RUN_BUDGET_BYTES: usize = 5_000 * PAGE_SIZE;
-
 impl<'a> ExternalMergeSortExecutor<'a> {
-    fn spill_sorted_run(&self, rows: &mut Vec<Tuple>) -> Result<TableHeap, ExecutorError> {
-        let (order_by, schema) = (&self.plan.order_by_exprs, &self.plan.schema);
-        let sorted = sorted_by_exprs(std::mem::take(rows), |t| t, order_by, schema)?;
-        let run = TableHeap::new(self.bpm.clone())?;
+    fn sort_in_memory(&self, rows: Vec<Tuple>) -> Result<Vec<Tuple>, ExecutorError> {
+        sorted_by_exprs(rows, |t| t, &self.plan.order_by_exprs, &self.plan.schema)
+    }
+
+    fn spill_sorted_run(&self, rows: &mut Vec<Tuple>) -> Result<SpillRun, ExecutorError> {
+        let sorted = self.sort_in_memory(std::mem::take(rows))?;
+        let run = SpillRun::new(self.bpm.clone())?;
         for t in sorted {
             run.insert(&t)?;
         }
         Ok(run)
     }
 
-    fn merge_runs(&self, a: &TableHeap, b: &TableHeap) -> Result<TableHeap, ExecutorError> {
+    fn merge_runs(&self, a: &SpillRun, b: &SpillRun) -> Result<SpillRun, ExecutorError> {
         let (order_by, schema) = (&self.plan.order_by_exprs, &self.plan.schema);
-        let out = TableHeap::new(self.bpm.clone())?;
+        let out = SpillRun::new(self.bpm.clone())?;
         let mut a_rows = a.iter();
         let mut b_rows = b.iter();
         let next_keyed =
@@ -1493,61 +1561,101 @@ impl<'a> ExternalMergeSortExecutor<'a> {
             *head = next_keyed(rows)?;
         }
     }
-}
 
-impl<'a> Executor for ExternalMergeSortExecutor<'a> {
-    fn open(&mut self) -> Result<(), ExecutorError> {
-        self.child.open()?;
-        let mut run_bytes: usize = 0;
-        let mut buf: Vec<Tuple> = Vec::new();
-        let mut runs: Vec<TableHeap> = Vec::new();
-
-        while let Some(batch) = self.child.next_batch()? {
-            for (tup, _) in batch {
-                run_bytes += tup.data.len();
-                buf.push(tup);
-                if run_bytes >= SORT_RUN_BUDGET_BYTES {
-                    runs.push(self.spill_sorted_run(&mut buf)?);
-                    run_bytes = 0;
-                }
-            }
-        }
-        runs.push(self.spill_sorted_run(&mut buf)?);
-
+    /// Merges `runs` pairwise into one run, freeing each run once it has been merged.
+    fn merge_all(&self, mut runs: Vec<SpillRun>) -> Result<SpillRun, ExecutorError> {
         while runs.len() > 1 {
-            let mut next_runs: Vec<TableHeap> = Vec::with_capacity(runs.len().div_ceil(2));
+            let mut next_runs = Vec::with_capacity(runs.len().div_ceil(2));
             let mut pending = runs.into_iter();
             while let Some(a) = pending.next() {
                 match pending.next() {
-                    Some(b) => next_runs.push(self.merge_runs(&a, &b)?),
+                    Some(b) => {
+                        next_runs.push(self.merge_runs(&a, &b)?);
+                        a.free()?;
+                        b.free()?;
+                    }
                     None => next_runs.push(a),
                 }
             }
             runs = next_runs;
         }
+        runs.pop()
+            .ok_or_else(|| ExecutorError("external sort produced no runs".to_string()))
+    }
 
-        let sorted = runs
-            .pop()
-            .ok_or_else(|| ExecutorError("external sort produced no runs".to_string()))?;
-        self.iter = Some(sorted.iter());
+    /// Reads the child to the end, spilling a sorted run each time the buffered tuple bytes
+    /// pass the memory budget. Returns the runs and the rows still buffered.
+    fn read_input(&mut self) -> Result<(Vec<SpillRun>, Vec<Tuple>), ExecutorError> {
+        let mut runs = Vec::new();
+        let mut buffered = Vec::new();
+        let mut buffered_bytes: usize = 0;
+        while let Some(batch) = self.child.next_batch()? {
+            for (tup, _) in batch {
+                buffered_bytes += tup.data.len();
+                buffered.push(tup);
+                if buffered_bytes > self.memory_budget_bytes {
+                    runs.push(self.spill_sorted_run(&mut buffered)?);
+                    buffered_bytes = 0;
+                }
+            }
+        }
+        Ok((runs, buffered))
+    }
+}
+
+impl<'a> Executor for ExternalMergeSortExecutor<'a> {
+    fn open(&mut self) -> Result<(), ExecutorError> {
+        self.output = None;
+        self.child.open()?;
+        let (mut runs, buffered) = self.read_input()?;
+        let output = if runs.is_empty() {
+            SortedOutput::InMemory(self.sort_in_memory(buffered)?.into_iter())
+        } else {
+            let mut rest = buffered;
+            if !rest.is_empty() {
+                runs.push(self.spill_sorted_run(&mut rest)?);
+            }
+            let run = self.merge_all(runs)?;
+            SortedOutput::Spilled {
+                iter: run.iter(),
+                run,
+            }
+        };
+        self.output = Some(output);
         Ok(())
     }
 
-    /// Yields the sorted rows with [`RecordId::RESERVED`], since their record ids point into
-    /// a scratch heap.
+    /// Yields the sorted rows with [`RecordId::RESERVED`], since a sort's rows map back to no
+    /// single table slot.
     fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
-        let iter = self
-            .iter
+        let output = self
+            .output
             .as_mut()
             .ok_or_else(|| not_opened("ExternalMergeSortExecutor"))?;
-        let mut rows = iter
-            .by_ref()
-            .map(|item| item.map(|(tup, _)| (tup, RecordId::RESERVED)));
-        fill_batch(&mut rows, self.batch_size)
+        match output {
+            SortedOutput::InMemory(rows) => Ok(take_batch(
+                &mut rows.by_ref().map(|t| (t, RecordId::RESERVED)),
+                self.batch_size,
+            )),
+            SortedOutput::Spilled { iter, .. } => {
+                let mut rows = iter
+                    .by_ref()
+                    .map(|item| item.map(|(tup, _)| (tup, RecordId::RESERVED)));
+                fill_batch(&mut rows, self.batch_size)
+            }
+        }
     }
+
+    /// Closes the child and deletes the pages of the spilled run, if the sort spilled.
     fn close(&mut self) -> Result<(), ExecutorError> {
-        self.child.close()
+        let child = self.child.close();
+        let freed = match self.output.take() {
+            Some(SortedOutput::Spilled { run, .. }) => run.free().map_err(ExecutorError::from),
+            Some(SortedOutput::InMemory(_)) | None => Ok(()),
+        };
+        child.and(freed)
     }
+
     fn schema(&self) -> &Schema {
         &self.plan.schema
     }
@@ -2163,6 +2271,7 @@ mod tests {
             values_child(&plan.child),
             bpm,
             DEFAULT_BATCH_SIZE,
+            DEFAULT_SORT_MEMORY_BUDGET_BYTES,
         );
 
         let mut a = int_rows(&schema, &[&[5, 0], &[1, 0], &[3, 0]]);
@@ -2226,6 +2335,7 @@ mod tests {
             values_child(&plan.child),
             bpm,
             DEFAULT_BATCH_SIZE,
+            DEFAULT_SORT_MEMORY_BUDGET_BYTES,
         );
 
         let mut a = int_rows(&schema, &[&[5, 0], &[1, 0], &[3, 0]]);
@@ -2306,6 +2416,7 @@ mod tests {
                 values_child(&plan.child),
                 bpm.clone(),
                 DEFAULT_BATCH_SIZE,
+                DEFAULT_SORT_MEMORY_BUDGET_BYTES,
             );
             let mut a = nullable_int_rows(&schema, &[&[Some(2)], &[None], &[Some(5)]]);
             let mut b = nullable_int_rows(&schema, &[&[None], &[Some(1)], &[Some(3)]]);
@@ -2318,6 +2429,126 @@ mod tests {
                 "{direction:?} NULLS {nulls:?}"
             );
         }
+    }
+
+    fn external_sort_of(plan: &Plan) -> &ExternalMergeSortPlanNode {
+        match plan {
+            Plan::ExternalMergeSort(p) => p,
+            _ => panic!("expected an external merge sort plan"),
+        }
+    }
+
+    fn descending_external_sort(rows: &[&[i32]]) -> Plan {
+        let schema = int_schema(&["k"]);
+        Plan::ExternalMergeSort(ExternalMergeSortPlanNode {
+            schema: schema.clone(),
+            child: Box::new(values_plan(&schema, rows)),
+            order_by_exprs: vec![SortExpr::descending(col(0))],
+        })
+    }
+
+    const SPILL_EVERY_ROW: usize = 0;
+
+    #[test]
+    fn external_sort_within_its_budget_sorts_without_scratch_pages() {
+        let (bpm, _dir) = crate::testing::bpm(8);
+        let plan = descending_external_sort(&[&[2], &[7], &[1]]);
+        let node = external_sort_of(&plan);
+        let mut exec = ExternalMergeSortExecutor::new(
+            node,
+            values_child(&node.child),
+            bpm.clone(),
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_SORT_MEMORY_BUDGET_BYTES,
+        );
+        assert_eq!(
+            decode_ints(&node.schema, drain(&mut exec)),
+            vec![vec![7], vec![2], vec![1]]
+        );
+        exec.close().unwrap();
+        assert_eq!(bpm.allocated_page_count(), 0, "the sort spilled");
+    }
+
+    #[test]
+    fn external_sort_past_its_budget_spills_and_close_frees_every_scratch_page() {
+        let (bpm, _dir) = crate::testing::bpm(8);
+        let input: Vec<[i32; 1]> = (0..40).map(|i| [(i * 17) % 40]).collect();
+        let rows: Vec<&[i32]> = input.iter().map(|r| &r[..]).collect();
+        let plan = descending_external_sort(&rows);
+        let node = external_sort_of(&plan);
+        let mut exec = ExternalMergeSortExecutor::new(
+            node,
+            values_child(&node.child),
+            bpm.clone(),
+            3,
+            SPILL_EVERY_ROW,
+        );
+
+        let sorted = decode_ints(&node.schema, drain(&mut exec));
+
+        assert_eq!(sorted, (0..40).rev().map(|i| vec![i]).collect::<Vec<_>>());
+        assert!(
+            bpm.allocated_page_count() > 40,
+            "expected a run per row plus merge output, got {} pages",
+            bpm.allocated_page_count()
+        );
+        assert!(
+            bpm.live_page_count() > 0,
+            "the merged run is read until close"
+        );
+        exec.close().unwrap();
+        assert_eq!(bpm.live_page_count(), 0, "scratch pages outlived close");
+    }
+
+    #[test]
+    fn dropping_an_external_sort_without_closing_it_frees_its_scratch_pages() {
+        let (bpm, _dir) = crate::testing::bpm(8);
+        let plan = descending_external_sort(&[&[3], &[1], &[2]]);
+        let node = external_sort_of(&plan);
+        let mut exec = ExternalMergeSortExecutor::new(
+            node,
+            values_child(&node.child),
+            bpm.clone(),
+            DEFAULT_BATCH_SIZE,
+            SPILL_EVERY_ROW,
+        );
+        exec.open().unwrap();
+        assert!(bpm.live_page_count() > 0, "the sort did not spill");
+        drop(exec);
+        assert_eq!(bpm.live_page_count(), 0);
+    }
+
+    #[test]
+    fn a_failed_external_sort_frees_the_runs_it_spilled() {
+        let (bpm, _dir) = crate::testing::bpm(8);
+        let schema = int_schema(&["a"]);
+        let plan = ExternalMergeSortPlanNode {
+            schema: schema.clone(),
+            child: Box::new(values_plan(&schema, &[&[2], &[1], &[0]])),
+            order_by_exprs: vec![SortExpr::ascending(Expression::Binary {
+                left: Box::new(Expression::Constant(Some(Value::INT(6)))),
+                right: Box::new(col(0)),
+                op: crate::processor::plan::Op::Div,
+            })],
+        };
+        let mut exec = ExternalMergeSortExecutor::new(
+            &plan,
+            values_child(&plan.child),
+            bpm.clone(),
+            DEFAULT_BATCH_SIZE,
+            SPILL_EVERY_ROW,
+        );
+        let err = exec.open().unwrap_err();
+        assert!(err.0.contains("division by zero"), "{}", err.0);
+        assert!(
+            bpm.allocated_page_count() >= 2,
+            "the rows before the zero were not spilled"
+        );
+        assert_eq!(
+            bpm.live_page_count(),
+            0,
+            "runs spilled before the error leaked"
+        );
     }
 
     fn divide_by_zero(col_idx: u32) -> Expression {

@@ -74,6 +74,7 @@ pub fn create_executor_with_batch_size<'a>(
                 child,
                 bpm.clone(),
                 batch_size,
+                ctx.sort_memory_budget_bytes,
             ))
         }
         Plan::Limit(p) => {
