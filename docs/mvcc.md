@@ -127,5 +127,8 @@ Changed:
 - A page format version. The table page layout changed with this work (slot entries grew
   from 9 to 17 bytes). Nothing is persisted across runs today, since the shell and the
   catalog live in a temp dir and in memory, so no old file can be misread yet.
-- Populating a new index from rows already in the table (pre-existing TODO).
-- `CREATE`/`DROP` are not transactional.
+- `CREATE`/`DROP` are not transactional. `CREATE INDEX` fills the new index from the
+  newest version of each row, outside any transaction. If another transaction has an
+  uncommitted update or delete open at that moment, the index can miss the row once that
+  transaction rolls back, and older snapshots can't find old keys through it. Run
+  `CREATE INDEX` while no other transaction is open.
