@@ -539,20 +539,9 @@ mod tests {
     use crate::replacer::ArcReplacer;
     use std::time::Duration;
 
-    fn make_bpm(num_frames: usize) -> (Arc<BufferPoolManager>, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).unwrap();
-        let bpm = BufferPoolManager::new(
-            num_frames,
-            ArcReplacer::new(num_frames),
-            DiskScheduler::new(dm),
-        );
-        (Arc::new(bpm), dir)
-    }
-
     #[test]
     fn allocated_page_count_counts_new_pages_without_allocating() {
-        let (bpm, _dir) = make_bpm(2);
+        let (bpm, _dir) = crate::testing::bpm(2);
         assert_eq!(bpm.allocated_page_count(), 0);
         for expected in 1..=3 {
             drop(bpm.new_page().unwrap());
@@ -563,7 +552,7 @@ mod tests {
 
     #[test]
     fn a_page_stops_being_resident_once_it_is_evicted() {
-        let (bpm, _dir) = make_bpm(2);
+        let (bpm, _dir) = crate::testing::bpm(2);
         let first = bpm.new_page().unwrap().page_id().unwrap();
         assert!(bpm.is_resident(first));
         assert!(!bpm.is_resident(first + 100));
@@ -587,7 +576,7 @@ mod tests {
 
     #[test]
     fn dropping_a_guard_with_zero_pins_still_releases_the_frame_lock() {
-        let (bpm, _dir) = make_bpm(1);
+        let (bpm, _dir) = crate::testing::bpm(1);
         let page = bpm.new_page().unwrap();
         let page_id = page.page_id().unwrap();
         bpm.meta.lock().pins[page.frame_id()] = 0;
@@ -609,7 +598,7 @@ mod tests {
 
     #[test]
     fn concurrent_access_retries_when_a_cached_frame_is_reassigned() {
-        let (bpm, _dir) = make_bpm(2);
+        let (bpm, _dir) = crate::testing::bpm(2);
         let page_count = 6;
         for _ in 0..page_count {
             drop(bpm.new_page().unwrap());
@@ -646,7 +635,7 @@ mod tests {
 
     #[test]
     fn last_guard_drop_makes_the_frame_evictable_again() {
-        let (bpm, _dir) = make_bpm(1);
+        let (bpm, _dir) = crate::testing::bpm(1);
         let page_id = bpm.new_page().unwrap().page_id().unwrap();
         let first = bpm.read_page(page_id).unwrap();
         let second = bpm.read_page(page_id).unwrap();
@@ -683,7 +672,7 @@ mod tests {
     }
 
     fn assert_a_hit_waits_while_a_miss_is_stalled_on(stalled: StalledDiskRequest) {
-        let (bpm, _dir) = make_bpm(2);
+        let (bpm, _dir) = crate::testing::bpm(2);
         let evicted = bpm.new_page().unwrap().page_id().unwrap();
         let victim = bpm.new_page().unwrap().page_id().unwrap();
         let resident = bpm.new_page().unwrap().page_id().unwrap();

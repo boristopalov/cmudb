@@ -1,68 +1,39 @@
-//! Shared harness for SQL-level end-to-end tests: wires disk manager,
-//! buffer pool, catalog, binder, planner and executors together and runs
-//! SQL text, returning decoded rows.
+//! Shared harness for SQL-level end-to-end tests: a thin wrapper over [`cmudb::Database`]
+//! that returns each statement's rows as decoded values.
 #![allow(dead_code)]
 
-use cmudb::buffer_pool::BufferPoolManager;
-use cmudb::catalog::{Catalog, Value};
-use cmudb::concurrency::{IsolationLevel, TransactionManager};
-use cmudb::create_buffer_pool_manager;
-use cmudb::disk::{DiskManager, DiskScheduler};
-use cmudb::parser::Binder;
-use cmudb::planner::Planner;
-use cmudb::processor::executor::{ExecutorContext, RowCursor};
-use cmudb::processor::executor_factory::create_executor;
+use cmudb::catalog::Value;
 use cmudb::processor::plan::Plan;
-use cmudb::replacer::ArcReplacer;
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
-use std::sync::Arc;
-use tempfile::TempDir;
+use cmudb::{Database, StatementResult};
+use std::ops::Deref;
 
-pub type Row = Vec<Option<Value>>;
+pub type Row = cmudb::database::Row;
 
+/// A [`Database`] in a scratch directory; derefs to it for everything the wrapper does not cover.
 pub struct Db {
-    pub catalog: Catalog,
-    pub bpm: Arc<BufferPoolManager>,
-    pub txn_mgr: Arc<TransactionManager>,
-    _dir: TempDir,
+    db: Database,
+}
+
+impl Deref for Db {
+    type Target = Database;
+
+    fn deref(&self) -> &Database {
+        &self.db
+    }
 }
 
 impl Db {
     pub fn new(num_frames: usize) -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).expect("disk");
-        let bpm = Arc::new(create_buffer_pool_manager(
-            num_frames,
-            ArcReplacer::new(num_frames),
-            DiskScheduler::new(dm),
-        ));
-        let catalog = Catalog::new(bpm.clone());
         Self {
-            catalog,
-            txn_mgr: Arc::new(TransactionManager::new(bpm.clone())),
-            bpm,
-            _dir: dir,
+            db: Database::scratch(num_frames).expect("temporary database"),
         }
     }
 
     /// Runs every statement in `sql` and returns the rows of the last one.
     /// DML statements return a single row holding the affected-row count.
     pub fn try_exec(&self, sql: &str) -> Result<Vec<Row>, String> {
-        let ast = Parser::parse_sql(&GenericDialect, sql).map_err(|e| format!("parse: {e}"))?;
-        let mut out = Vec::new();
-        for stmt in ast {
-            let bound = Binder::new(&self.catalog)
-                .bind(vec![stmt])
-                .map_err(|e| format!("bind: {}", e.0))?;
-            for stmt in bound {
-                let plan = Planner::new(&self.catalog)
-                    .plan(stmt)
-                    .map_err(|e| format!("plan: {}", e.0))?;
-                out = self.run_plan(&plan)?;
-            }
-        }
-        Ok(out)
+        let results = self.db.execute(sql).map_err(|e| e.to_string())?;
+        Ok(results.into_iter().last().map(rows_of).unwrap_or_default())
     }
 
     pub fn exec(&self, sql: &str) -> Vec<Row> {
@@ -72,72 +43,37 @@ impl Db {
     /// Runs `plan` in a transaction of its own, committed when the plan succeeds and rolled
     /// back when it fails.
     pub fn run_plan(&self, plan: &Plan) -> Result<Vec<Row>, String> {
-        let txn = self.txn_mgr.begin(IsolationLevel::SnapshotIsolation);
-        let ctx = ExecutorContext::new(
-            &self.catalog,
-            self.bpm.clone(),
-            txn.clone(),
-            self.txn_mgr.clone(),
-        );
-        let result = Self::run_in(&ctx, plan);
-        match &result {
-            Ok(_) => {
-                self.txn_mgr
-                    .commit(&txn)
-                    .map_err(|e| format!("commit: {e}"))?;
-            }
-            Err(_) => self
-                .txn_mgr
-                .abort(&txn)
-                .map_err(|e| format!("abort: {e}"))?,
-        }
-        result
+        self.db
+            .execute_plan(plan)
+            .map(rows_of)
+            .map_err(|e| e.to_string())
     }
 
-    fn run_in(ctx: &ExecutorContext<'_>, plan: &Plan) -> Result<Vec<Row>, String> {
-        let mut exec = create_executor(ctx, plan);
-        exec.open().map_err(|e| format!("open: {}", e.0))?;
-        let mut rows = Vec::new();
-        match plan {
-            Plan::Insert(_) => {
-                if let Some((t, _)) = RowCursor::new(exec.as_mut())
-                    .next_row()
-                    .map_err(|e| format!("exec: {}", e.0))?
-                {
-                    let n = i32::from_ne_bytes(t.data.as_slice().try_into().unwrap());
-                    rows.push(vec![Some(Value::INT(n))]);
-                }
-            }
-            Plan::Update(_) | Plan::Delete(_) => {
-                let mut n = 0;
-                while let Some(batch) = exec.next_batch().map_err(|e| format!("exec: {}", e.0))? {
-                    n += batch.len() as i32;
-                }
-                rows.push(vec![Some(Value::INT(n))]);
-            }
-            Plan::CreateTable(_)
-            | Plan::CreateIndex(_)
-            | Plan::DropTable(_)
-            | Plan::DropIndex(_) => {
-                exec.next_batch().map_err(|e| format!("exec: {}", e.0))?;
-            }
-            _ => {
-                let schema = exec.schema().clone();
-                for row in RowCursor::new(exec.as_mut()) {
-                    let (t, _) = row.map_err(|e| format!("exec: {}", e.0))?;
-                    let row = (0..schema.cols.len())
-                        .map(|i| schema.get_value(&t, i).expect("decode"))
-                        .collect();
-                    rows.push(row);
-                }
-            }
-        }
-        exec.close().map_err(|e| format!("close: {}", e.0))?;
-        Ok(rows)
+    /// The plan `sql` (a single statement) gets.
+    pub fn plan_of(&self, sql: &str) -> Plan {
+        let mut plans = self
+            .db
+            .plan(sql)
+            .unwrap_or_else(|e| panic!("plan {sql}: {e}"));
+        assert_eq!(plans.len(), 1, "expected one statement in {sql}");
+        plans.remove(0)
     }
 
     pub fn table_oid(&self, name: &str) -> u32 {
-        self.catalog.table_oid(name).expect("table")
+        self.db.catalog().table_oid(name).expect("table")
+    }
+}
+
+/// A statement's result as rows: a query's rows, one row holding a DML count, or none.
+pub fn rows_of(result: StatementResult) -> Vec<Row> {
+    match result {
+        StatementResult::Rows { rows, .. } => rows,
+        StatementResult::Count { rows, .. } => {
+            vec![vec![
+                int(i32::try_from(rows).expect("count fits in an INT")),
+            ]]
+        }
+        StatementResult::Ddl(_) | StatementResult::Txn(_) => Vec::new(),
     }
 }
 

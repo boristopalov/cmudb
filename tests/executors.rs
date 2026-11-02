@@ -389,15 +389,20 @@ fn drop_index_then_drop_table() {
     db.exec("CREATE INDEX t_id ON t (id)");
     db.exec("INSERT INTO t VALUES (1, 10)");
     let table_oid = db.table_oid("t");
-    let index_oid = db.catalog.index_oid("t", "t_id").unwrap();
+    let index_oid = db.catalog().index_oid("t", "t_id").unwrap();
 
     db.run_plan(&Plan::DropIndex(DropIndexPlanNode {
         index_oid,
         if_exists: false,
     }))
     .unwrap();
-    assert!(db.catalog.get_index(index_oid).is_err());
-    assert!(db.catalog.get_table_indexes(table_oid).unwrap().is_empty());
+    assert!(db.catalog().get_index(index_oid).is_err());
+    assert!(
+        db.catalog()
+            .get_table_indexes(table_oid)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         ints(&db.exec("SELECT v FROM t WHERE id = 1")),
         vec![[10]],

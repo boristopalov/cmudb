@@ -3,15 +3,11 @@ use std::thread;
 
 use cmudb::buffer_pool::{BpmError, BufferPoolManager};
 use cmudb::catalog::index_schema::{IndexKey, IndexValue};
-use cmudb::create_buffer_pool_manager;
-use cmudb::disk::{DiskManager, DiskScheduler};
 use cmudb::index::BPlusTree;
 use cmudb::index::Index;
-use cmudb::replacer::ArcReplacer;
 use cmudb::table_heap::RecordId;
 use env_logger::Env;
 use rand::Rng;
-use tempfile::tempdir;
 
 fn init_logger() {
     static INIT: std::sync::Once = std::sync::Once::new();
@@ -22,16 +18,7 @@ fn init_logger() {
 
 fn make_bpm(num_frames: usize) -> (Arc<BufferPoolManager>, tempfile::TempDir) {
     init_logger();
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("db");
-    let log_path = dir.path().join("log");
-    let dm = DiskManager::new(&db_path, &log_path).expect("disk manager");
-    let scheduler = DiskScheduler::new(dm);
-    let replacer = ArcReplacer::new(num_frames);
-    (
-        Arc::new(create_buffer_pool_manager(num_frames, replacer, scheduler)),
-        dir,
-    )
+    cmudb::testing::bpm(num_frames)
 }
 
 fn make_key(k: u8, key_len: usize) -> IndexKey {

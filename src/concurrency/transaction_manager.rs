@@ -367,20 +367,12 @@ fn chain_len(mut cur: Option<Arc<UndoLog>>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::create_buffer_pool_manager;
-    use crate::disk::{DiskManager, DiskScheduler};
-    use crate::replacer::ArcReplacer;
+
     use crate::table_heap::Tuple;
-    use tempfile::{TempDir, tempdir};
+    use tempfile::TempDir;
 
     fn setup() -> (Arc<TransactionManager>, TableHeap, TempDir) {
-        let dir = tempdir().unwrap();
-        let dm = DiskManager::new(dir.path().join("db"), dir.path().join("log")).unwrap();
-        let bpm = Arc::new(create_buffer_pool_manager(
-            8,
-            ArcReplacer::new(8),
-            DiskScheduler::new(dm),
-        ));
+        let (bpm, dir) = crate::testing::bpm(8);
         let mgr = Arc::new(TransactionManager::new(bpm.clone()));
         (mgr, TableHeap::new(bpm).unwrap(), dir)
     }
