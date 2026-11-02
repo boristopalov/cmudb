@@ -13,7 +13,8 @@ use sqlparser::ast::{
 
 use crate::catalog::{Catalog, DataType, Schema, Value};
 use crate::processor::plan::{
-    AggType, Expression, JoinType, NullOrdering, Op, SortDirection, SortExpr,
+    AggType, ColIdx, Expression, JoinColumn, JoinPredicate, JoinType, NullOrdering, Op, Side,
+    SortDirection, SortExpr,
 };
 
 /// Argument bound for `COUNT(*)`. COUNT skips NULL arguments, so a non-NULL constant makes it count
@@ -76,11 +77,7 @@ impl<'a> Binder<'a> {
                         if found.is_some() {
                             return Err(BinderError(format!("ambiguous column: {name}")));
                         }
-                        found = Some(Expression::Column {
-                            tuple_idx: ts.idx,
-                            col_idx: idx as u32,
-                            dtype: ts.schema.cols[idx].dtype,
-                        });
+                        found = Some(ts.column(idx));
                     }
                 }
                 found.ok_or_else(|| BinderError(format!("column not found: {name}")))
@@ -99,11 +96,7 @@ impl<'a> Binder<'a> {
                     .schema
                     .col_idx(&c.value)
                     .ok_or_else(|| BinderError(format!("column not found: {}", c.value)))?;
-                Ok(Expression::Column {
-                    tuple_idx: ts.idx,
-                    col_idx: idx as u32,
-                    dtype: ts.schema.cols[idx].dtype,
-                })
+                Ok(ts.column(idx))
             }
 
             Expr::BinaryOp { left, op, right } => {
@@ -177,8 +170,7 @@ impl<'a> Binder<'a> {
                 .dtype()
                 .ok_or_else(|| BinderError("GROUP BY expression has no inferable type".into()))?;
             return Ok(Some(Expression::Column {
-                tuple_idx: 0,
-                col_idx: idx as u32,
+                col: ColIdx(idx as u32),
                 dtype,
             }));
         }
@@ -265,8 +257,7 @@ impl<'a> Binder<'a> {
         let col_idx = ctx.group_bys.len() + ctx.aggregates.len();
         ctx.aggregates.push((arg_expr, agg_type));
         Ok(Expression::Column {
-            tuple_idx: 0,
-            col_idx: col_idx as u32,
+            col: ColIdx(col_idx as u32),
             dtype: result_dtype,
         })
     }
@@ -398,9 +389,9 @@ impl<'a> Binder<'a> {
         })
     }
 
-    /// Builds a scope from the FROM clause. We allow at most two tables, joined
-    /// by a single INNER/LEFT JOIN ... ON. The left table gets tuple_idx 0, the
-    /// right gets tuple_idx 1 — matching how the executors thread tuples.
+    /// Builds a scope from the FROM clause: at most two tables, joined by a single
+    /// INNER/LEFT JOIN ... ON. Columns resolve to positions in the FROM output, which lists the
+    /// left table's columns before the right table's; the ON predicate reads each side's row.
     fn build_select_scope(
         &self,
         from: &[TableWithJoins],
@@ -415,13 +406,15 @@ impl<'a> Binder<'a> {
         };
 
         let mut scope = HashMap::new();
-        let (left_alias, left) = self.bind_table_factor(&twj.relation, 0)?;
+        let (left_alias, left) = self.bind_table_factor(&twj.relation, Side::Left, 0)?;
+        let left_cols = left.schema.cols.len();
         scope.insert(left_alias, left);
 
         let join = match twj.joins.as_slice() {
             [] => None,
             [j] => {
-                let (right_alias, right) = self.bind_table_factor(&j.relation, 1)?;
+                let (right_alias, right) =
+                    self.bind_table_factor(&j.relation, Side::Right, left_cols)?;
                 scope.insert(right_alias, right);
 
                 let (join_type, predicate_expr) = match &j.join_operator {
@@ -434,7 +427,7 @@ impl<'a> Binder<'a> {
                         "only ON <expr> join constraints supported".into(),
                     ));
                 };
-                let predicate = self.resolve_expr(expr, &scope)?;
+                let predicate = join_predicate(self.resolve_expr(expr, &scope)?, left_cols);
                 Some(BoundJoin {
                     join_type,
                     predicate,
@@ -449,7 +442,8 @@ impl<'a> Binder<'a> {
     fn bind_table_factor(
         &self,
         tf: &TableFactor,
-        idx: TupleIndex,
+        side: Side,
+        first_col: usize,
     ) -> Result<(TableAlias, TableScope), BinderError> {
         let TableFactor::Table { name, alias, .. } = tf else {
             return Err(BinderError("FROM target must be a plain table".into()));
@@ -471,7 +465,8 @@ impl<'a> Binder<'a> {
             key,
             TableScope {
                 oid,
-                idx,
+                side,
+                first_col,
                 schema: tinfo.schema.clone(),
             },
         ))
@@ -496,15 +491,9 @@ impl<'a> Binder<'a> {
                 }
                 SelectItem::Wildcard(_) => {
                     let mut tables: Vec<&TableScope> = scope.values().collect();
-                    tables.sort_by_key(|ts| ts.idx);
+                    tables.sort_by_key(|ts| ts.first_col);
                     for ts in tables {
-                        for (i, col) in ts.schema.cols.iter().enumerate() {
-                            out.push(Expression::Column {
-                                tuple_idx: ts.idx,
-                                col_idx: i as u32,
-                                dtype: col.dtype,
-                            });
-                        }
+                        out.extend((0..ts.schema.cols.len()).map(|i| ts.column(i)));
                     }
                 }
                 _ => return Err(BinderError("unsupported select item".into())),
@@ -527,13 +516,14 @@ impl<'a> Binder<'a> {
             return Err(BinderError("INSERT requires VALUES".into()));
         };
 
+        let no_input_columns = HashMap::new();
         let rows = values
             .rows
             .iter()
             .map(|row| {
                 row.content
                     .iter()
-                    .map(|e| self.resolve_expr(e, &scope))
+                    .map(|e| self.resolve_expr(e, &no_input_columns))
                     .collect()
             })
             .collect::<Result<_, _>>()?;
@@ -578,11 +568,7 @@ impl<'a> Binder<'a> {
             let idx = schema
                 .col_idx(&col)
                 .ok_or_else(|| BinderError(format!("column not found: {col}")))?;
-            cols.push(Expression::Column {
-                tuple_idx: 0,
-                col_idx: idx as u32,
-                dtype: schema.cols[idx].dtype,
-            });
+            cols.push(ColIdx(idx as u32));
             new_cols.push(self.resolve_expr(value, &scope)?);
         }
 
@@ -681,7 +667,8 @@ impl<'a> Binder<'a> {
             table_name.to_string(),
             TableScope {
                 oid,
-                idx: 0,
+                side: Side::Left,
+                first_col: 0,
                 schema: tinfo.schema.clone(),
             },
         );
@@ -833,7 +820,7 @@ pub struct BoundSelect {
 
 pub struct BoundJoin {
     pub join_type: JoinType,
-    pub predicate: Expression,
+    pub predicate: JoinPredicate,
 }
 
 pub struct BoundValues {
@@ -847,7 +834,7 @@ pub struct BoundInsert {
 
 pub struct BoundUpdate {
     pub scope: Scope,
-    pub cols: Vec<Expression>,
+    pub cols: Vec<ColIdx>,
     pub new_cols: Vec<Expression>,
     pub filters: Option<Vec<Expression>>,
 }
@@ -872,12 +859,39 @@ pub struct BoundCreateIndex {
 pub type Scope = HashMap<TableAlias, TableScope>;
 pub struct TableScope {
     pub oid: TableOid,
-    pub idx: TupleIndex,
+    pub side: Side,
+    /// Position of this table's first column in the statement's FROM output.
+    pub first_col: usize,
     pub schema: Schema,
 }
+
+impl TableScope {
+    /// A reference to this table's column `idx`, positioned in the FROM output.
+    fn column(&self, idx: usize) -> Expression {
+        Expression::Column {
+            col: ColIdx((self.first_col + idx) as u32),
+            dtype: self.schema.cols[idx].dtype,
+        }
+    }
+}
+
 pub type TableAlias = String;
 pub type TableOid = u32;
-pub type TupleIndex = u8;
+
+/// Rewrites an ON predicate bound over the FROM output into one that reads the left and right
+/// rows of the join, given the number of columns the left table contributes.
+fn join_predicate(predicate: Expression, left_cols: usize) -> JoinPredicate {
+    predicate.map_columns(|col| match col.index().checked_sub(left_cols) {
+        None => JoinColumn {
+            side: Side::Left,
+            col,
+        },
+        Some(right_idx) => JoinColumn {
+            side: Side::Right,
+            col: ColIdx(right_idx as u32),
+        },
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -890,7 +904,7 @@ mod tests {
     use crate::catalog::{Catalog, DataType, Schema};
     use crate::create_buffer_pool_manager;
     use crate::disk::{DiskManager, DiskScheduler};
-    use crate::processor::plan::Expression;
+    use crate::processor::plan::{ColIdx, Expression, JoinColumn, JoinPredicate, Side};
     use crate::replacer::ArcReplacer;
 
     fn catalog_with_tables(tables: &[(&str, &[&str])]) -> (Catalog, tempfile::TempDir) {
@@ -921,13 +935,11 @@ mod tests {
             .map_err(|e| e.0)
     }
 
-    fn column_refs(exprs: &[Expression]) -> Vec<(u8, u32)> {
+    fn column_refs(exprs: &[Expression]) -> Vec<u32> {
         exprs
             .iter()
             .map(|e| match e {
-                Expression::Column {
-                    tuple_idx, col_idx, ..
-                } => (*tuple_idx, *col_idx),
+                Expression::Column { col, .. } => col.0,
                 _ => panic!("expected only column references"),
             })
             .collect()
@@ -942,7 +954,7 @@ mod tests {
             else {
                 panic!("expected a bound SELECT");
             };
-            assert_eq!(column_refs(&sel.projections), vec![(0, 0), (0, 1), (1, 0)]);
+            assert_eq!(column_refs(&sel.projections), vec![0, 1, 2]);
         }
     }
 
@@ -951,6 +963,47 @@ mod tests {
             Ok(_) => panic!("expected `{sql}` to fail to bind"),
             Err(e) => e,
         }
+    }
+
+    #[test]
+    fn join_predicate_reads_each_column_from_its_own_side() {
+        let (catalog, _dir) = catalog_with_tables(&[("l", &["a", "b"]), ("r", &["c"])]);
+        let Ok(BoundStatement::Select(sel)) =
+            bind_one(&catalog, "SELECT * FROM l JOIN r ON l.b = r.c")
+        else {
+            panic!("expected a bound SELECT");
+        };
+        let join = sel.join.expect("a bound join");
+        let Expression::Binary { left, right, .. } = join.predicate else {
+            panic!("expected `l.b = r.c`");
+        };
+        let side_of = |e: &JoinPredicate| match e {
+            Expression::Column { col, .. } => *col,
+            _ => panic!("expected a column reference"),
+        };
+        assert_eq!(
+            side_of(&left),
+            JoinColumn {
+                side: Side::Left,
+                col: ColIdx(1)
+            }
+        );
+        assert_eq!(
+            side_of(&right),
+            JoinColumn {
+                side: Side::Right,
+                col: ColIdx(0)
+            }
+        );
+    }
+
+    #[test]
+    fn insert_values_referencing_a_column_is_a_bind_error() {
+        let (catalog, _dir) = catalog_with_tables(&[("t", &["a"])]);
+        let err = bind_error(&catalog, "INSERT INTO t VALUES (a)");
+        assert!(err.contains("column not found: a"), "{err}");
+        let err = bind_error(&catalog, "INSERT INTO t VALUES (t.a + 1)");
+        assert!(err.contains("table not in scope: t"), "{err}");
     }
 
     #[test]
@@ -987,7 +1040,7 @@ mod tests {
         else {
             panic!("expected a bound SELECT");
         };
-        assert_eq!(column_refs(&sel.projections), vec![(0, 0), (0, 1), (0, 2)]);
+        assert_eq!(column_refs(&sel.projections), vec![0, 1, 2]);
         assert_eq!(sel.group_bys.len(), 1);
         assert_eq!(sel.aggregates.len(), 2);
     }

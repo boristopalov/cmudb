@@ -330,6 +330,34 @@ fn inner_and_left_joins_without_index_use_nested_loop_join() {
 }
 
 #[test]
+fn group_by_and_order_by_read_right_side_join_columns() {
+    let db = emp_db();
+    db.exec("CREATE TABLE dept (id INTEGER, name INTEGER)");
+    db.exec("INSERT INTO dept VALUES (10, 1000), (20, 2000), (40, 4000)");
+    assert_eq!(
+        ints(&db.exec(
+            "SELECT emp.id FROM emp JOIN dept ON emp.dept = dept.id \
+             ORDER BY dept.name DESC, emp.id DESC"
+        )),
+        vec![[3], [2], [1]]
+    );
+    assert_eq!(
+        ints(&db.exec(
+            "SELECT dept.name, COUNT(*), SUM(emp.salary) FROM emp JOIN dept ON emp.dept = dept.id \
+             GROUP BY dept.name ORDER BY dept.name DESC"
+        )),
+        vec![[2000, 1, 300], [1000, 2, 300]]
+    );
+    assert_eq!(
+        ints(&db.exec(
+            "SELECT dept.id, COUNT(*) FROM emp LEFT JOIN dept ON emp.dept = dept.id \
+             WHERE dept.id > 0 GROUP BY dept.id ORDER BY dept.id"
+        )),
+        vec![[10, 2], [20, 1]]
+    );
+}
+
+#[test]
 fn inner_join_with_index_on_inner_side_uses_nested_index_join() {
     let db = Db::new(64);
     db.exec("CREATE TABLE t (id INTEGER, v INTEGER)");
@@ -543,6 +571,19 @@ fn other_column_types_parse() {
     assert_eq!(rows[0][0], int(1));
     assert_eq!(rows[0][4], Some(Value::BOOLEAN(true)));
     assert_eq!(rows[0][5], None);
+}
+
+#[test]
+fn insert_values_naming_a_column_is_a_bind_error_and_inserts_nothing() {
+    let db = Db::new(8);
+    db.exec("CREATE TABLE t (a INTEGER)");
+    let err = db
+        .try_exec("INSERT INTO t VALUES (a)")
+        .expect_err("a VALUES row has no input columns to read");
+    assert!(err.contains("column not found: a"), "{err}");
+    assert!(db.exec("SELECT * FROM t").is_empty());
+    db.exec("INSERT INTO t VALUES (1 + 2)");
+    assert_eq!(ints(&db.exec("SELECT a FROM t")), vec![vec![3]]);
 }
 
 #[test]

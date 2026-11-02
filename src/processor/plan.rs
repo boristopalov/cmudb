@@ -5,6 +5,7 @@ use crate::{
 };
 use ordered_float::OrderedFloat;
 use std::cmp::Ordering;
+use std::convert::Infallible;
 use std::ops::Bound;
 
 pub enum Plan {
@@ -107,7 +108,7 @@ pub struct NestedLoopJoinPlanNode {
     pub schema: Schema,
     pub left: Box<Plan>,
     pub right: Box<Plan>,
-    pub predicate: Expression,
+    pub predicate: JoinPredicate,
     pub join_type: JoinType,
 }
 
@@ -246,28 +247,86 @@ pub struct DropIndexPlanNode {
     pub if_exists: bool,
 }
 
-/// `Expression::Column::tuple_idx` of a column read from the left (or only) input.
-pub const LEFT_TUPLE: u8 = 0;
-/// `Expression::Column::tuple_idx` of a column read from the right input of a join.
-pub const RIGHT_TUPLE: u8 = 1;
+/// Position of a column in the schema of the input an expression is evaluated against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ColIdx(pub u32);
 
-#[derive(Clone)]
-pub enum Expression {
+impl ColIdx {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Which input of a join a column comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Left,
+    Right,
+}
+
+/// A column of one input of a join, as read by a join predicate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JoinColumn {
+    pub side: Side,
+    pub col: ColIdx,
+}
+
+/// A predicate over the left and right input rows of a join.
+pub type JoinPredicate = Expression<JoinColumn>;
+
+/// A scalar expression whose column references are `C`: a [`ColIdx`] into one input row, or a
+/// [`JoinColumn`] inside a [`JoinPredicate`].
+#[derive(Clone, Debug)]
+pub enum Expression<C = ColIdx> {
     Constant(Option<Value>),
     Column {
-        /// [`LEFT_TUPLE`] or [`RIGHT_TUPLE`].
-        tuple_idx: u8,
-        col_idx: u32,
+        col: C,
         dtype: DataType,
     },
     Binary {
-        left: Box<Expression>,
-        right: Box<Expression>,
+        left: Box<Expression<C>>,
+        right: Box<Expression<C>>,
         op: Op,
     },
 }
 
-impl Expression {
+/// The values an expression's column references `C` read from.
+pub trait ColumnSource<C> {
+    fn column_value(&self, col: C) -> Result<Option<Value>, ExecutorError>;
+}
+
+/// One input row and the schema it is encoded with.
+#[derive(Clone, Copy)]
+pub struct InputRow<'a> {
+    pub tuple: &'a Tuple,
+    pub schema: &'a Schema,
+}
+
+impl ColumnSource<ColIdx> for InputRow<'_> {
+    fn column_value(&self, col: ColIdx) -> Result<Option<Value>, ExecutorError> {
+        self.schema
+            .get_value(self.tuple, col.index())
+            .map_err(|e| ExecutorError(format!("cannot read column {}: {e:?}", col.0)))
+    }
+}
+
+/// The left and right input rows a join predicate is evaluated against.
+#[derive(Clone, Copy)]
+pub struct JoinRow<'a> {
+    pub left: InputRow<'a>,
+    pub right: InputRow<'a>,
+}
+
+impl ColumnSource<JoinColumn> for JoinRow<'_> {
+    fn column_value(&self, col: JoinColumn) -> Result<Option<Value>, ExecutorError> {
+        match col.side {
+            Side::Left => self.left.column_value(col.col),
+            Side::Right => self.right.column_value(col.col),
+        }
+    }
+}
+
+impl<C: Copy> Expression<C> {
     /// The type this expression evaluates to, or `None` for a NULL constant.
     pub fn dtype(&self) -> Option<DataType> {
         match self {
@@ -286,73 +345,49 @@ impl Expression {
         }
     }
 
-    /// Evaluates the expression against one tuple. In a join schema, right-input
-    /// columns are read at `schema.join_offset + col_idx`.
-    pub fn evaluate(&self, tuple: &Tuple, schema: &Schema) -> Result<Option<Value>, ExecutorError> {
+    /// Evaluates the expression, reading each column reference from `row`.
+    pub fn evaluate_on(&self, row: &impl ColumnSource<C>) -> Result<Option<Value>, ExecutorError> {
         match self {
             Expression::Binary { left, right, op } => {
-                let l = left.evaluate(tuple, schema)?;
-                let r = right.evaluate(tuple, schema)?;
+                let l = left.evaluate_on(row)?;
+                let r = right.evaluate_on(row)?;
                 eval_binary(op, l, r)
             }
-            Expression::Column {
-                tuple_idx, col_idx, ..
-            } => {
-                let idx = match *tuple_idx {
-                    LEFT_TUPLE => *col_idx as usize,
-                    RIGHT_TUPLE => {
-                        let offset = schema.join_offset.ok_or_else(|| {
-                            ExecutorError(
-                                "right-input column evaluated against a non-join schema"
-                                    .to_string(),
-                            )
-                        })?;
-                        offset + *col_idx as usize
-                    }
-                    other => return Err(invalid_tuple_idx(other)),
-                };
-                schema
-                    .get_value(tuple, idx)
-                    .map_err(|_| ExecutorError("error when evaluating".to_string()))
-            }
+            Expression::Column { col, .. } => row.column_value(*col),
             Expression::Constant(v) => Ok(*v),
         }
     }
 
-    /// Evaluates the expression against the two input tuples of a join.
-    pub fn evaluate_join(
-        &self,
-        left_tuple: &Tuple,
-        left_schema: &Schema,
-        right_tuple: &Tuple,
-        right_schema: &Schema,
-    ) -> Result<Option<Value>, ExecutorError> {
-        match self {
-            Expression::Binary { left, right, op } => {
-                let l = left.evaluate_join(left_tuple, left_schema, right_tuple, right_schema)?;
-                let r = right.evaluate_join(left_tuple, left_schema, right_tuple, right_schema)?;
-                eval_binary(op, l, r)
-            }
-            Expression::Column {
-                tuple_idx, col_idx, ..
-            } => {
-                let (tup, sch) = match *tuple_idx {
-                    LEFT_TUPLE => (left_tuple, left_schema),
-                    RIGHT_TUPLE => (right_tuple, right_schema),
-                    other => return Err(invalid_tuple_idx(other)),
-                };
-                sch.get_value(tup, *col_idx as usize)
-                    .map_err(|_| ExecutorError("error when evaluating".to_string()))
-            }
-            Expression::Constant(v) => Ok(*v),
+    /// The same expression with every column reference replaced by `f(col)`.
+    pub fn try_map_columns<D, E>(self, f: &impl Fn(C) -> Result<D, E>) -> Result<Expression<D>, E> {
+        Ok(match self {
+            Expression::Constant(v) => Expression::Constant(v),
+            Expression::Column { col, dtype } => Expression::Column {
+                col: f(col)?,
+                dtype,
+            },
+            Expression::Binary { left, right, op } => Expression::Binary {
+                left: Box::new(left.try_map_columns(f)?),
+                right: Box::new(right.try_map_columns(f)?),
+                op,
+            },
+        })
+    }
+
+    /// The same expression with every column reference replaced by `f(col)`.
+    pub fn map_columns<D>(self, f: impl Fn(C) -> D) -> Expression<D> {
+        match self.try_map_columns(&|col| Ok::<D, Infallible>(f(col))) {
+            Ok(mapped) => mapped,
+            Err(infallible) => match infallible {},
         }
     }
 }
 
-fn invalid_tuple_idx(tuple_idx: u8) -> ExecutorError {
-    ExecutorError(format!(
-        "column tuple_idx {tuple_idx} is neither LEFT_TUPLE nor RIGHT_TUPLE"
-    ))
+impl Expression {
+    /// Evaluates the expression against one input row encoded with `schema`.
+    pub fn evaluate(&self, tuple: &Tuple, schema: &Schema) -> Result<Option<Value>, ExecutorError> {
+        self.evaluate_on(&InputRow { tuple, schema })
+    }
 }
 
 fn eval_binary(
@@ -470,7 +505,7 @@ impl Arithmetic {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Op {
     Add,
     Sub,
@@ -643,41 +678,79 @@ mod tests {
         assert!(eval(int(i32::MIN), Op::Div, int(-1)).is_err());
     }
 
+    fn int_column(col: u32) -> Expression {
+        Expression::Column {
+            col: ColIdx(col),
+            dtype: DataType::INT,
+        }
+    }
+
     #[test]
-    fn right_input_column_reads_past_the_join_offset() {
-        let mut schema = Schema::new(vec![
-            (DataType::INT, "l".to_string()),
-            (DataType::INT, "r".to_string()),
+    fn join_predicate_reads_each_side_from_its_own_row() {
+        let schema = Schema::new(vec![
+            (DataType::INT, "a".to_string()),
+            (DataType::INT, "b".to_string()),
         ]);
-        let tuple = schema
+        let left = schema
             .encode_tuple(&[Some(Value::INT(1)), Some(Value::INT(2))])
             .unwrap();
-        let right_col0 = Expression::Column {
-            tuple_idx: RIGHT_TUPLE,
-            col_idx: 0,
+        let right = schema
+            .encode_tuple(&[Some(Value::INT(10)), Some(Value::INT(20))])
+            .unwrap();
+        let row = JoinRow {
+            left: InputRow {
+                tuple: &left,
+                schema: &schema,
+            },
+            right: InputRow {
+                tuple: &right,
+                schema: &schema,
+            },
+        };
+        let column = |side, col| JoinPredicate::Column {
+            col: JoinColumn {
+                side,
+                col: ColIdx(col),
+            },
             dtype: DataType::INT,
         };
-        assert!(
-            right_col0.evaluate(&tuple, &schema).is_err(),
-            "a right-input column needs a join schema"
-        );
-        schema.join_offset = Some(1);
         assert_eq!(
-            right_col0.evaluate(&tuple, &schema).unwrap(),
+            column(Side::Left, 1).evaluate_on(&row).unwrap(),
             Some(Value::INT(2))
+        );
+        assert_eq!(
+            column(Side::Right, 1).evaluate_on(&row).unwrap(),
+            Some(Value::INT(20))
         );
     }
 
     #[test]
-    fn column_with_unknown_tuple_idx_is_an_error() {
+    fn column_past_the_end_of_the_input_is_an_error() {
         let schema = Schema::new(vec![(DataType::INT, "a".to_string())]);
         let tuple = schema.encode_tuple(&[Some(Value::INT(1))]).unwrap();
-        let col = Expression::Column {
-            tuple_idx: 2,
-            col_idx: 0,
-            dtype: DataType::INT,
+        assert!(int_column(1).evaluate(&tuple, &schema).is_err());
+        assert!(
+            int_column(0)
+                .evaluate(&Tuple { data: vec![] }, &schema)
+                .is_err(),
+            "a column read from an empty input row is an error"
+        );
+    }
+
+    #[test]
+    fn mapping_columns_keeps_the_expression_shape() {
+        let sum = Expression::Binary {
+            left: Box::new(int_column(0)),
+            right: Box::new(int_column(3)),
+            op: Op::Add,
         };
-        assert!(col.evaluate(&tuple, &schema).is_err());
-        assert!(col.evaluate_join(&tuple, &schema, &tuple, &schema).is_err());
+        let mapped: Expression<u32> = sum
+            .try_map_columns(&|c: ColIdx| Ok::<_, ()>(c.0 * 10))
+            .unwrap();
+        let Expression::Binary { left, right, .. } = mapped else {
+            panic!("expected a binary expression");
+        };
+        assert!(matches!(*left, Expression::Column { col: 0, .. }));
+        assert!(matches!(*right, Expression::Column { col: 30, .. }));
     }
 }

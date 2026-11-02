@@ -15,11 +15,11 @@ use cmudb::processor::executor::ExecutorContext;
 use cmudb::processor::executor::RowCursor;
 use cmudb::processor::executor_factory::create_executor_with_batch_size;
 use cmudb::processor::plan::{
-    AggType, AggregationPlanNode, ColumnAssignment, DeletePlanNode, Expression,
+    AggType, AggregationPlanNode, ColIdx, ColumnAssignment, DeletePlanNode, Expression,
     ExternalMergeSortPlanNode, FilterPlanNode, HashJoinPlanNode, IndexScanPlanNode, InsertPlanNode,
-    JoinType, LimitPlanNode, NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, Op, Plan,
-    ProjectionPlanNode, SeqScanPlanNode, SortExpr, SortPlanNode, UpdatePlanNode, ValuesPlanNode,
-    WindowFunctionPlanNode,
+    JoinColumn, JoinPredicate, JoinType, LimitPlanNode, NestedIndexJoinPlanNode,
+    NestedLoopJoinPlanNode, Op, Plan, ProjectionPlanNode, SeqScanPlanNode, Side, SortExpr,
+    SortPlanNode, UpdatePlanNode, ValuesPlanNode, WindowFunctionPlanNode,
 };
 use cmudb::replacer::ArcReplacer;
 use std::collections::HashMap;
@@ -74,15 +74,24 @@ fn int(v: i32) -> Option<Value> {
     Some(Value::INT(v))
 }
 
-fn col(tuple_idx: u8, col_idx: u32) -> Expression {
+fn col(col_idx: u32) -> Expression {
     Expression::Column {
-        tuple_idx,
-        col_idx,
+        col: ColIdx(col_idx),
         dtype: DataType::INT,
     }
 }
 
-fn binary(left: Expression, op: Op, right: Expression) -> Expression {
+fn join_col(side: Side, col_idx: u32) -> JoinPredicate {
+    Expression::Column {
+        col: JoinColumn {
+            side,
+            col: ColIdx(col_idx),
+        },
+        dtype: DataType::INT,
+    }
+}
+
+fn binary<C>(left: Expression<C>, op: Op, right: Expression<C>) -> Expression<C> {
     Expression::Binary {
         left: Box::new(left),
         right: Box::new(right),
@@ -105,14 +114,12 @@ fn r_schema() -> Schema {
 }
 
 fn joined_schema() -> Schema {
-    let mut s = Schema::new(vec![
+    Schema::new(vec![
         (DataType::INT, "l.id".to_string()),
         (DataType::INT, "l.k".to_string()),
         (DataType::INT, "r.k".to_string()),
         (DataType::INT, "r.tag".to_string()),
-    ]);
-    s.join_offset = Some(2);
-    s
+    ])
 }
 
 fn s_schema() -> Schema {
@@ -304,10 +311,10 @@ fn selective_filter_and_projection() {
     let env = setup();
     let plan = Plan::Projection(ProjectionPlanNode {
         schema: Schema::new(vec![(DataType::INT, "id_x10".to_string())]),
-        expressions: vec![binary(col(0, 0), Op::Mul, Expression::Constant(int(10)))],
+        expressions: vec![binary(col(0), Op::Mul, Expression::Constant(int(10)))],
         child: Box::new(Plan::Filter(FilterPlanNode {
             schema: l_schema(),
-            predicate: binary(col(0, 1), Op::Eq, Expression::Constant(int(2))),
+            predicate: binary(col(1), Op::Eq, Expression::Constant(int(2))),
             child: scan(env.l_oid, l_schema()),
         })),
     });
@@ -346,7 +353,7 @@ fn nested_loop_join_fan_out_spans_batches() {
             schema: joined_schema(),
             left: scan(env.l_oid, l_schema()),
             right: scan(env.r_oid, r_schema()),
-            predicate: binary(col(0, 1), Op::Eq, col(1, 0)),
+            predicate: binary(join_col(Side::Left, 1), Op::Eq, join_col(Side::Right, 0)),
             join_type,
         });
         let expected = expected_join(&r_rows(), left_outer);
@@ -363,7 +370,7 @@ fn nested_index_join_spans_batches() {
         let plan = Plan::NestedIndexJoin(NestedIndexJoinPlanNode {
             schema: joined_schema(),
             child: scan(env.l_oid, l_schema()),
-            key_predicate: col(0, 1),
+            key_predicate: col(1),
             table_oid: env.s_oid,
             table_schema: s_schema(),
             index_oid: env.s_index_oid,
@@ -383,8 +390,8 @@ fn hash_join_fan_out_spans_batches() {
             schema: joined_schema(),
             left: scan(env.l_oid, l_schema()),
             right: scan(env.r_oid, r_schema()),
-            left_exprs: vec![col(0, 1)],
-            right_exprs: vec![col(0, 0)],
+            left_exprs: vec![col(1)],
+            right_exprs: vec![col(0)],
             join_type,
         });
         assert_all_batch_sizes(&env, &plan, &expected_join(&r_rows(), left_outer), false);
@@ -401,8 +408,8 @@ fn aggregation_groups_span_batches() {
             (DataType::INT, "sum".to_string()),
         ]),
         child: scan(env.l_oid, l_schema()),
-        group_bys: vec![col(0, 1)],
-        aggregates: vec![(col(0, 0), AggType::COUNT), (col(0, 0), AggType::SUM)],
+        group_bys: vec![col(1)],
+        aggregates: vec![(col(0), AggType::COUNT), (col(0), AggType::SUM)],
     });
     let mut groups: HashMap<i32, (i32, i32)> = HashMap::new();
     for r in l_rows() {
@@ -424,10 +431,7 @@ fn aggregation_groups_span_batches() {
 #[test]
 fn sorts_emit_in_order_across_batches() {
     let env = setup();
-    let order_by = vec![
-        SortExpr::ascending(col(0, 1)),
-        SortExpr::ascending(col(0, 0)),
-    ];
+    let order_by = vec![SortExpr::ascending(col(1)), SortExpr::ascending(col(0))];
     let mut expected = l_rows();
     expected.sort_by_key(|r| (r[1], r[0]));
 
@@ -457,9 +461,9 @@ fn window_function_output_spans_batches() {
         ]),
         child: scan(env.l_oid, l_schema()),
         order_by_exprs: None,
-        partition_by_exprs: Some(vec![col(0, 1)]),
-        aggregates: vec![(col(0, 0), AggType::SUM)],
-        columns: vec![col(0, 0), col(0, 1)],
+        partition_by_exprs: Some(vec![col(1)]),
+        aggregates: vec![(col(0), AggType::SUM)],
+        columns: vec![col(0), col(1)],
     });
     let rows = l_rows();
     let expected: Rows = rows
@@ -505,7 +509,7 @@ fn update_and_delete_touch_every_row_once() {
             schema: s_schema(),
             assignments: vec![ColumnAssignment {
                 col_idx: 1,
-                value: binary(col(0, 1), Op::Add, Expression::Constant(int(100))),
+                value: binary(col(1), Op::Add, Expression::Constant(int(100))),
             }],
             child: scan(env.s_oid, s_schema()),
             table_oid: env.s_oid,
@@ -527,7 +531,7 @@ fn update_and_delete_touch_every_row_once() {
             schema: s_schema(),
             child: Box::new(Plan::Filter(FilterPlanNode {
                 schema: s_schema(),
-                predicate: binary(col(0, 0), Op::Lt, Expression::Constant(int(10))),
+                predicate: binary(col(0), Op::Lt, Expression::Constant(int(10))),
                 child: scan(env.s_oid, s_schema()),
             })),
             table_oid: env.s_oid,
