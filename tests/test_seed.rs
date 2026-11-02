@@ -1,11 +1,13 @@
 mod common;
 
-use common::seed::{DEFAULT_SEED, SEED_ENV, Stream, parse_seed, stream_rng, with_seed};
+use common::seed::{SEED_ENV, Stream, parse_seed, stream_rng, with_seed};
 use rand::Rng;
 
 #[test]
-fn unset_seed_uses_the_fixed_default() {
-    assert_eq!(parse_seed(None), Ok(DEFAULT_SEED));
+fn unset_seed_picks_a_fresh_random_seed_each_time() {
+    let first = parse_seed(None).expect("unset seed is valid");
+    let second = parse_seed(None).expect("unset seed is valid");
+    assert_ne!(first, second, "two unset reads should draw different seeds");
 }
 
 #[test]
@@ -57,10 +59,15 @@ fn different_streams_or_seeds_give_different_sequences() {
 #[test]
 fn with_seed_passes_the_seed_and_returns_the_test_result() {
     let seen = with_seed(|seed| seed);
-    let expected = std::env::var(SEED_ENV).ok().map_or(DEFAULT_SEED, |text| {
-        text.trim().parse().expect("valid CMUDB_SEED")
-    });
-    assert_eq!(seen, expected);
+    if let Ok(text) = std::env::var(SEED_ENV) {
+        let expected: u64 = text.trim().parse().expect("valid CMUDB_SEED");
+        assert_eq!(seen, expected, "with_seed uses CMUDB_SEED when it is set");
+    }
+    assert_eq!(
+        with_seed(|_| "result"),
+        "result",
+        "with_seed returns the test's value"
+    );
 }
 
 #[test]

@@ -37,6 +37,12 @@ jobs:
         with:
           tool: just
       - uses: Swatinem/rust-cache@v2
+      - name: Pick a random CMUDB_SEED for the randomized tests
+        run: |
+          seed=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
+          echo "CMUDB_SEED=$seed" >> "$GITHUB_ENV"
+          echo "Randomized tests use CMUDB_SEED=$seed; replay locally with: CMUDB_SEED=$seed just test"
+          echo "Randomized tests use \`CMUDB_SEED=$seed\`. Replay locally with \`CMUDB_SEED=$seed just test\`." >> "$GITHUB_STEP_SUMMARY"
       - run: just test
 
   coverage:

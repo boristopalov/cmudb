@@ -20,9 +20,11 @@ The toolchain is pinned in `rust-toolchain.toml`, and rustup installs it on
 first use. Warnings fail `just lint`, `just ci` and CI (clippy runs with
 `-D warnings`), but not local `cargo build` or `cargo test`.
 
-The randomized soak tests take their seed from `CMUDB_SEED` (a fixed default
-when unset) and print it when they fail; rerun with `CMUDB_SEED=<seed>` to
-replay the same operations in each thread (thread interleaving still varies).
+The randomized soak tests pick a fresh random seed on every run, locally and in
+CI, and print it when they fail. CI's test job also picks one seed per run and
+prints it at the start of the job and in the job summary. Rerun with
+`CMUDB_SEED=<seed> just test` to replay the same operations in each thread
+(thread interleaving still varies).
 
 CI type-checks the benchmarks in `benches/` but never runs them. To run each bench once
 without timing it, including the checks it makes on its results:
