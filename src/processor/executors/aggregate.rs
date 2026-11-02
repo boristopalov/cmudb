@@ -14,7 +14,7 @@ pub struct AggregationExecutor<'a> {
     plan: &'a AggregationPlanNode,
     child: Box<dyn Executor + 'a>,
     batch_size: usize,
-    iter: Option<IntoIter<ExprKey, AggVal>>,
+    iter: Option<IntoIter<ExprKey, AggregateState<'a>>>,
 }
 
 impl<'a> AggregationExecutor<'a> {
@@ -33,28 +33,26 @@ impl<'a> AggregationExecutor<'a> {
 }
 
 impl<'a> Executor for AggregationExecutor<'a> {
+    /// Groups the whole input. Without GROUP BY there is one group even when the input is
+    /// empty, so `SELECT COUNT(*) FROM empty` yields one row holding 0.
     fn open(&mut self) -> Result<(), ExecutorError> {
         self.child.open()?;
-        let mut agg_hash_table: HashMap<ExprKey, AggVal> = HashMap::new();
+        let aggregates = &self.plan.aggregates;
+        let mut groups: HashMap<ExprKey, AggregateState<'a>> = HashMap::new();
         while let Some(batch) = self.child.next_batch()? {
             let schema = self.child.schema();
             for (tuple, _) in batch {
-                let groups = eval_key(&self.plan.group_bys, &tuple, schema)?;
-                let entry = agg_hash_table.entry(groups).or_insert_with(|| {
-                    AggVal(
-                        self.plan
-                            .aggregates
-                            .iter()
-                            .map(|(_, agg_type)| AggState::new(agg_type))
-                            .collect(),
-                    )
-                });
-                for (state, (expr, _)) in entry.0.iter_mut().zip(self.plan.aggregates.iter()) {
-                    state.update(expr.evaluate(&tuple, schema)?)?;
-                }
+                let key = eval_key(&self.plan.group_bys, &tuple, schema)?;
+                groups
+                    .entry(key)
+                    .or_insert_with(|| AggregateState::new(aggregates))
+                    .update(&tuple, schema)?;
             }
         }
-        self.iter = Some(agg_hash_table.into_iter());
+        if self.plan.group_bys.is_empty() && groups.is_empty() {
+            groups.insert(ExprKey(Vec::new()), AggregateState::new(aggregates));
+        }
+        self.iter = Some(groups.into_iter());
         Ok(())
     }
 
@@ -64,12 +62,9 @@ impl<'a> Executor for AggregationExecutor<'a> {
             .as_mut()
             .ok_or_else(|| not_opened("AggregationExecutor"))?;
         let mut rows = Vec::with_capacity(self.batch_size);
-        for (key, val) in iter.by_ref().take(self.batch_size) {
-            let mut out: Vec<Option<Value>> = Vec::with_capacity(key.0.len() + val.0.len());
-            out.extend(key.0);
-            for v in val.0 {
-                out.push(v.value()?);
-            }
+        for (key, state) in iter.by_ref().take(self.batch_size) {
+            let mut out = key.0;
+            state.append_values(&mut out)?;
             rows.push((self.plan.schema.encode_tuple(&out)?, RecordId::RESERVED));
         }
         Ok(Batch::from_rows(rows))
@@ -84,7 +79,49 @@ impl<'a> Executor for AggregationExecutor<'a> {
     }
 }
 
-struct AggVal(Vec<AggState>);
+/// The running value of each of a plan's aggregates, folded in one input row at a time.
+/// GROUP BY keeps one per group and a window keeps one per partition.
+struct AggregateState<'p> {
+    aggregates: &'p [(Expression, AggType)],
+    states: Vec<AggState>,
+}
+
+impl<'p> AggregateState<'p> {
+    /// Every aggregate of `aggregates` over no rows.
+    fn new(aggregates: &'p [(Expression, AggType)]) -> Self {
+        Self {
+            aggregates,
+            states: aggregates
+                .iter()
+                .map(|(_, agg_type)| AggState::new(agg_type))
+                .collect(),
+        }
+    }
+
+    /// Folds in the value each aggregate's argument takes on `tuple`.
+    fn update(&mut self, tuple: &Tuple, schema: &Schema) -> Result<(), ExecutorError> {
+        for (state, (expr, _)) in self.states.iter_mut().zip(self.aggregates) {
+            state.update(expr.evaluate(tuple, schema)?)?;
+        }
+        Ok(())
+    }
+
+    /// Moves every RANK to `pos` when a new peer group starts.
+    fn update_rank(&mut self, new_peer_group: bool, pos: i32) {
+        for state in &mut self.states {
+            state.update_rank(new_peer_group, pos);
+        }
+    }
+
+    /// Appends each aggregate's value over the rows folded in so far to `out`.
+    fn append_values(&self, out: &mut Vec<Option<Value>>) -> Result<(), ExecutorError> {
+        out.reserve(self.states.len());
+        for state in &self.states {
+            out.push(state.value()?);
+        }
+        Ok(())
+    }
+}
 
 enum AggState {
     Max(Option<Value>),
@@ -191,88 +228,12 @@ impl<'a> WindowFunctionExecutor<'a> {
 impl<'a> Executor for WindowFunctionExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
         self.child.open()?;
-        let tups: Vec<Tuple> = collect_rows(self.child.as_mut())?
+        let tuples: Vec<Tuple> = collect_rows(self.child.as_mut())?
             .into_iter()
             .map(|(t, _)| t)
             .collect();
-
-        let child_schema = self.child.schema();
-        let partition_by: &[Expression] = self.plan.partition_by_exprs.as_deref().unwrap_or(&[]);
-        let order_by: &[SortExpr] = self.plan.order_by_exprs.as_deref().unwrap_or(&[]);
-        let sort_exprs: Vec<SortExpr> = partition_by
-            .iter()
-            .cloned()
-            .map(SortExpr::ascending)
-            .chain(order_by.iter().cloned())
-            .collect();
-        let order_keys: Vec<Expression> = order_by.iter().map(|key| key.expr.clone()).collect();
-        let tups = sorted_by_exprs(tups, |t| t, &sort_exprs, child_schema)?;
-
-        let running = self.plan.order_by_exprs.is_some();
-        let fresh_aggregates = || -> Vec<AggState> {
-            self.plan
-                .aggregates
-                .iter()
-                .map(|(_, agg_type)| AggState::new(agg_type))
-                .collect()
-        };
-        let mut partition_aggregates = fresh_aggregates();
-        let mut peer_buffer: Vec<Tuple> = Vec::new();
-        let mut output_tuples: Vec<Tuple> = Vec::with_capacity(tups.len());
-
-        let mut curr_rank = 1;
-        let mut row_num = 1;
-        let mut prev_partition_key: Option<ExprKey> = None;
-        let mut prev_order_key: Option<ExprKey> = None;
-
-        for t in tups.iter() {
-            let curr_partition_key = eval_key(partition_by, t, child_schema)?;
-            let new_partition = prev_partition_key.as_ref() != Some(&curr_partition_key);
-            let curr_order_key = eval_key(&order_keys, t, child_schema)?;
-            let new_peer_group = new_partition || prev_order_key.as_ref() != Some(&curr_order_key);
-
-            let flush_now = if new_partition {
-                prev_partition_key.is_some()
-            } else {
-                running && new_peer_group && !peer_buffer.is_empty()
-            };
-            if flush_now {
-                flush_peer_group(
-                    self.plan,
-                    &mut peer_buffer,
-                    &mut partition_aggregates,
-                    child_schema,
-                    &mut output_tuples,
-                )?;
-            }
-            if new_partition {
-                partition_aggregates = fresh_aggregates();
-                row_num = 1;
-            }
-            if new_peer_group {
-                curr_rank = row_num;
-            }
-            for state in partition_aggregates.iter_mut() {
-                state.update_rank(new_peer_group, curr_rank);
-            }
-
-            peer_buffer.push(t.clone());
-            row_num += 1;
-            prev_partition_key = Some(curr_partition_key);
-            prev_order_key = Some(curr_order_key);
-        }
-
-        if !peer_buffer.is_empty() {
-            flush_peer_group(
-                self.plan,
-                &mut peer_buffer,
-                &mut partition_aggregates,
-                child_schema,
-                &mut output_tuples,
-            )?;
-        }
-
-        self.iter = Some(output_tuples.into_iter());
+        let output = window_rows(self.plan, tuples, self.child.schema())?;
+        self.iter = Some(output.into_iter());
         Ok(())
     }
 
@@ -293,19 +254,91 @@ impl<'a> Executor for WindowFunctionExecutor<'a> {
     }
 }
 
+/// Sorts `tuples` by partition and then by the window's ORDER BY, and emits each row as the
+/// plan's `columns` followed by its aggregates. Without ORDER BY an aggregate covers the
+/// whole partition; with it, each row sees the running value up to the end of its peer group.
+fn window_rows(
+    plan: &WindowFunctionPlanNode,
+    tuples: Vec<Tuple>,
+    child_schema: &Schema,
+) -> Result<Vec<Tuple>, ExecutorError> {
+    let partition_by: &[Expression] = plan.partition_by_exprs.as_deref().unwrap_or(&[]);
+    let order_by: &[SortExpr] = plan.order_by_exprs.as_deref().unwrap_or(&[]);
+    let sort_exprs: Vec<SortExpr> = partition_by
+        .iter()
+        .cloned()
+        .map(SortExpr::ascending)
+        .chain(order_by.iter().cloned())
+        .collect();
+    let order_keys: Vec<Expression> = order_by.iter().map(|key| key.expr.clone()).collect();
+    let tuples = sorted_by_exprs(tuples, |t| t, &sort_exprs, child_schema)?;
+
+    let running = plan.order_by_exprs.is_some();
+    let mut partition_aggregates = AggregateState::new(&plan.aggregates);
+    let mut peer_buffer: Vec<Tuple> = Vec::new();
+    let mut output: Vec<Tuple> = Vec::with_capacity(tuples.len());
+
+    let mut curr_rank = 1;
+    let mut row_num = 1;
+    let mut prev_partition_key: Option<ExprKey> = None;
+    let mut prev_order_key: Option<ExprKey> = None;
+
+    for t in tuples {
+        let curr_partition_key = eval_key(partition_by, &t, child_schema)?;
+        let new_partition = prev_partition_key.as_ref() != Some(&curr_partition_key);
+        let curr_order_key = eval_key(&order_keys, &t, child_schema)?;
+        let new_peer_group = new_partition || prev_order_key.as_ref() != Some(&curr_order_key);
+
+        let flush_now = if new_partition {
+            prev_partition_key.is_some()
+        } else {
+            running && new_peer_group && !peer_buffer.is_empty()
+        };
+        if flush_now {
+            flush_peer_group(
+                plan,
+                &mut peer_buffer,
+                &mut partition_aggregates,
+                child_schema,
+                &mut output,
+            )?;
+        }
+        if new_partition {
+            partition_aggregates = AggregateState::new(&plan.aggregates);
+            row_num = 1;
+        }
+        if new_peer_group {
+            curr_rank = row_num;
+        }
+        partition_aggregates.update_rank(new_peer_group, curr_rank);
+
+        peer_buffer.push(t);
+        row_num += 1;
+        prev_partition_key = Some(curr_partition_key);
+        prev_order_key = Some(curr_order_key);
+    }
+
+    flush_peer_group(
+        plan,
+        &mut peer_buffer,
+        &mut partition_aggregates,
+        child_schema,
+        &mut output,
+    )?;
+    Ok(output)
+}
+
 /// Folds every buffered peer row into `aggregates`, then emits each of those rows as the
 /// plan's `columns` followed by the aggregates' current values, draining `buffer`.
 fn flush_peer_group(
     plan: &WindowFunctionPlanNode,
     buffer: &mut Vec<Tuple>,
-    aggregates: &mut [AggState],
+    aggregates: &mut AggregateState,
     child_schema: &Schema,
     output: &mut Vec<Tuple>,
 ) -> Result<(), ExecutorError> {
     for buf_tup in buffer.iter() {
-        for (state, (expr, _)) in aggregates.iter_mut().zip(plan.aggregates.iter()) {
-            state.update(expr.evaluate(buf_tup, child_schema)?)?;
-        }
+        aggregates.update(buf_tup, child_schema)?;
     }
     for buf_tup in buffer.drain(..) {
         let mut combined = plan
@@ -313,9 +346,7 @@ fn flush_peer_group(
             .iter()
             .map(|e| e.evaluate(&buf_tup, child_schema))
             .collect::<Result<Vec<_>, _>>()?;
-        for agg in aggregates.iter() {
-            combined.push(agg.value()?);
-        }
+        aggregates.append_values(&mut combined)?;
         output.push(plan.schema.encode_tuple(&combined)?);
     }
     Ok(())

@@ -164,6 +164,31 @@ fn count_column_skips_nulls() {
 }
 
 #[test]
+fn aggregates_without_group_by_over_no_rows_yield_one_row() {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE t (a INTEGER)");
+    assert_eq!(
+        nullable_ints(&db.exec("SELECT COUNT(*), COUNT(a), SUM(a), MIN(a), MAX(a), AVG(a) FROM t")),
+        vec![vec![Some(0), Some(0), None, None, None, None]]
+    );
+    db.exec("INSERT INTO t VALUES (1)");
+    assert_eq!(
+        ints(&db.exec("SELECT COUNT(*) FROM t WHERE a > 5")),
+        vec![[0]]
+    );
+}
+
+#[test]
+fn group_by_over_no_rows_yields_no_groups() {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE t (a INTEGER)");
+    assert_eq!(
+        ints(&db.exec("SELECT a, COUNT(*) FROM t GROUP BY a")),
+        Vec::<Vec<i32>>::new()
+    );
+}
+
+#[test]
 fn order_by_and_limit() {
     let db = Db::new(64);
     db.exec("CREATE TABLE t (a INTEGER, b INTEGER)");
