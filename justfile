@@ -6,11 +6,11 @@ export RUST_LOG := env("RUST_LOG", "warn")
 # Run fmt, clippy, the comment policy and the tests, as CI does.
 ci: lint test
 
-# fmt check, clippy (lint levels live in Cargo.toml) and the comment policy.
+# fmt check, clippy with warnings as errors (lint levels live in Cargo.toml) and the comment policy.
 lint:
     cargo fmt --all --check
-    cargo clippy --all-targets
-    cargo clippy --benches --features bench
+    cargo clippy --all-targets -- -D warnings
+    cargo clippy --benches --features bench -- -D warnings
     python3 scripts/check_comments.py
 
 # Unit, integration, end-to-end and doc tests at RUST_LOG=warn.
