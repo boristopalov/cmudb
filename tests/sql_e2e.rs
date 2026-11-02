@@ -212,7 +212,7 @@ fn order_by_mixes_directions_per_key() {
 }
 
 #[test]
-fn order_by_desc_puts_nulls_last_and_works_after_group_by() {
+fn order_by_desc_puts_nulls_last() {
     let db = emp_db();
     let rows = db.exec("SELECT id FROM emp ORDER BY bonus DESC");
     assert_eq!(
@@ -220,6 +220,11 @@ fn order_by_desc_puts_nulls_last_and_works_after_group_by() {
         vec![vec![int(4)], vec![int(2)], vec![int(1)], vec![int(3)]],
         "NULL sorts below every value, so it comes last when descending"
     );
+}
+
+#[test]
+fn order_by_desc_applies_after_group_by() {
+    let db = emp_db();
     assert_eq!(
         ints(&db.exec("SELECT dept, COUNT(*) FROM emp GROUP BY dept ORDER BY dept DESC")),
         vec![[30, 1], [20, 1], [10, 2]]
