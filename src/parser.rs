@@ -6,12 +6,13 @@ use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, CreateIndex as SqlCreateIndex,
     CreateTable as SqlCreateTable, DataType as SqlDataType, Delete, Expr, FromTable, Function,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Insert, JoinConstraint,
-    JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderByKind, Query, SelectItem, SetExpr,
-    Statement, TableFactor, TableObject, TableWithJoins, Update, Value as SqlValue,
+    JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderByExpr, OrderByKind, Query,
+    SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins, Update,
+    Value as SqlValue,
 };
 
 use crate::catalog::{Catalog, DataType, Schema, Value};
-use crate::processor::plan::{AggType, Expression, JoinType, Op};
+use crate::processor::plan::{AggType, Expression, JoinType, Op, SortDirection, SortExpr};
 
 /// Argument bound for `COUNT(*)`. COUNT skips NULL arguments, so a non-NULL constant makes it count
 /// every row.
@@ -358,18 +359,44 @@ impl<'a> Binder<'a> {
         &self,
         q: &Query,
         scope: &Scope,
-    ) -> Result<Option<Vec<Expression>>, BinderError> {
+    ) -> Result<Option<Vec<SortExpr>>, BinderError> {
         let Some(ob) = q.order_by.as_ref() else {
             return Ok(None);
         };
+        if ob.interpolate.is_some() {
+            return Err(BinderError(
+                "ORDER BY ... INTERPOLATE is not supported".into(),
+            ));
+        }
         match &ob.kind {
             OrderByKind::Expressions(exprs) => exprs
                 .iter()
-                .map(|oe| self.resolve_expr(&oe.expr, scope))
+                .map(|oe| self.resolve_sort_expr(oe, scope))
                 .collect::<Result<_, _>>()
                 .map(Some),
             OrderByKind::All(_) => Err(BinderError("ORDER BY ALL not supported".into())),
         }
+    }
+
+    fn resolve_sort_expr(&self, oe: &OrderByExpr, scope: &Scope) -> Result<SortExpr, BinderError> {
+        if oe.options.nulls_first.is_some() {
+            return Err(BinderError(
+                "ORDER BY ... NULLS FIRST/LAST is not supported".into(),
+            ));
+        }
+        if oe.with_fill.is_some() {
+            return Err(BinderError(
+                "ORDER BY ... WITH FILL is not supported".into(),
+            ));
+        }
+        let direction = match oe.options.asc {
+            Some(false) => SortDirection::Descending,
+            Some(true) | None => SortDirection::Ascending,
+        };
+        Ok(SortExpr {
+            expr: self.resolve_expr(&oe.expr, scope)?,
+            direction,
+        })
     }
 
     /// Builds a scope from the FROM clause. We allow at most two tables, joined
@@ -801,7 +828,7 @@ pub struct BoundSelect {
     /// and ORDER BY. Each is `(argument_expr, agg_type)` and is evaluated
     /// against the child schema by the AggregationExecutor.
     pub aggregates: Vec<(Expression, AggType)>,
-    pub sort: Option<Vec<Expression>>,
+    pub sort: Option<Vec<SortExpr>>,
     pub limit: Option<u32>,
 }
 

@@ -10,7 +10,7 @@ use crate::processor::plan::{
     DeletePlanNode, DropIndexPlanNode, DropTablePlanNode, Expression, ExternalMergeSortPlanNode,
     FilterPlanNode, HashJoinPlanNode, IndexScanPlanNode, InsertPlanNode, JoinType, LimitPlanNode,
     NestedIndexJoinPlanNode, NestedLoopJoinPlanNode, ProjectionPlanNode, SeqScanPlanNode,
-    SortPlanNode, UpdatePlanNode, ValuesPlanNode, WindowFunctionPlanNode,
+    SortDirection, SortExpr, SortPlanNode, UpdatePlanNode, ValuesPlanNode, WindowFunctionPlanNode,
 };
 use crate::table_heap::{RecordId, TableHeap, TableHeapError, TableHeapIterator, Tuple};
 use std::collections::hash_map::IntoIter;
@@ -1256,17 +1256,69 @@ impl<'a> ExternalMergeSortExecutor<'a> {
     }
 }
 
-/// Rows ordered by `exprs` evaluated on each row's tuple, NULLs first; equal rows keep
-/// their input order.
+/// One evaluated `ORDER BY` key of a row, ordered in its key's direction with NULL
+/// below every value.
+struct SortValue {
+    value: Option<Value>,
+    direction: SortDirection,
+}
+
+impl Ord for SortValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let ascending = self.value.cmp(&other.value);
+        match self.direction {
+            SortDirection::Ascending => ascending,
+            SortDirection::Descending => ascending.reverse(),
+        }
+    }
+}
+
+impl PartialEq for SortValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for SortValue {}
+
+impl PartialOrd for SortValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// A row's `ORDER BY` keys, compared key by key.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct SortKey(Vec<SortValue>);
+
+fn eval_sort_key(
+    order_by: &[SortExpr],
+    tuple: &Tuple,
+    schema: &Schema,
+) -> Result<SortKey, ExecutorError> {
+    order_by
+        .iter()
+        .map(|key| {
+            Ok(SortValue {
+                value: key.expr.evaluate(tuple, schema)?,
+                direction: key.direction,
+            })
+        })
+        .collect::<Result<_, ExecutorError>>()
+        .map(SortKey)
+}
+
+/// Rows ordered by `order_by` evaluated on each row's tuple, with NULL below every value
+/// in either direction; equal rows keep their input order.
 fn sorted_by_exprs<T>(
     rows: Vec<T>,
     tuple_of: impl Fn(&T) -> &Tuple,
-    exprs: &[Expression],
+    order_by: &[SortExpr],
     schema: &Schema,
 ) -> Result<Vec<T>, ExecutorError> {
     let mut keyed = rows
         .into_iter()
-        .map(|row| Ok((eval_key(exprs, tuple_of(&row), schema)?, row)))
+        .map(|row| Ok((eval_sort_key(order_by, tuple_of(&row), schema)?, row)))
         .collect::<Result<Vec<_>, ExecutorError>>()?;
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(keyed.into_iter().map(|(_, row)| row).collect())
@@ -1292,9 +1344,9 @@ impl<'a> ExternalMergeSortExecutor<'a> {
         let mut a_rows = a.iter();
         let mut b_rows = b.iter();
         let next_keyed =
-            |rows: &mut TableHeapIterator| -> Result<Option<(ExprKey, Tuple)>, ExecutorError> {
+            |rows: &mut TableHeapIterator| -> Result<Option<(SortKey, Tuple)>, ExecutorError> {
                 match rows.next().transpose()? {
-                    Some((t, _)) => Ok(Some((eval_key(order_by, &t, schema)?, t))),
+                    Some((t, _)) => Ok(Some((eval_sort_key(order_by, &t, schema)?, t))),
                     None => Ok(None),
                 }
             };
@@ -1451,7 +1503,12 @@ impl<'a> Executor for WindowFunctionExecutor<'a> {
         let child_schema = self.child.schema();
         let partition_by: &[Expression] = self.plan.partition_by_exprs.as_deref().unwrap_or(&[]);
         let order_by: &[Expression] = self.plan.order_by_exprs.as_deref().unwrap_or(&[]);
-        let sort_exprs: Vec<Expression> = partition_by.iter().chain(order_by).cloned().collect();
+        let sort_exprs: Vec<SortExpr> = partition_by
+            .iter()
+            .chain(order_by)
+            .cloned()
+            .map(SortExpr::ascending)
+            .collect();
         let tups = sorted_by_exprs(tups, |t| t, &sort_exprs, child_schema)?;
 
         let running = self.plan.order_by_exprs.is_some();
@@ -1983,7 +2040,7 @@ mod tests {
         let plan = ExternalMergeSortPlanNode {
             schema: schema.clone(),
             child: Box::new(values_plan(&schema, &[])),
-            order_by_exprs: vec![col(0)],
+            order_by_exprs: vec![SortExpr::ascending(col(0))],
         };
         let exec = ExternalMergeSortExecutor::new(
             &plan,
@@ -2022,6 +2079,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn descending_sort_keeps_tied_rows_in_input_order() {
+        let schema = int_schema(&["k", "v"]);
+        let rows = values_plan(&schema, &[&[1, 0], &[2, 0], &[1, 1], &[2, 1], &[1, 2]]);
+        let plan = SortPlanNode {
+            schema: schema.clone(),
+            child: Box::new(values_plan(&schema, &[])),
+            order_by_exprs: vec![SortExpr::descending(col(0))],
+        };
+        let mut sort = SortExecutor::new(&plan, values_child(&rows));
+        assert_eq!(
+            decode_ints(&schema, drain(&mut sort)),
+            vec![vec![2, 0], vec![2, 1], vec![1, 0], vec![1, 1], vec![1, 2]],
+            "rows with equal keys keep their input order"
+        );
+    }
+
+    #[test]
+    fn external_sort_merges_descending_runs_in_descending_order() {
+        let (bpm, _dir) = buffer_pool();
+        let schema = int_schema(&["k", "v"]);
+        let plan = ExternalMergeSortPlanNode {
+            schema: schema.clone(),
+            child: Box::new(values_plan(&schema, &[])),
+            order_by_exprs: vec![SortExpr::descending(col(0))],
+        };
+        let exec = ExternalMergeSortExecutor::new(&plan, values_child(&plan.child), bpm);
+
+        let mut a = int_rows(&schema, &[&[5, 0], &[1, 0], &[3, 0]]);
+        let mut b = int_rows(&schema, &[&[4, 1], &[1, 1], &[9, 1]]);
+        let run_a = exec.spill_sorted_run(&mut a).unwrap();
+        let run_b = exec.spill_sorted_run(&mut b).unwrap();
+        let merged = exec.merge_runs(&run_a, &run_b).unwrap();
+        assert_eq!(
+            decode_ints(&schema, merged.iter().map(|r| r.unwrap().0)),
+            vec![
+                vec![9, 1],
+                vec![5, 0],
+                vec![4, 1],
+                vec![3, 0],
+                vec![1, 0],
+                vec![1, 1],
+            ],
+            "keys descend and ties keep the left run's row first"
+        );
+    }
+
     fn divide_by_zero(col_idx: u32) -> Expression {
         Expression::Binary {
             left: Box::new(col(col_idx)),
@@ -2037,7 +2141,7 @@ mod tests {
         let plan = SortPlanNode {
             schema: schema.clone(),
             child: Box::new(values_plan(&schema, &[])),
-            order_by_exprs: vec![divide_by_zero(0)],
+            order_by_exprs: vec![SortExpr::ascending(divide_by_zero(0))],
         };
         let mut sort = SortExecutor::new(&plan, values_child(&rows), DEFAULT_BATCH_SIZE);
         let err = sort.open().unwrap_err();
