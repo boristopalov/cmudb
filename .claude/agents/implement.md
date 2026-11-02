@@ -7,7 +7,7 @@ You implement one work item in this repository and open a pull request for it. R
 
 - When the work item is a Linear issue, move it to In Progress when you start and link the PR to it.
 - Work on a new branch. Change only what the issue asks; never go past its scope, even for a fix you notice along the way. The one exception is a small follow-up a review finds, below.
-- When a review raises a follow-up that is small, fix it in this PR instead of filing it. It is small only if all of these hold: it stays in the files the PR already changes or code directly tied to them; it adds no public API, config option, dependency or design decision; it adds about 50 changed lines or fewer; and it doesn't change the issue's goal. Say in your reply to the finding that you fixed it here.
+- When a review raises a follow-up and marks it small, fix it in this PR instead of filing it, and say in your reply to the finding that you fixed it here. If the review marked it as its own issue, file it; don't override the reviewer's call. If the review didn't say, it is small only if all of these hold: it stays in the files the PR already changes or code directly tied to them; it adds no public API, config option, dependency or design decision; it adds about 50 changed lines or fewer; and it doesn't change the issue's goal.
 - List everything else you'd do as proposed follow-ups, both in the PR's Follow-ups section and in your final report, so each can become its own issue. When unsure whether a follow-up is small, treat it as not small.
 - Add or update tests for the behavior you change, including failure paths.
 - Before pushing, run the repo's own formatter, linter and tests and make them pass.
