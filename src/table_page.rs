@@ -284,7 +284,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> TablePage<B> {
 
     /// Overwrites the bytes and metadata of `slot` in place. The new tuple is exactly as large
     /// as the old one, as cmudb's fixed-width rows are, or the update is refused. The slot's
-    /// range is validated before anything is written through it.
+    /// range and the deleted-tuple counter are checked before anything is written.
     pub fn update_in_place(
         &mut self,
         slot: u32,
@@ -300,9 +300,10 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> TablePage<B> {
             )));
         }
         self.tuple_bytes(&current)?;
+        self.update_meta(slot, meta)?;
         let range = current.range();
         self.bytes_mut()[range].copy_from_slice(data);
-        self.update_meta(slot, meta)
+        Ok(())
     }
 }
 
@@ -435,6 +436,25 @@ mod tests {
         assert!(page.update_meta(0, live).is_err());
         assert!(page.slot(0).unwrap().meta.is_deleted);
         assert_eq!(page.num_deleted_tuples(), 0);
+    }
+
+    #[test]
+    fn update_in_place_with_a_corrupt_counter_writes_nothing() {
+        let mut buf = [0u8; PAGE_SIZE];
+        let mut page = TablePage::init(&mut buf[..]);
+        page.insert(b"old").unwrap();
+        page.mark_deleted(0).unwrap();
+        put_u16_le(&mut buf, NUM_DELETED_OFF, 0);
+        let mut page = TablePageMut::new(&mut buf[..]).unwrap();
+        let before = page.slot(0).unwrap();
+        let live = TupleMeta {
+            is_deleted: false,
+            ..before.meta
+        };
+        assert!(page.update_in_place(0, live, b"new").is_err());
+        let after = page.slot(0).unwrap();
+        assert_eq!(after.meta, before.meta);
+        assert_eq!(page.tuple_bytes(&after).unwrap(), b"old");
     }
 
     #[test]
