@@ -27,7 +27,9 @@ The rules for holding guards are in `ARCHITECTURE.md`.
   latch. If the frame was given to another page in between, drop the pin and retry.
 - **Miss**: take a frame from the free list, or ask the replacer for a victim and write it
   back first if it is dirty. Read the page from disk into the frame, map it and pin it. If
-  the read fails, the victim is put back.
+  the read fails, the victim is put back. The meta lock is held for the whole miss, both
+  disk requests included, so misses run one at a time and hits and guard drops on other
+  threads wait for them.
 - With no free frame and nothing evictable, the fetch fails with `BpmError::NoFreeFrame`.
 - `flush_page(id)` writes a resident page to disk and clears its dirty flag without
   changing its pins.
