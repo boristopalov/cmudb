@@ -542,7 +542,7 @@ fn drop_index_then_drop_table() {
     });
     assert!(matches!(
         db.plan_error(&again),
-        QueryError::Execute(ExecutorError::IndexNotFound { oid }) if oid == index_oid
+        QueryError::Execute(ExecutorError::IndexNotFound { oid }) if oid == Some(index_oid)
     ));
     let again = Plan::DropIndex(DropIndexPlanNode {
         index_oid: Some(index_oid),
@@ -565,7 +565,7 @@ fn drop_index_then_drop_table() {
     });
     assert!(matches!(
         db.plan_error(&again),
-        QueryError::Execute(ExecutorError::TableNotFound { oid }) if oid == table_oid
+        QueryError::Execute(ExecutorError::TableNotFound { oid }) if oid == Some(table_oid)
     ));
     let again = Plan::DropTable(DropTablePlanNode {
         table_oid: Some(table_oid),
@@ -590,10 +590,14 @@ fn drop_plans_without_a_target_fail_unless_if_exists() {
             if_exists,
         })
     };
-    let err = db.run_plan(&missing_table(false)).unwrap_err();
-    assert!(err.contains("table does not exist"), "{err}");
-    let err = db.run_plan(&missing_index(false)).unwrap_err();
-    assert!(err.contains("index does not exist"), "{err}");
+    assert!(matches!(
+        db.plan_error(&missing_table(false)),
+        QueryError::Execute(ExecutorError::TableNotFound { oid: None })
+    ));
+    assert!(matches!(
+        db.plan_error(&missing_index(false)),
+        QueryError::Execute(ExecutorError::IndexNotFound { oid: None })
+    ));
     db.run_plan(&missing_table(true)).unwrap();
     db.run_plan(&missing_index(true)).unwrap();
 }

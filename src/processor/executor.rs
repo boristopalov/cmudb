@@ -2296,7 +2296,7 @@ impl<'a> Executor for DropIndexExecutor<'a> {
     }
 }
 
-/// The error message for a DROP whose `kind` of object (table or index) does not exist.
+/// Writes the message for a DROP whose `kind` of object (table or index) does not exist.
 fn missing_drop_target(f: &mut fmt::Formatter<'_>, kind: &str, oid: Option<u32>) -> fmt::Result {
     match oid {
         Some(oid) => write!(f, "{kind} with oid {oid} does not exist"),
