@@ -7,8 +7,9 @@ executor and where each kind of test goes. MVCC is described in docs/mvcc.md.
 
 ## Commands
 
-Run `just ci` before pushing: it runs every check CI runs (fmt, clippy, the
-comment policy and the tests), and CI calls the same recipes.
+Run `just ci` before pushing: it runs CI's lint and test jobs (fmt, clippy, the
+comment policy and the tests) through the same recipes CI calls. CI's coverage
+job also runs `just coverage`.
 
 ```sh
 just ci                                      # fmt, clippy, comment policy, tests

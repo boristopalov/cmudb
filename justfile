@@ -1,7 +1,7 @@
-# Every check CI runs, so `just` or `just ci` before pushing matches CI.
+# `just` or `just ci` runs CI's lint and test jobs; CI's coverage job runs `just coverage`.
 # CI calls the `lint`, `test` and `coverage` recipes below directly.
 
-# Run fmt, clippy, the comment policy and the tests, as CI does.
+# Run fmt, clippy, the comment policy and the tests, as CI's lint and test jobs do.
 ci: lint test
 
 # fmt check, clippy with warnings as errors, and the comment policy.

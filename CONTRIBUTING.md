@@ -10,9 +10,9 @@ just ci
 
 It runs `cargo fmt --all --check`, clippy on all targets and on the benches,
 `scripts/check_comments.py`, and `cargo test`. Tests install no logger, so
-`RUST_LOG` has no effect on them. CI calls
-the same `just lint` and `just test` recipes, so a green `just ci` means a
-green CI. Install `just` with `cargo install just` (or `pip install rust-just`).
+`RUST_LOG` has no effect on them. CI's lint and test jobs call the same
+`just lint` and `just test` recipes, so a green `just ci` means green lint and
+test jobs; CI's coverage job also runs `just coverage`. Install `just` with `cargo install just` (or `pip install rust-just`).
 
 `just coverage` runs CI's 80% line-coverage gate and needs `cargo-llvm-cov`.
 
