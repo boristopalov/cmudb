@@ -78,6 +78,6 @@ criterion's 95% interval):
 
 The table heap benches use a 64-frame pool on a heap of about 270 pages, so scans and random
 gets include disk reads and evictions. The bench asserts that the heap is larger than the pool,
-and that every read in `read_miss_evict` misses. The B+ tree lookup and scan benches use a
+and, before timing, that every read in two laps of `read_miss_evict`'s fixed cycle misses. The B+ tree lookup and scan benches use a
 1024-frame pool and assert that the whole 100k-key tree stays in it, so their cost is decoding
 pages rather than I/O.
