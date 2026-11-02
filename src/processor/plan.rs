@@ -212,11 +212,13 @@ impl SortExpr {
 /// Computes window aggregates without collapsing rows. For
 /// `SELECT salary * 2, AVG(salary) OVER (PARTITION BY dept) FROM emp`, `columns` is
 /// `[salary * 2]` and `aggregates` is `[(salary, AVG)]`; each output row is the
-/// `columns` values followed by one value per aggregate.
+/// `columns` values followed by one value per aggregate. With `order_by_exprs`, each
+/// aggregate runs over its partition's rows up to and including the row's peers, the rows
+/// whose `ORDER BY` key equals its own; without, over the whole partition.
 pub struct WindowFunctionPlanNode {
     pub schema: Schema,
     pub child: Box<Plan>,
-    pub order_by_exprs: Option<Vec<Expression>>,
+    pub order_by_exprs: Option<Vec<SortExpr>>,
     pub partition_by_exprs: Option<Vec<Expression>>,
     pub aggregates: Vec<(Expression, AggType)>,
     pub columns: Vec<Expression>,

@@ -1883,13 +1883,14 @@ impl<'a> Executor for WindowFunctionExecutor<'a> {
 
         let child_schema = self.child.schema();
         let partition_by: &[Expression] = self.plan.partition_by_exprs.as_deref().unwrap_or(&[]);
-        let order_by: &[Expression] = self.plan.order_by_exprs.as_deref().unwrap_or(&[]);
+        let order_by: &[SortExpr] = self.plan.order_by_exprs.as_deref().unwrap_or(&[]);
         let sort_exprs: Vec<SortExpr> = partition_by
             .iter()
-            .chain(order_by)
             .cloned()
             .map(SortExpr::ascending)
+            .chain(order_by.iter().cloned())
             .collect();
+        let order_keys: Vec<Expression> = order_by.iter().map(|key| key.expr.clone()).collect();
         let tups = sorted_by_exprs(tups, |t| t, &sort_exprs, child_schema)?;
 
         let running = self.plan.order_by_exprs.is_some();
@@ -1912,7 +1913,7 @@ impl<'a> Executor for WindowFunctionExecutor<'a> {
         for t in tups.iter() {
             let curr_partition_key = eval_key(partition_by, t, child_schema)?;
             let new_partition = prev_partition_key.as_ref() != Some(&curr_partition_key);
-            let curr_order_key = eval_key(order_by, t, child_schema)?;
+            let curr_order_key = eval_key(&order_keys, t, child_schema)?;
             let new_peer_group = new_partition || prev_order_key.as_ref() != Some(&curr_order_key);
 
             let flush_now = if new_partition {

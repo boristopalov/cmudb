@@ -64,7 +64,7 @@ typed `StatementResult` per statement. The shell (`src/main.rs`) only prints tho
    `tests/batch_execution.rs` checks this across batch sizes.
 3. Add its arm to `create_executor_with_batch_size` in `executor_factory.rs`.
 4. Have `src/planner.rs` emit it, or, until it does, build its plan by hand in
-   `tests/executors.rs`, as window functions do today.
+   `tests/executors.rs`.
 5. Reach it through SQL in tests, through `Database` (or `tests/common`, which wraps it).
 
 ## Tests
@@ -73,7 +73,7 @@ typed `StatementResult` per statement. The shell (`src/main.rs`) only prints tho
 |---|---|
 | Unit | `#[cfg(test)] mod tests` beside the code |
 | Storage and index integration, concurrency soaks | `tests/buffer_pool_integration.rs`, `tests/table_heap_integration.rs`, `tests/b_plus_tree_integration.rs` |
-| SQL end to end | `tests/sql_e2e.rs` on the `tests/common` harness; `tests/e2e.rs`, `tests/mvcc.rs` and `tests/batch_execution.rs` |
+| SQL end to end | `tests/sql_e2e.rs` on the `tests/common` harness; `tests/window_functions.rs`, `tests/e2e.rs`, `tests/mvcc.rs` and `tests/batch_execution.rs` |
 | Hand-built plans | `tests/executors.rs` |
 | Shell binary | `tests/cli.rs` |
 | Fixtures | `cmudb::testing` (`bpm(frames)`, `catalog(frames)`), built for unit tests and, through the `testing` feature, for `tests/` and `benches/` |
