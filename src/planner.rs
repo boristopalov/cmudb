@@ -342,11 +342,11 @@ impl<'a> Planner<'a> {
         let index_join = match join.join_type {
             JoinType::Inner => left_right_equi_join(&join.predicate)
                 .filter(|&(outer, inner)| {
-                    left_ts.schema.cols[outer as usize].dtype
-                        == right_ts.schema.cols[inner as usize].dtype
+                    left_ts.schema.cols[outer.index()].dtype
+                        == right_ts.schema.cols[inner.index()].dtype
                 })
                 .and_then(|(outer, inner)| {
-                    self.index_for_cols(right_ts.oid, &[inner as usize])
+                    self.index_for_cols(right_ts.oid, &[inner.index()])
                         .map(|index_oid| (outer, index_oid))
                 }),
             JoinType::Left => None,
@@ -356,8 +356,8 @@ impl<'a> Planner<'a> {
                 schema: out_schema,
                 child: Box::new(left),
                 key_predicate: Expression::Column {
-                    col: ColIdx(outer_col),
-                    dtype: left_ts.schema.cols[outer_col as usize].dtype,
+                    col: outer_col,
+                    dtype: left_ts.schema.cols[outer_col.index()].dtype,
                 },
                 table_oid: right_ts.oid,
                 table_schema: right_ts.schema.clone(),
@@ -469,15 +469,15 @@ fn hash_join_keys(
 ) -> Result<HashJoinKeys, JoinPredicate> {
     let key_columns = |part: &JoinPredicate| {
         left_right_equi_join(part)
-            .filter(|&(l, r)| left.cols[l as usize].dtype == right.cols[r as usize].dtype)
+            .filter(|&(l, r)| left.cols[l.index()].dtype == right.cols[r.index()].dtype)
     };
     let parts = conjuncts(&predicate);
     if !parts.iter().any(|part| key_columns(part).is_some()) {
         return Err(predicate);
     }
-    let column = |schema: &Schema, col: u32| Expression::Column {
-        col: ColIdx(col),
-        dtype: schema.cols[col as usize].dtype,
+    let column = |schema: &Schema, col: ColIdx| Expression::Column {
+        col,
+        dtype: schema.cols[col.index()].dtype,
     };
     let mut left_exprs = Vec::new();
     let mut right_exprs = Vec::new();
@@ -691,7 +691,7 @@ fn column_equals_constant(filter: &Expression) -> Option<(ColIdx, Value)> {
 
 /// `(left_col, right_col)` when `predicate` is an equality between a left-input column
 /// and a right-input column, in either order.
-fn left_right_equi_join(predicate: &JoinPredicate) -> Option<(u32, u32)> {
+fn left_right_equi_join(predicate: &JoinPredicate) -> Option<(ColIdx, ColIdx)> {
     let Expression::Binary {
         left,
         right,
@@ -724,7 +724,7 @@ fn left_right_equi_join(predicate: &JoinPredicate) -> Option<(u32, u32)> {
                 side: Side::Left,
                 col: outer,
             },
-        ) => Some((outer.0, inner.0)),
+        ) => Some((outer, inner)),
         _ => None,
     }
 }
@@ -824,7 +824,11 @@ mod tests {
         );
         assert_eq!(
             left_right_equi_join(&eq(join_column(Side::Right, 4), join_column(Side::Left, 1))),
-            Some((1, 4))
+            Some((ColIdx(1), ColIdx(4)))
+        );
+        assert_eq!(
+            left_right_equi_join(&eq(join_column(Side::Left, 1), join_column(Side::Right, 4))),
+            Some((ColIdx(1), ColIdx(4)))
         );
         assert_eq!(
             left_right_equi_join(&eq(join_column(Side::Left, 4), join_column(Side::Left, 1))),
