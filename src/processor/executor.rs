@@ -41,19 +41,144 @@ impl From<IndexError> for ExecutorError {
     }
 }
 
-/// A pull-based plan operator. `open` prepares state and opens the children, then each
-/// `next` call yields one row until it returns `Ok(None)`.
+/// Default number of rows an executor aims to put in each [`Batch`].
+pub const DEFAULT_BATCH_SIZE: usize = 1024;
+
+/// A single row flowing through the executor tree, with the record id it came from, or
+/// [`RecordId::RESERVED`] for rows that do not map back to a table slot.
+pub type Row = (Tuple, RecordId);
+
+/// A batch of rows passed between executors. Batching spreads the per-call cost of the
+/// pull model (dynamic dispatch, `Option`/`Result` wrapping, state checks) over many rows.
+#[derive(Debug, Default)]
+pub struct Batch {
+    pub rows: Vec<Row>,
+}
+
+impl Batch {
+    /// Wraps `rows` in a batch, or returns `None` when `rows` is empty, so that an empty
+    /// batch is not handed to a parent.
+    pub fn from_rows(rows: Vec<Row>) -> Option<Self> {
+        if rows.is_empty() {
+            None
+        } else {
+            Some(Self { rows })
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, Row> {
+        self.rows.iter()
+    }
+}
+
+impl IntoIterator for Batch {
+    type Item = Row;
+    type IntoIter = VecIter<Row>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.rows.into_iter()
+    }
+}
+
+/// A pull-based plan operator using a vectorized volcano model. `open` prepares state and
+/// opens the children, then each `next_batch` call yields a batch of at least one row until
+/// it returns `Ok(None)`, which it then returns on every later call. Executors that produce
+/// rows themselves (scans, joins, sorts, aggregations) emit at most their configured batch
+/// size; pass-through executors (filter, projection, limit, update, delete) emit at most what
+/// their child handed them.
 pub trait Executor {
     fn open(&mut self) -> Result<(), ExecutorError>;
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError>;
-    /// Layout of the tuples `next` yields.
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError>;
+    /// Layout of the tuples `next_batch` yields.
     fn schema(&self) -> &Schema;
     /// Releases resources early; dropping the executor releases the rest.
     fn close(&mut self) -> Result<(), ExecutorError>;
 }
 
+/// Row-at-a-time view over an executor, for callers (the shell, tests) that consume rows one
+/// by one. It pulls a batch at a time from the executor.
+pub struct RowCursor<'e> {
+    exec: &'e mut dyn Executor,
+    buf: VecIter<Row>,
+}
+
+impl<'e> RowCursor<'e> {
+    pub fn new(exec: &'e mut dyn Executor) -> Self {
+        Self {
+            exec,
+            buf: Vec::new().into_iter(),
+        }
+    }
+
+    pub fn next_row(&mut self) -> Result<Option<Row>, ExecutorError> {
+        loop {
+            if let Some(row) = self.buf.next() {
+                return Ok(Some(row));
+            }
+            match self.exec.next_batch()? {
+                Some(batch) => self.buf = batch.into_iter(),
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+impl Iterator for RowCursor<'_> {
+    type Item = Result<Row, ExecutorError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_row().transpose()
+    }
+}
+
+/// Drains an opened executor and returns all of its rows.
+pub fn collect_rows(exec: &mut dyn Executor) -> Result<Vec<Row>, ExecutorError> {
+    let mut rows = Vec::new();
+    while let Some(batch) = exec.next_batch()? {
+        rows.extend(batch);
+    }
+    Ok(rows)
+}
+
+/// Pulls up to `batch_size` rows from a fallible row iterator.
+fn fill_batch<I, E>(iter: &mut I, batch_size: usize) -> Result<Option<Batch>, ExecutorError>
+where
+    I: Iterator<Item = Result<Row, E>>,
+    ExecutorError: From<E>,
+{
+    let mut rows = Vec::with_capacity(batch_size);
+    while rows.len() < batch_size {
+        match iter.next() {
+            Some(row) => rows.push(row?),
+            None => break,
+        }
+    }
+    Ok(Batch::from_rows(rows))
+}
+
+/// Pulls up to `batch_size` rows from an iterator over already materialized rows.
+fn take_batch<I>(iter: &mut I, batch_size: usize) -> Option<Batch>
+where
+    I: Iterator<Item = Row>,
+{
+    Batch::from_rows(iter.by_ref().take(batch_size).collect())
+}
+
+/// A batch holding only `tuple`, which maps back to no table slot.
+fn single_row(tuple: Tuple) -> Option<Batch> {
+    Batch::from_rows(vec![(tuple, RecordId::RESERVED)])
+}
+
 fn not_opened(executor: &str) -> ExecutorError {
-    ExecutorError(format!("{executor}::next called before open"))
+    ExecutorError(format!("{executor}::next_batch called before open"))
 }
 
 fn is_true(predicate_result: Option<Value>) -> bool {
@@ -96,14 +221,16 @@ fn eval_key(
 pub struct SeqScanExecutor<'a> {
     catalog: &'a Catalog,
     plan: &'a SeqScanPlanNode,
+    batch_size: usize,
     iter: Option<TableHeapIterator>,
 }
 
 impl<'a> SeqScanExecutor<'a> {
-    pub fn new(catalog: &'a Catalog, plan: &'a SeqScanPlanNode) -> Self {
+    pub fn new(catalog: &'a Catalog, plan: &'a SeqScanPlanNode, batch_size: usize) -> Self {
         Self {
             catalog,
             plan,
+            batch_size,
             iter: None,
         }
     }
@@ -116,12 +243,12 @@ impl<'a> Executor for SeqScanExecutor<'a> {
         Ok(())
     }
 
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
         let iter = self
             .iter
             .as_mut()
             .ok_or_else(|| not_opened("SeqScanExecutor"))?;
-        iter.next().transpose().map_err(ExecutorError::from)
+        fill_batch(iter, self.batch_size)
     }
 
     fn schema(&self) -> &Schema {
@@ -165,9 +292,9 @@ impl<'a> Executor for InsertExecutor<'a> {
         Ok(())
     }
 
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
         if self.done {
-            return Err(ExecutorError("already executed".to_string()));
+            return Ok(None);
         }
 
         let table = self
@@ -177,17 +304,19 @@ impl<'a> Executor for InsertExecutor<'a> {
 
         let indexes = self.catalog.get_table_indexes(self.plan.table_oid)?;
         let mut count: i32 = 0;
-        while let Some(res) = self.child.next()? {
-            reject_duplicate_keys(&indexes, None, &res.0)?;
-            let rid = table.heap.insert(&res.0)?;
-            for idx in &indexes {
-                idx.index.insert(&res.0, rid)?;
+        while let Some(batch) = self.child.next_batch()? {
+            for (tuple, _) in batch {
+                reject_duplicate_keys(&indexes, None, &tuple)?;
+                let rid = table.heap.insert(&tuple)?;
+                for idx in &indexes {
+                    idx.index.insert(&tuple, rid)?;
+                }
+                count += 1;
             }
-            count += 1;
         }
 
         self.done = true;
-        Ok(Some((inserted_count_tuple(count), RecordId::RESERVED)))
+        Ok(single_row(inserted_count_tuple(count)))
     }
 
     fn schema(&self) -> &Schema {
@@ -222,33 +351,40 @@ fn inserted_count_tuple(count: i32) -> Tuple {
     }
 }
 
-/// Yields one tuple per row of a `VALUES` list.
+/// Yields one tuple per row of a `VALUES` list, up to `batch_size` per batch.
 pub struct ValuesExecutor<'a> {
     plan: &'a ValuesPlanNode,
-    cursor: u32,
+    batch_size: usize,
+    cursor: usize,
 }
 
 impl<'a> ValuesExecutor<'a> {
-    pub fn new(plan: &'a ValuesPlanNode) -> Self {
-        Self { plan, cursor: 0 }
+    pub fn new(plan: &'a ValuesPlanNode, batch_size: usize) -> Self {
+        Self {
+            plan,
+            batch_size,
+            cursor: 0,
+        }
     }
 }
 
 impl<'a> Executor for ValuesExecutor<'a> {
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
-        if self.cursor as usize >= self.plan.rows.len() {
-            return Ok(None);
-        }
-        let exprs = &self.plan.rows[self.cursor as usize];
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
+        let start = self.cursor.min(self.plan.rows.len());
+        let end = start
+            .saturating_add(self.batch_size)
+            .min(self.plan.rows.len());
         let no_input_row = Tuple { data: vec![] };
-        let vals: Vec<Option<Value>> = exprs
-            .iter()
-            .map(|e| e.evaluate(&no_input_row, self.schema()))
-            .collect::<Result<Vec<Option<Value>>, ExecutorError>>()?;
-
-        let tuple = self.schema().encode_tuple(&vals)?;
-        self.cursor += 1;
-        Ok(Some((tuple, RecordId::RESERVED)))
+        let mut rows = Vec::with_capacity(end - start);
+        for exprs in &self.plan.rows[start..end] {
+            let vals: Vec<Option<Value>> = exprs
+                .iter()
+                .map(|e| e.evaluate(&no_input_row, &self.plan.schema))
+                .collect::<Result<Vec<Option<Value>>, ExecutorError>>()?;
+            rows.push((self.plan.schema.encode_tuple(&vals)?, RecordId::RESERVED));
+        }
+        self.cursor = end;
+        Ok(Batch::from_rows(rows))
     }
 
     fn close(&mut self) -> Result<(), ExecutorError> {
@@ -294,32 +430,40 @@ impl<'a> Executor for UpdateExecutor<'a> {
         Ok(())
     }
 
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+    /// Updates every row of the next child batch and returns the updated rows. The child scan
+    /// stops at the heap's tail as of `open`, so the replacement rows `heap.update` appends
+    /// are not fed back into this executor.
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
         let table = self
             .table
             .as_ref()
             .ok_or_else(|| not_opened("UpdateExecutor"))?;
 
-        let Some((tuple_to_update, rid)) = self.child.next()? else {
+        let Some(batch) = self.child.next_batch()? else {
             return Ok(None);
         };
 
-        let mut new_values = row_values(self.schema(), &tuple_to_update)?;
-        for assignment in &self.plan.assignments {
-            new_values[assignment.col_idx as usize] =
-                assignment.value.evaluate(&tuple_to_update, self.schema())?;
-        }
-
-        let new_tuple = self.schema().encode_tuple(new_values.as_ref())?;
+        let schema = &self.plan.schema;
         let indexes = self.catalog.get_table_indexes(self.plan.table_oid)?;
-        reject_duplicate_keys(&indexes, Some(&tuple_to_update), &new_tuple)?;
-        let (new_rid, _) = table.heap.update(rid, &new_tuple)?;
+        let mut out = Vec::with_capacity(batch.len());
+        for (tuple_to_update, rid) in batch {
+            let mut new_values = row_values(schema, &tuple_to_update)?;
+            for assignment in &self.plan.assignments {
+                new_values[assignment.col_idx as usize] =
+                    assignment.value.evaluate(&tuple_to_update, schema)?;
+            }
 
-        for idx in &indexes {
-            idx.index.remove(&tuple_to_update)?;
-            idx.index.insert(&new_tuple, new_rid)?;
+            let new_tuple = schema.encode_tuple(new_values.as_ref())?;
+            reject_duplicate_keys(&indexes, Some(&tuple_to_update), &new_tuple)?;
+            let (new_rid, _) = table.heap.update(rid, &new_tuple)?;
+
+            for idx in &indexes {
+                idx.index.remove(&tuple_to_update)?;
+                idx.index.insert(&new_tuple, new_rid)?;
+            }
+            out.push((new_tuple, new_rid));
         }
-        Ok(Some((new_tuple, new_rid)))
+        Ok(Batch::from_rows(out))
     }
 
     fn close(&mut self) -> Result<(), ExecutorError> {
@@ -361,21 +505,25 @@ impl<'a> Executor for DeleteExecutor<'a> {
         Ok(())
     }
 
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+    /// Deletes every row of the next child batch and returns the deleted rows.
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
         let table = self
             .table
             .as_ref()
             .ok_or_else(|| not_opened("DeleteExecutor"))?;
 
-        let Some((tup, rid)) = self.child.next()? else {
+        let Some(batch) = self.child.next_batch()? else {
             return Ok(None);
         };
 
-        table.heap.delete(&rid)?;
-        for idx in self.catalog.get_table_indexes(self.plan.table_oid)? {
-            idx.as_ref().index.remove(&tup)?;
+        let indexes = self.catalog.get_table_indexes(self.plan.table_oid)?;
+        for (tup, rid) in batch.iter() {
+            table.heap.delete(rid)?;
+            for idx in &indexes {
+                idx.index.remove(tup)?;
+            }
         }
-        Ok(Some((tup, rid)))
+        Ok(Some(batch))
     }
 
     fn schema(&self) -> &Schema {
@@ -390,15 +538,17 @@ impl<'a> Executor for DeleteExecutor<'a> {
 pub struct IndexScanExecutor<'a> {
     catalog: &'a Catalog,
     plan: &'a IndexScanPlanNode,
+    batch_size: usize,
     table: Option<Arc<TableInfo>>,
     iter: Option<IndexIter>,
 }
 
 impl<'a> IndexScanExecutor<'a> {
-    pub fn new(catalog: &'a Catalog, plan: &'a IndexScanPlanNode) -> Self {
+    pub fn new(catalog: &'a Catalog, plan: &'a IndexScanPlanNode, batch_size: usize) -> Self {
         Self {
             catalog,
             plan,
+            batch_size,
             table: None,
             iter: None,
         }
@@ -419,7 +569,7 @@ impl<'a> Executor for IndexScanExecutor<'a> {
 
         Ok(())
     }
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
         let iter = self
             .iter
             .as_mut()
@@ -429,13 +579,16 @@ impl<'a> Executor for IndexScanExecutor<'a> {
             .as_ref()
             .ok_or_else(|| not_opened("IndexScanExecutor"))?;
 
-        let Some(item) = iter.next() else {
-            return Ok(None);
-        };
-        let (_key, IndexValue::IndexValue(rid)) = item?;
-
-        let (rid, tuple) = table.heap.get(rid)?;
-        Ok(Some((tuple, rid)))
+        let mut rows = Vec::with_capacity(self.batch_size);
+        while rows.len() < self.batch_size {
+            let Some(item) = iter.next() else {
+                break;
+            };
+            let (_key, IndexValue::IndexValue(rid)) = item?;
+            let (rid, tuple) = table.heap.get(rid)?;
+            rows.push((tuple, rid));
+        }
+        Ok(Batch::from_rows(rows))
     }
 
     fn schema(&self) -> &Schema {
@@ -450,14 +603,20 @@ impl<'a> Executor for IndexScanExecutor<'a> {
 pub struct AggregationExecutor<'a> {
     plan: &'a AggregationPlanNode,
     child: Box<dyn Executor + 'a>,
+    batch_size: usize,
     iter: Option<IntoIter<ExprKey, AggVal>>,
 }
 
 impl<'a> AggregationExecutor<'a> {
-    pub fn new(plan: &'a AggregationPlanNode, child: Box<dyn Executor + 'a>) -> Self {
+    pub fn new(
+        plan: &'a AggregationPlanNode,
+        child: Box<dyn Executor + 'a>,
+        batch_size: usize,
+    ) -> Self {
         Self {
             plan,
             child,
+            batch_size,
             iter: None,
         }
     }
@@ -467,42 +626,43 @@ impl<'a> Executor for AggregationExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
         self.child.open()?;
         let mut agg_hash_table: HashMap<ExprKey, AggVal> = HashMap::new();
-        while let Some((tuple, _)) = self.child.next()? {
+        while let Some(batch) = self.child.next_batch()? {
             let schema = self.child.schema();
-            let groups = eval_key(&self.plan.group_bys, &tuple, schema)?;
-            let entry = agg_hash_table.entry(groups).or_insert_with(|| {
-                AggVal(
-                    self.plan
-                        .aggregates
-                        .iter()
-                        .map(|(_, agg_type)| AggState::new(agg_type))
-                        .collect(),
-                )
-            });
-            for (state, (expr, _)) in entry.0.iter_mut().zip(self.plan.aggregates.iter()) {
-                state.update(expr.evaluate(&tuple, schema)?)?;
+            for (tuple, _) in batch {
+                let groups = eval_key(&self.plan.group_bys, &tuple, schema)?;
+                let entry = agg_hash_table.entry(groups).or_insert_with(|| {
+                    AggVal(
+                        self.plan
+                            .aggregates
+                            .iter()
+                            .map(|(_, agg_type)| AggState::new(agg_type))
+                            .collect(),
+                    )
+                });
+                for (state, (expr, _)) in entry.0.iter_mut().zip(self.plan.aggregates.iter()) {
+                    state.update(expr.evaluate(&tuple, schema)?)?;
+                }
             }
         }
         self.iter = Some(agg_hash_table.into_iter());
         Ok(())
     }
 
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
         let iter = self
             .iter
             .as_mut()
             .ok_or_else(|| not_opened("AggregationExecutor"))?;
-        let Some((key, val)) = iter.next() else {
-            return Ok(None);
-        };
-        let mut out: Vec<Option<Value>> = Vec::with_capacity(key.0.len() + val.0.len());
-        out.extend(key.0);
-        for v in val.0 {
-            out.push(v.value()?);
+        let mut rows = Vec::with_capacity(self.batch_size);
+        for (key, val) in iter.by_ref().take(self.batch_size) {
+            let mut out: Vec<Option<Value>> = Vec::with_capacity(key.0.len() + val.0.len());
+            out.extend(key.0);
+            for v in val.0 {
+                out.push(v.value()?);
+            }
+            rows.push((self.plan.schema.encode_tuple(&out)?, RecordId::RESERVED));
         }
-
-        let tuple = self.schema().encode_tuple(&out)?;
-        Ok(Some((tuple, RecordId::RESERVED)))
+        Ok(Batch::from_rows(rows))
     }
 
     fn close(&mut self) -> Result<(), ExecutorError> {
@@ -598,12 +758,48 @@ fn add_to(total: Option<Value>, v: Value) -> Result<Value, ExecutorError> {
     }
 }
 
+/// The outer (left) side of a join: rows are pulled from the child a batch at a time and
+/// handed to the join one at a time.
+struct OuterRows {
+    buf: VecIter<Row>,
+    exhausted: bool,
+}
+
+impl OuterRows {
+    fn new() -> Self {
+        Self {
+            buf: Vec::new().into_iter(),
+            exhausted: false,
+        }
+    }
+
+    fn next(&mut self, child: &mut dyn Executor) -> Result<Option<Tuple>, ExecutorError> {
+        loop {
+            if let Some((tuple, _)) = self.buf.next() {
+                return Ok(Some(tuple));
+            }
+            if self.exhausted {
+                return Ok(None);
+            }
+            match child.next_batch()? {
+                Some(batch) => self.buf = batch.into_iter(),
+                None => self.exhausted = true,
+            }
+        }
+    }
+}
+
+/// Joins every left row with every buffered right row that satisfies the predicate. One left
+/// row can match more rows than fit in a batch, so `right_cursor` keeps the position in the
+/// right rows across `next_batch` calls.
 pub struct NestedLoopJoinExecutor<'a> {
     plan: &'a NestedLoopJoinPlanNode,
     left: Box<dyn Executor + 'a>,
     right: Box<dyn Executor + 'a>,
+    batch_size: usize,
 
     right_tuples: Vec<Tuple>,
+    outer: OuterRows,
 
     right_cursor: usize,
     curr_left: Option<Tuple>,
@@ -615,12 +811,15 @@ impl<'a> NestedLoopJoinExecutor<'a> {
         plan: &'a NestedLoopJoinPlanNode,
         left: Box<dyn Executor + 'a>,
         right: Box<dyn Executor + 'a>,
+        batch_size: usize,
     ) -> Self {
         Self {
             plan,
             left,
             right,
+            batch_size,
             right_tuples: Vec::new(),
+            outer: OuterRows::new(),
             right_cursor: 0,
             curr_left: None,
             left_matched: false,
@@ -632,58 +831,55 @@ impl<'a> Executor for NestedLoopJoinExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
         self.left.open()?;
         self.right.open()?;
-        while let Some((tup, _)) = self.right.next()? {
-            self.right_tuples.push(tup);
-        }
+        self.right_tuples = collect_rows(self.right.as_mut())?
+            .into_iter()
+            .map(|(tup, _)| tup)
+            .collect();
         Ok(())
     }
 
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
-        loop {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
+        let mut out: Vec<Row> = Vec::with_capacity(self.batch_size);
+        while out.len() < self.batch_size {
             if self.curr_left.is_none() {
-                let Some((lt, _)) = self.left.next()? else {
-                    return Ok(None);
+                let Some(lt) = self.outer.next(self.left.as_mut())? else {
+                    break;
                 };
                 self.curr_left = Some(lt);
                 self.right_cursor = 0;
                 self.left_matched = false;
-            };
+            }
             let Some(lt) = self.curr_left.as_ref() else {
                 continue;
             };
+            let left_schema = self.left.schema();
+            let right_schema = self.right.schema();
 
-            while self.right_cursor < self.right_tuples.len() {
+            while self.right_cursor < self.right_tuples.len() && out.len() < self.batch_size {
                 let rt = &self.right_tuples[self.right_cursor];
                 self.right_cursor += 1;
-                let predicate_result = self.plan.predicate.evaluate_join(
-                    lt,
-                    self.left.schema(),
-                    rt,
-                    self.right.schema(),
-                )?;
+                let predicate_result =
+                    self.plan
+                        .predicate
+                        .evaluate_join(lt, left_schema, rt, right_schema)?;
                 if is_true(predicate_result) {
                     self.left_matched = true;
-                    let row = joined_row(self.left.schema(), lt, self.right.schema(), Some(rt))?;
-                    let out = self.schema().encode_tuple(&row)?;
-                    return Ok(Some((out, RecordId::RESERVED)));
+                    let row = joined_row(left_schema, lt, right_schema, Some(rt))?;
+                    out.push((self.plan.schema.encode_tuple(&row)?, RecordId::RESERVED));
                 }
             }
 
-            let unmatched_left_row = match self.plan.join_type {
-                JoinType::Left if !self.left_matched => Some(joined_row(
-                    self.left.schema(),
-                    lt,
-                    self.right.schema(),
-                    None,
-                )?),
-                _ => None,
-            };
-            self.curr_left = None;
-            if let Some(row) = unmatched_left_row {
-                let out = self.schema().encode_tuple(&row)?;
-                return Ok(Some((out, RecordId::RESERVED)));
+            let left_row_finished = self.right_cursor >= self.right_tuples.len();
+            if !left_row_finished {
+                break;
             }
+            if matches!(self.plan.join_type, JoinType::Left) && !self.left_matched {
+                let row = joined_row(left_schema, lt, right_schema, None)?;
+                out.push((self.plan.schema.encode_tuple(&row)?, RecordId::RESERVED));
+            }
+            self.curr_left = None;
         }
+        Ok(Batch::from_rows(out))
     }
 
     fn schema(&self) -> &Schema {
@@ -699,9 +895,11 @@ pub struct NestedIndexJoinExecutor<'a> {
     catalog: &'a Catalog,
     plan: &'a NestedIndexJoinPlanNode,
     child: Box<dyn Executor + 'a>,
+    batch_size: usize,
     inner_table: Option<Arc<TableInfo>>,
 
     index: Option<Arc<IndexInfo>>,
+    outer: OuterRows,
     inner_matches: Option<IndexIter>,
     curr_left: Option<Tuple>,
     left_matched: bool,
@@ -712,13 +910,16 @@ impl<'a> NestedIndexJoinExecutor<'a> {
         catalog: &'a Catalog,
         plan: &'a NestedIndexJoinPlanNode,
         child: Box<dyn Executor + 'a>,
+        batch_size: usize,
     ) -> Self {
         Self {
             catalog,
             plan,
             child,
+            batch_size,
             inner_table: None,
             index: None,
+            outer: OuterRows::new(),
             inner_matches: None,
             curr_left: None,
             left_matched: false,
@@ -736,20 +937,21 @@ impl<'a> Executor for NestedIndexJoinExecutor<'a> {
         self.inner_table = Some(table);
         Ok(())
     }
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
         let index = self
             .index
-            .as_ref()
+            .clone()
             .ok_or_else(|| not_opened("NestedIndexJoinExecutor"))?;
         let table = self
             .inner_table
-            .as_ref()
+            .clone()
             .ok_or_else(|| not_opened("NestedIndexJoinExecutor"))?;
 
-        loop {
+        let mut out: Vec<Row> = Vec::with_capacity(self.batch_size);
+        while out.len() < self.batch_size {
             if self.curr_left.is_none() {
-                let Some((outer, _)) = self.child.next()? else {
-                    return Ok(None);
+                let Some(outer) = self.outer.next(self.child.as_mut())? else {
+                    break;
                 };
                 let key = self
                     .plan
@@ -762,34 +964,35 @@ impl<'a> Executor for NestedIndexJoinExecutor<'a> {
             let Some(outer) = self.curr_left.as_ref() else {
                 continue;
             };
+            let child_schema = self.child.schema();
 
-            if let Some(entry) = self.inner_matches.as_mut().and_then(Iterator::next) {
+            let mut inner_finished = true;
+            while let Some(matches) = self.inner_matches.as_mut() {
+                if out.len() >= self.batch_size {
+                    inner_finished = false;
+                    break;
+                }
+                let Some(entry) = matches.next() else {
+                    break;
+                };
                 let (_, IndexValue::IndexValue(rid)) = entry?;
                 let (_, inner_tuple) = table.heap.get(rid)?;
-                let row = joined_row(
-                    self.child.schema(),
-                    outer,
-                    &table.schema,
-                    Some(&inner_tuple),
-                )?;
-                let out = self.schema().encode_tuple(&row)?;
+                let row = joined_row(child_schema, outer, &table.schema, Some(&inner_tuple))?;
+                out.push((self.plan.schema.encode_tuple(&row)?, RecordId::RESERVED));
                 self.left_matched = true;
-                return Ok(Some((out, RecordId::RESERVED)));
+            }
+            if !inner_finished {
+                break;
             }
 
-            let unmatched_left_row = match self.plan.join_type {
-                JoinType::Left if !self.left_matched => {
-                    Some(joined_row(self.child.schema(), outer, &table.schema, None)?)
-                }
-                _ => None,
-            };
+            if matches!(self.plan.join_type, JoinType::Left) && !self.left_matched {
+                let row = joined_row(child_schema, outer, &table.schema, None)?;
+                out.push((self.plan.schema.encode_tuple(&row)?, RecordId::RESERVED));
+            }
             self.curr_left = None;
             self.inner_matches = None;
-            if let Some(row) = unmatched_left_row {
-                let out = self.schema().encode_tuple(&row)?;
-                return Ok(Some((out, RecordId::RESERVED)));
-            }
         }
+        Ok(Batch::from_rows(out))
     }
     fn schema(&self) -> &Schema {
         &self.plan.schema
@@ -822,6 +1025,7 @@ pub struct HashJoinExecutor<'a> {
     left: Box<dyn Executor + 'a>,
     right: Box<dyn Executor + 'a>,
     bpm: Arc<BufferPoolManager>,
+    batch_size: usize,
     left_partitions: Vec<TableHeap>,
     right_partitions: Vec<TableHeap>,
 
@@ -837,12 +1041,14 @@ impl<'a> HashJoinExecutor<'a> {
         left: Box<dyn Executor + 'a>,
         right: Box<dyn Executor + 'a>,
         bpm: Arc<BufferPoolManager>,
+        batch_size: usize,
     ) -> Self {
         Self {
             plan,
             left,
             right,
             bpm,
+            batch_size,
             left_partitions: Vec::new(),
             right_partitions: Vec::new(),
             right_partition_iter: None,
@@ -880,9 +1086,11 @@ fn spill_into_partitions(
     key_exprs: &[Expression],
     partitions: &[TableHeap],
 ) -> Result<(), ExecutorError> {
-    while let Some((tuple, _)) = input.next()? {
-        let key = eval_key(key_exprs, &tuple, input.schema())?;
-        partitions[partition_of(&key)].insert(&tuple)?;
+    while let Some(batch) = input.next_batch()? {
+        for (tuple, _) in batch {
+            let key = eval_key(key_exprs, &tuple, input.schema())?;
+            partitions[partition_of(&key)].insert(&tuple)?;
+        }
     }
     Ok(())
 }
@@ -909,14 +1117,21 @@ impl<'a> Executor for HashJoinExecutor<'a> {
         Ok(())
     }
 
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
+        let mut out: Vec<Row> = Vec::with_capacity(self.batch_size);
         loop {
-            if let Some(out) = self.matches_buffer.pop_back() {
-                return Ok(Some((out, RecordId::RESERVED)));
-            };
+            while out.len() < self.batch_size {
+                let Some(tup) = self.matches_buffer.pop_front() else {
+                    break;
+                };
+                out.push((tup, RecordId::RESERVED));
+            }
+            if out.len() >= self.batch_size {
+                break;
+            }
 
             if self.partition_cursor >= self.left_partitions.len() {
-                return Ok(None);
+                break;
             };
 
             let build_table = match self.build_table.take() {
@@ -960,6 +1175,7 @@ impl<'a> Executor for HashJoinExecutor<'a> {
                     .push_back(self.plan.schema.encode_tuple(&values)?);
             }
         }
+        Ok(Batch::from_rows(out))
     }
 
     fn close(&mut self) -> Result<(), ExecutorError> {
@@ -973,14 +1189,16 @@ impl<'a> Executor for HashJoinExecutor<'a> {
 pub struct SortExecutor<'a> {
     plan: &'a SortPlanNode,
     child: Box<dyn Executor + 'a>,
-    sorted: VecIter<(Tuple, RecordId)>,
+    batch_size: usize,
+    sorted: VecIter<Row>,
 }
 
 impl<'a> SortExecutor<'a> {
-    pub fn new(plan: &'a SortPlanNode, child: Box<dyn Executor + 'a>) -> Self {
+    pub fn new(plan: &'a SortPlanNode, child: Box<dyn Executor + 'a>, batch_size: usize) -> Self {
         Self {
             plan,
             child,
+            batch_size,
             sorted: Vec::new().into_iter(),
         }
     }
@@ -989,10 +1207,7 @@ impl<'a> SortExecutor<'a> {
 impl<'a> Executor for SortExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
         self.child.open()?;
-        let mut buf: Vec<(Tuple, RecordId)> = Vec::new();
-        while let Some(row) = self.child.next()? {
-            buf.push(row);
-        }
+        let buf = collect_rows(self.child.as_mut())?;
         let sorted = sorted_by_exprs(
             buf,
             |row| &row.0,
@@ -1003,8 +1218,8 @@ impl<'a> Executor for SortExecutor<'a> {
         Ok(())
     }
 
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
-        Ok(self.sorted.next())
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
+        Ok(take_batch(&mut self.sorted, self.batch_size))
     }
 
     fn schema(&self) -> &Schema {
@@ -1020,6 +1235,7 @@ pub struct ExternalMergeSortExecutor<'a> {
     plan: &'a ExternalMergeSortPlanNode,
     child: Box<dyn Executor + 'a>,
     bpm: Arc<BufferPoolManager>,
+    batch_size: usize,
     iter: Option<TableHeapIterator>,
 }
 
@@ -1028,11 +1244,13 @@ impl<'a> ExternalMergeSortExecutor<'a> {
         plan: &'a ExternalMergeSortPlanNode,
         child: Box<dyn Executor + 'a>,
         bpm: Arc<BufferPoolManager>,
+        batch_size: usize,
     ) -> Self {
         Self {
             plan,
             child,
             bpm,
+            batch_size,
             iter: None,
         }
     }
@@ -1161,12 +1379,14 @@ impl<'a> Executor for ExternalMergeSortExecutor<'a> {
         let mut buf: Vec<Tuple> = Vec::new();
         let mut runs: Vec<TableHeap> = Vec::new();
 
-        while let Some((tup, _)) = self.child.next()? {
-            run_bytes += tup.data.len();
-            buf.push(tup);
-            if run_bytes >= SORT_RUN_BUDGET_BYTES {
-                runs.push(self.spill_sorted_run(&mut buf)?);
-                run_bytes = 0;
+        while let Some(batch) = self.child.next_batch()? {
+            for (tup, _) in batch {
+                run_bytes += tup.data.len();
+                buf.push(tup);
+                if run_bytes >= SORT_RUN_BUDGET_BYTES {
+                    runs.push(self.spill_sorted_run(&mut buf)?);
+                    run_bytes = 0;
+                }
             }
         }
         runs.push(self.spill_sorted_run(&mut buf)?);
@@ -1190,16 +1410,17 @@ impl<'a> Executor for ExternalMergeSortExecutor<'a> {
         Ok(())
     }
 
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+    /// Yields the sorted rows with [`RecordId::RESERVED`], since their record ids point into
+    /// a scratch heap.
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
         let iter = self
             .iter
             .as_mut()
             .ok_or_else(|| not_opened("ExternalMergeSortExecutor"))?;
-        let Some(item) = iter.next() else {
-            return Ok(None);
-        };
-        let (tup, _) = item?;
-        Ok(Some((tup, RecordId::RESERVED)))
+        let mut rows = iter
+            .by_ref()
+            .map(|item| item.map(|(tup, _)| (tup, RecordId::RESERVED)));
+        fill_batch(&mut rows, self.batch_size)
     }
     fn close(&mut self) -> Result<(), ExecutorError> {
         self.child.close()
@@ -1229,15 +1450,17 @@ impl<'a> Executor for LimitExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
         self.child.open()
     }
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
         if self.count >= self.plan.limit {
             return Ok(None);
         }
-        let row = self.child.next()?;
-        if row.is_some() {
-            self.count += 1;
-        }
-        Ok(row)
+        let Some(mut batch) = self.child.next_batch()? else {
+            return Ok(None);
+        };
+        let remaining = (self.plan.limit - self.count) as usize;
+        batch.rows.truncate(remaining);
+        self.count += batch.len() as u32;
+        Ok(Some(batch))
     }
     fn close(&mut self) -> Result<(), ExecutorError> {
         self.child.close()
@@ -1250,14 +1473,20 @@ impl<'a> Executor for LimitExecutor<'a> {
 pub struct WindowFunctionExecutor<'a> {
     plan: &'a WindowFunctionPlanNode,
     child: Box<dyn Executor + 'a>,
+    batch_size: usize,
     iter: Option<VecIter<Tuple>>,
 }
 
 impl<'a> WindowFunctionExecutor<'a> {
-    pub fn new(plan: &'a WindowFunctionPlanNode, child: Box<dyn Executor + 'a>) -> Self {
+    pub fn new(
+        plan: &'a WindowFunctionPlanNode,
+        child: Box<dyn Executor + 'a>,
+        batch_size: usize,
+    ) -> Self {
         Self {
             plan,
             child,
+            batch_size,
             iter: None,
         }
     }
@@ -1266,10 +1495,10 @@ impl<'a> WindowFunctionExecutor<'a> {
 impl<'a> Executor for WindowFunctionExecutor<'a> {
     fn open(&mut self) -> Result<(), ExecutorError> {
         self.child.open()?;
-        let mut tups: Vec<Tuple> = vec![];
-        while let Some((t, _)) = self.child.next()? {
-            tups.push(t);
-        }
+        let tups: Vec<Tuple> = collect_rows(self.child.as_mut())?
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
 
         let child_schema = self.child.schema();
         let partition_by: &[Expression] = self.plan.partition_by_exprs.as_deref().unwrap_or(&[]);
@@ -1350,12 +1579,13 @@ impl<'a> Executor for WindowFunctionExecutor<'a> {
         Ok(())
     }
 
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
         let iter = self
             .iter
             .as_mut()
             .ok_or_else(|| not_opened("WindowFunctionExecutor"))?;
-        Ok(iter.next().map(|tup| (tup, RecordId::RESERVED)))
+        let mut rows = iter.by_ref().map(|tup| (tup, RecordId::RESERVED));
+        Ok(take_batch(&mut rows, self.batch_size))
     }
 
     fn schema(&self) -> &Schema {
@@ -1382,10 +1612,19 @@ impl<'a> Executor for FilterExecutor<'a> {
         self.child.open()
     }
 
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
-        while let Some((tup, rid)) = self.child.next()? {
-            if is_true(self.plan.predicate.evaluate(&tup, self.child.schema())?) {
-                return Ok(Some((tup, rid)));
+    /// Filters child batches, pulling until at least one row passes, so that an empty batch
+    /// is not handed up. A NULL predicate rejects the row.
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
+        while let Some(batch) = self.child.next_batch()? {
+            let child_schema = self.child.schema();
+            let mut rows = Vec::with_capacity(batch.len());
+            for (tup, rid) in batch {
+                if is_true(self.plan.predicate.evaluate(&tup, child_schema)?) {
+                    rows.push((tup, rid));
+                }
+            }
+            if let Some(out) = Batch::from_rows(rows) {
+                return Ok(Some(out));
             }
         }
         Ok(None)
@@ -1416,19 +1655,22 @@ impl<'a> Executor for ProjectionExecutor<'a> {
         self.child.open()
     }
 
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
-        let Some((tup, rid)) = self.child.next()? else {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
+        let Some(batch) = self.child.next_batch()? else {
             return Ok(None);
         };
         let child_schema = self.child.schema();
-        let vals: Vec<Option<Value>> = self
-            .plan
-            .expressions
-            .iter()
-            .map(|e| e.evaluate(&tup, child_schema))
-            .collect::<Result<_, _>>()?;
-        let out = self.plan.schema.encode_tuple(&vals)?;
-        Ok(Some((out, rid)))
+        let mut rows = Vec::with_capacity(batch.len());
+        for (tup, rid) in batch {
+            let vals: Vec<Option<Value>> = self
+                .plan
+                .expressions
+                .iter()
+                .map(|e| e.evaluate(&tup, child_schema))
+                .collect::<Result<_, _>>()?;
+            rows.push((self.plan.schema.encode_tuple(&vals)?, rid));
+        }
+        Ok(Batch::from_rows(rows))
     }
 
     fn schema(&self) -> &Schema {
@@ -1468,9 +1710,9 @@ impl<'a> Executor for CreateTableExecutor<'a> {
         Ok(())
     }
 
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
         if self.done {
-            return Err(ExecutorError("already executed".to_string()));
+            return Ok(None);
         }
         self.done = true;
         match self
@@ -1479,11 +1721,11 @@ impl<'a> Executor for CreateTableExecutor<'a> {
         {
             Ok(_oid) => {
                 let tup = self.status_schema.encode_tuple(&[Some(Value::INT(1))])?;
-                Ok(Some((tup, RecordId::RESERVED)))
+                Ok(single_row(tup))
             }
             Err(CatalogError::TableExists) if self.plan.if_not_exists => {
                 let tup = self.status_schema.encode_tuple(&[Some(Value::INT(0))])?;
-                Ok(Some((tup, RecordId::RESERVED)))
+                Ok(single_row(tup))
             }
             Err(e) => Err(e.into()),
         }
@@ -1521,9 +1763,9 @@ impl<'a> Executor for DropTableExecutor<'a> {
         Ok(())
     }
 
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
         if self.done {
-            return Err(ExecutorError("already executed".to_string()));
+            return Ok(None);
         }
         self.done = true;
         let dropped = self.catalog.drop_table(self.plan.table_oid)?;
@@ -1536,7 +1778,7 @@ impl<'a> Executor for DropTableExecutor<'a> {
         let tup = self
             .status_schema
             .encode_tuple(&[Some(Value::INT(if dropped { 1 } else { 0 }))])?;
-        Ok(Some((tup, RecordId::RESERVED)))
+        Ok(single_row(tup))
     }
 
     fn schema(&self) -> &Schema {
@@ -1577,9 +1819,9 @@ impl<'a> Executor for CreateIndexExecutor<'a> {
         Ok(())
     }
 
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
         if self.done {
-            return Err(ExecutorError("already executed".to_string()));
+            return Ok(None);
         }
         self.done = true;
 
@@ -1607,7 +1849,7 @@ impl<'a> Executor for CreateIndexExecutor<'a> {
             IndexType::BPlusTree,
         )?;
         let tup = self.status_schema.encode_tuple(&[Some(Value::INT(1))])?;
-        Ok(Some((tup, RecordId::RESERVED)))
+        Ok(single_row(tup))
     }
 
     fn schema(&self) -> &Schema {
@@ -1642,9 +1884,9 @@ impl<'a> Executor for DropIndexExecutor<'a> {
         Ok(())
     }
 
-    fn next(&mut self) -> Result<Option<(Tuple, RecordId)>, ExecutorError> {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecutorError> {
         if self.done {
-            return Err(ExecutorError("already executed".to_string()));
+            return Ok(None);
         }
         self.done = true;
         let dropped = self.catalog.drop_index(self.plan.index_oid)?;
@@ -1657,7 +1899,7 @@ impl<'a> Executor for DropIndexExecutor<'a> {
         let tup = self
             .status_schema
             .encode_tuple(&[Some(Value::INT(if dropped { 1 } else { 0 }))])?;
-        Ok(Some((tup, RecordId::RESERVED)))
+        Ok(single_row(tup))
     }
 
     fn schema(&self) -> &Schema {
@@ -1779,16 +2021,16 @@ mod tests {
         let Plan::Values(values) = plan else {
             panic!("expected a Values plan");
         };
-        Box::new(ValuesExecutor::new(values))
+        Box::new(ValuesExecutor::new(values, DEFAULT_BATCH_SIZE))
     }
 
     fn drain(exec: &mut dyn Executor) -> Vec<Tuple> {
         exec.open().expect("open");
-        let mut out = Vec::new();
-        while let Some((t, _)) = exec.next().expect("next") {
-            out.push(t);
-        }
-        out
+        collect_rows(exec)
+            .expect("next_batch")
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect()
     }
 
     #[test]
@@ -1800,7 +2042,12 @@ mod tests {
             child: Box::new(values_plan(&schema, &[])),
             order_by_exprs: vec![SortExpr::ascending(col(0))],
         };
-        let exec = ExternalMergeSortExecutor::new(&plan, values_child(&plan.child), bpm);
+        let exec = ExternalMergeSortExecutor::new(
+            &plan,
+            values_child(&plan.child),
+            bpm,
+            DEFAULT_BATCH_SIZE,
+        );
 
         let mut a = int_rows(&schema, &[&[5, 0], &[1, 0], &[3, 0]]);
         let mut b = int_rows(&schema, &[&[4, 1], &[2, 1], &[1, 1], &[9, 1]]);
@@ -1841,7 +2088,7 @@ mod tests {
             child: Box::new(values_plan(&schema, &[])),
             order_by_exprs: vec![SortExpr::descending(col(0))],
         };
-        let mut sort = SortExecutor::new(&plan, values_child(&rows));
+        let mut sort = SortExecutor::new(&plan, values_child(&rows), DEFAULT_BATCH_SIZE);
         assert_eq!(
             decode_ints(&schema, drain(&mut sort)),
             vec![vec![2, 0], vec![2, 1], vec![1, 0], vec![1, 1], vec![1, 2]],
@@ -1858,7 +2105,12 @@ mod tests {
             child: Box::new(values_plan(&schema, &[])),
             order_by_exprs: vec![SortExpr::descending(col(0))],
         };
-        let exec = ExternalMergeSortExecutor::new(&plan, values_child(&plan.child), bpm);
+        let exec = ExternalMergeSortExecutor::new(
+            &plan,
+            values_child(&plan.child),
+            bpm,
+            DEFAULT_BATCH_SIZE,
+        );
 
         let mut a = int_rows(&schema, &[&[5, 0], &[1, 0], &[3, 0]]);
         let mut b = int_rows(&schema, &[&[4, 1], &[1, 1], &[9, 1]]);
@@ -1896,7 +2148,7 @@ mod tests {
             child: Box::new(values_plan(&schema, &[])),
             order_by_exprs: vec![SortExpr::ascending(divide_by_zero(0))],
         };
-        let mut sort = SortExecutor::new(&plan, values_child(&rows));
+        let mut sort = SortExecutor::new(&plan, values_child(&rows), DEFAULT_BATCH_SIZE);
         let err = sort.open().unwrap_err();
         assert!(err.0.contains("division by zero"), "{}", err.0);
     }
@@ -1911,7 +2163,7 @@ mod tests {
             group_bys: vec![divide_by_zero(0)],
             aggregates: vec![],
         };
-        let mut agg = AggregationExecutor::new(&plan, values_child(&rows));
+        let mut agg = AggregationExecutor::new(&plan, values_child(&rows), DEFAULT_BATCH_SIZE);
         let err = agg.open().unwrap_err();
         assert!(err.0.contains("division by zero"), "{}", err.0);
     }
@@ -1934,7 +2186,8 @@ mod tests {
             aggregates: vec![(col(1), AggType::SUM)],
             columns: vec![doubled_amount],
         };
-        let mut window = WindowFunctionExecutor::new(&plan, values_child(&rows));
+        let mut window =
+            WindowFunctionExecutor::new(&plan, values_child(&rows), DEFAULT_BATCH_SIZE);
         assert_eq!(
             decode_ints(&out_schema, drain(&mut window)),
             vec![vec![20, 40], vec![60, 40], vec![10, 5]]
@@ -1955,7 +2208,7 @@ mod tests {
             decode_ints(&schema, drain(&mut exec)),
             vec![vec![1], vec![2]]
         );
-        assert!(exec.next().unwrap().is_none());
+        assert!(exec.next_batch().unwrap().is_none());
     }
 
     #[test]
@@ -2031,8 +2284,8 @@ mod tests {
             group_bys: vec![],
             aggregates: vec![],
         };
-        let mut agg = AggregationExecutor::new(&agg_plan, values_child(&rows));
-        let err = agg.next().unwrap_err();
+        let mut agg = AggregationExecutor::new(&agg_plan, values_child(&rows), DEFAULT_BATCH_SIZE);
+        let err = agg.next_batch().unwrap_err();
         assert!(err.0.contains("before open"), "{}", err.0);
     }
 }
