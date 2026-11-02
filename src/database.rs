@@ -606,9 +606,16 @@ impl Database {
                 let rows = collect_rows(&mut *exec)?
                     .into_iter()
                     .map(|(tuple, _)| {
-                        (0..schema.cols.len())
-                            .map(|i| schema.get_value(&tuple, i))
-                            .collect::<Result<Row, _>>()
+                        schema
+                            .cols
+                            .iter()
+                            .enumerate()
+                            .map(|(i, col)| {
+                                Ok(schema
+                                    .get_value(&tuple, i)?
+                                    .map(|v| v.padded_for(col.dtype)))
+                            })
+                            .collect::<Result<Row, CatalogError>>()
                     })
                     .collect::<Result<Vec<Row>, _>>()?;
                 StatementResult::Rows { schema, rows }

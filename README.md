@@ -40,8 +40,9 @@ SQL the shell runs:
   `COUNT`, `SUM`, `AVG`, `MIN` and `MAX`, `SELECT DISTINCT`, `ORDER BY` and `LIMIT`
 - window functions: those aggregates and `RANK()` with `OVER (PARTITION BY ... ORDER BY ...)`
 - column types `INT` (32-bit), `BIGINT`, `FLOAT` (64-bit), `BOOLEAN`, `TIMESTAMP`
-  (microseconds, no time zone, written as `'YYYY-MM-DD HH:MM:SS'`), `TEXT` and `VARCHAR(n)`
-  (at most `n` characters); `INT` and `BIGINT` values widen to `FLOAT` where needed
+  (microseconds, no time zone, written as `'YYYY-MM-DD HH:MM:SS'`), `TEXT`, `VARCHAR(n)`
+  (at most `n` characters) and `CHAR(n)` (padded with spaces to `n` characters, compared
+  without trailing spaces); `INT` and `BIGINT` values widen to `FLOAT` where needed
 - operators `+ - * /`, comparisons, `AND` and `OR`
 
 ## What's missing:
@@ -51,7 +52,7 @@ SQL the shell runs:
 - `HAVING`, subqueries, `WITH`, `OFFSET`, `IS NULL`, `NOT`, `LIKE`, `IN`, `CAST`, `%`, string
   functions and `||`, joins of more than two tables, window frames (`ROWS`/`RANGE`) and window
   functions in a `SELECT` that also aggregates
-- `CHAR(n)`; indexes on plain `TEXT` columns (index a `VARCHAR(n)` column instead)
+- indexes on plain `TEXT` columns (index a `VARCHAR(n)` column instead)
 - a row must fit in one 8 KiB page, and an `UPDATE` that grows a row past its page's free space
   fails instead of moving the row
 - `DROP TABLE` and `DROP INDEX` do not free their pages, and GC does not reclaim deleted rows'

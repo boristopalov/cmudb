@@ -672,8 +672,9 @@ fn aggregation_output_schema(
 }
 
 /// True when an index on a column of type `dtype` can look `value` up: `value` has the
-/// column's type, or is a string a `VARCHAR` column of that length holds. An index lookup encodes
-/// `value` with its own type, and a longer string than the column holds has no key there.
+/// column's type, or is a string a `VARCHAR` or `CHAR` column of that length holds as it is. An
+/// index lookup encodes `value` with its own type, and a longer string than the column holds has
+/// no key there.
 fn is_index_key_of(value: &Value, dtype: DataType) -> bool {
     value.clone().coerce_to(dtype).as_ref() == Ok(value)
 }
