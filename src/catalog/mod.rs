@@ -540,10 +540,7 @@ impl Schema {
             .get(self.bitmap_len..)
             .and_then(|payload| payload.get(col.payload_range()))
             .ok_or(CatalogError::TupleSchemaMismatch)?;
-        if col.dtype.is_text() {
-            return text_at(&tuple.data, bytes).map(Some);
-        }
-        Ok(Some(Value::decode(bytes, &col.dtype)))
+        Value::decode(&tuple.data, bytes, &col.dtype).map(Some)
     }
 
     /// Encodes one row, converting each value to its column's type as [`Value::coerce_to`]
@@ -822,15 +819,17 @@ impl Value {
         }
     }
 
-    fn decode(bytes: &[u8], dtype: &DataType) -> Self {
-        match dtype {
+    /// Decodes the column whose fixed-width bytes are `bytes`; a text column's bytes are a
+    /// descriptor of where its characters sit in `tuple`.
+    fn decode(tuple: &[u8], bytes: &[u8], dtype: &DataType) -> Result<Self, CatalogError> {
+        Ok(match dtype {
             DataType::BOOLEAN => Value::BOOLEAN(bytes[0] != 0),
             DataType::INT => Value::INT(i32::from_le_bytes(bytes.try_into().unwrap())),
             DataType::BIGINT => Value::BIGINT(i64::from_le_bytes(bytes.try_into().unwrap())),
             DataType::FLOAT => Value::float(f64::from_le_bytes(bytes.try_into().unwrap())),
             DataType::TIMESTAMP => Value::TIMESTAMP(i64::from_le_bytes(bytes.try_into().unwrap())),
-            DataType::TEXT | DataType::VARCHAR(_) => Value::text(&String::from_utf8_lossy(bytes)),
-        }
+            DataType::TEXT | DataType::VARCHAR(_) => return text_at(tuple, bytes),
+        })
     }
 }
 
@@ -911,8 +910,7 @@ fn order_preserving_f64_bits(f: f64) -> u64 {
     }
 }
 
-/// The type of a column. Every type but TEXT and VARCHAR has a fixed width (see
-/// [`DataType::fixed_width`]); a text value's characters follow the fixed-width part of its
+/// The type of a column. Every type but TEXT and VARCHAR has a fixed width; a text value's characters follow the fixed-width part of its
 /// tuple, so tuples of a table with a text column differ in length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
@@ -1119,6 +1117,25 @@ mod tests {
             is_null(&[], 0),
             Err(CatalogError::TupleSchemaMismatch)
         ));
+    }
+
+    #[test]
+    fn a_text_value_pointing_outside_its_tuple_or_at_bad_utf8_is_an_error() {
+        let schema = Schema::new(vec![(DataType::TEXT, "t".to_string())]);
+        let good = schema.encode_tuple(&[Some(Value::text("hé"))]).unwrap();
+        assert_eq!(schema.get_value(&good, 0).unwrap(), Some(Value::text("hé")));
+
+        let mut past_the_end = good.data.clone();
+        past_the_end[5..9].copy_from_slice(&100u32.to_le_bytes());
+        let mut not_utf8 = good.data.clone();
+        let last = not_utf8.len() - 1;
+        not_utf8[last] = 0xff;
+        for data in [past_the_end, not_utf8] {
+            assert!(matches!(
+                schema.get_value(&Tuple { data }, 0),
+                Err(CatalogError::TupleSchemaMismatch)
+            ));
+        }
     }
 
     #[test]

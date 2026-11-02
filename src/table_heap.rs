@@ -569,8 +569,9 @@ impl TableHeap {
         self.write_with(rid, |_, _| Ok(SlotWrite { meta, data: None }))
     }
 
-    /// Overwrites a tuple and its metadata in place, keeping its record id. The new tuple
-    /// is the same size as the old one, or the write fails.
+    /// Overwrites a tuple and its metadata in place, keeping its record id. The new tuple may be
+    /// longer or shorter than the old one; when its page has no room for it, the write fails with
+    /// [`TablePageError::UpdateDoesNotFit`] and changes nothing.
     pub fn update_in_place(
         &self,
         rid: RecordId,
