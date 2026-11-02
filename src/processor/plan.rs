@@ -56,7 +56,7 @@ pub struct UpdatePlanNode {
 
 /// `SET <column> = <value>` for one column of an UPDATE.
 pub struct ColumnAssignment {
-    pub col_idx: u32,
+    pub col_idx: ColIdx,
     pub value: Expression,
 }
 
@@ -239,7 +239,7 @@ pub struct DropTablePlanNode {
 pub struct CreateIndexPlanNode {
     pub index_name: String,
     pub table_oid: u32,
-    pub key_columns: Vec<u32>,
+    pub key_columns: Vec<ColIdx>,
 }
 
 pub struct DropIndexPlanNode {
