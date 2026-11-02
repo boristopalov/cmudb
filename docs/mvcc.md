@@ -23,12 +23,19 @@ allows something simpler. Code: `src/concurrency/`.
 - **Older versions: undo chains.** `TransactionManager` maps each record id to the head of
   a newest-first chain of `UndoLog { ts, is_deleted, data, prev }`. Every entry is a full
   image of an older version.
-- **Updates are in place.** A row keeps its record id for life; `UPDATE` used to tombstone
-  and append. Each slot records the capacity of its byte region, and the capacity never
-  shrinks, so writing an older image back on abort always fits. A new image longer than
-  the capacity moves within its page; when the page has no room left, the update fails
-  with `UpdateDoesNotFit` and changes nothing. Tables with a `TEXT` or `VARCHAR` column
+- **Updates are in place while the row fits its page.** A row keeps its record id as long as
+  its new image fits on its page. Each slot records the capacity of its byte region, and the
+  capacity never shrinks, so writing an older image back on abort always fits. A new image
+  longer than the capacity moves within its page. Tables with a `TEXT` or `VARCHAR` column
   leave `TEXT_UPDATE_RESERVE` bytes free on each page for rows to grow into.
+- **A row that outgrows its page moves.** When even a compacted page has no room for the
+  new image (`UpdateDoesNotFit`), `mvcc::update_tuple` turns the update into a delete of
+  the old record id plus an insert of the new image at a new record id, filed in every
+  index under the new record id, all under the indexes' unique latches. Older snapshots
+  keep reading the old record id and its undo chain and see nothing at the new one; abort
+  restores the old slot and kills the new one, as for any delete and insert. Uniqueness is
+  checked only for keys the update changes. `UpdateExecutor` skips record ids it moved
+  rows to, so a scan that reaches a moved row again does not update it twice.
 
 ## Visibility
 
@@ -120,8 +127,9 @@ Changed:
 - **Multiple unique indexes, and key-changing updates, work under MVCC.** BusTub supports a
   single primary-key index and reuses the deleted tuple's RID on re-insert. Appending the
   RID to index keys removes that restriction.
-- **Updates are always in place.** BusTub's update-the-primary-key path turns into
-  delete + insert; with RID-suffixed keys that isn't needed.
+- **Updates are in place unless the row outgrows its page.** BusTub's update-the-primary-key
+  path turns into delete + insert; with RID-suffixed keys that isn't needed. A row moves
+  (delete + insert) only when its new image no longer fits on its page.
 
 ## Not done yet
 

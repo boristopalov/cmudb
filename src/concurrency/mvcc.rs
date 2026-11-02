@@ -6,7 +6,7 @@ use crate::catalog::IndexInfo;
 use crate::catalog::index_schema::{IndexKey, TableIndex};
 use crate::index::IndexError;
 use crate::table_heap::{RecordId, SlotWrite, TableHeap, TableHeapError, Tuple};
-use crate::table_page::TupleMeta;
+use crate::table_page::{TablePageError, TupleMeta};
 use std::fmt;
 use std::sync::Arc;
 
@@ -254,8 +254,12 @@ pub fn insert_tuple(
     })
 }
 
-/// Replaces the version of `rid` that `txn` sees (`old`) with `new`, in place. Indexes whose
-/// key changed get an entry for the new key; the old entry stays for older snapshots.
+/// Replaces the version of `rid` that `txn` sees (`old`) with `new` and returns the record id
+/// the new version lives at. Indexes whose key changed get an entry for the new key; the old
+/// entry stays for older snapshots.
+///
+/// The row keeps `rid` while `new` fits on its page. A new version too large for the page moves
+/// the row to a new record id (see [`move_tuple`]).
 pub fn update_tuple(
     txn: &Transaction,
     txn_mgr: &TransactionManager,
@@ -264,10 +268,15 @@ pub fn update_tuple(
     rid: RecordId,
     old: &Tuple,
     new: &Tuple,
-) -> Result<(), MvccError> {
+) -> Result<RecordId, MvccError> {
     taint_on_err(txn, {
         (|| {
-            write_version(txn, txn_mgr, heap, rid, Some(new))?;
+            match write_version(txn, txn_mgr, heap, rid, Some(new)) {
+                Err(e) if outgrew_its_page(&e) => {
+                    return move_tuple(txn, txn_mgr, heap, indexes, rid, old, new);
+                }
+                res => res?,
+            }
             for info in sorted(indexes) {
                 let index = &info.index;
                 let new_key = index.key_of_tuple(new)?;
@@ -278,9 +287,62 @@ pub fn update_tuple(
                 check_unique(txn, heap, info, new, Some(rid))?;
                 index.insert(new, rid)?;
             }
-            Ok(())
+            Ok(rid)
         })()
     })
+}
+
+/// Whether `err` is a write that changed nothing because the new version does not fit on the
+/// row's page.
+fn outgrew_its_page(err: &MvccError) -> bool {
+    matches!(
+        err,
+        MvccError::Txn(TxnError::Storage(TableHeapError::Page {
+            source: TablePageError::UpdateDoesNotFit { .. },
+            ..
+        }))
+    )
+}
+
+/// Moves the row at `rid` to a new record id holding `new`, and returns that record id.
+///
+/// `rid` gets a deletion and `new` is inserted as this transaction's own row, filed in every
+/// index under the new record id, all under the indexes' unique latches. Older snapshots keep
+/// reading `rid` and its undo chain, and see nothing at the new record id. Uniqueness is
+/// checked only for keys the update changes: an unchanged key was this row's already.
+fn move_tuple(
+    txn: &Transaction,
+    txn_mgr: &TransactionManager,
+    heap: &TableHeap,
+    indexes: &[Arc<IndexInfo>],
+    rid: RecordId,
+    old: &Tuple,
+    new: &Tuple,
+) -> Result<RecordId, MvccError> {
+    let indexes = sorted(indexes);
+    let _latches: Vec<_> = indexes
+        .iter()
+        .map(|i| i.index.unique_latch.lock())
+        .collect();
+    for info in &indexes {
+        let new_key = info.index.key_of_tuple(new)?;
+        if new_key.is_some() && info.index.key_of_tuple(old)? != new_key {
+            check_unique(txn, heap, info, new, Some(rid))?;
+        }
+    }
+    write_version(txn, txn_mgr, heap, rid, None)?;
+    let new_rid = heap.insert_with_meta(
+        TupleMeta {
+            ts: txn.id(),
+            is_deleted: false,
+        },
+        new,
+    )?;
+    txn.record_write(new_rid, false);
+    for info in &indexes {
+        info.index.insert(new, new_rid)?;
+    }
+    Ok(new_rid)
 }
 
 /// Deletes the version of `rid` that `txn` sees. Index entries stay for older snapshots.
