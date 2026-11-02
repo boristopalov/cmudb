@@ -66,10 +66,9 @@ fn tables_rows_and_indexes_survive_a_restart() {
              DELETE FROM t WHERE id = 3;\
              CREATE TABLE u (a INTEGER);\
              INSERT INTO u VALUES (10), (20);\
-             CREATE TABLE gone (a INTEGER);",
+             CREATE TABLE gone (a INTEGER);\
+             DROP TABLE gone;",
         );
-        let gone = db.catalog().table_oid("gone").unwrap();
-        assert!(db.catalog().drop_table(gone).unwrap());
         db.close().unwrap();
     }
 
