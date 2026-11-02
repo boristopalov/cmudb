@@ -4,6 +4,7 @@
 mod common;
 
 use cmudb::catalog::{DataType, Schema, Value};
+use cmudb::parser::BinderError;
 use cmudb::processor::plan::{
     AggType, ColIdx, CreateIndexPlanNode, DropIndexPlanNode, DropTablePlanNode, Expression,
     ExternalMergeSortPlanNode, HashJoinPlanNode, JoinType, LimitPlanNode, NullOrdering, Plan,
@@ -503,10 +504,9 @@ fn drop_index_then_drop_table() {
         if_exists: false,
     }))
     .unwrap();
-    assert!(
-        db.try_exec("SELECT * FROM t")
-            .unwrap_err()
-            .contains("table not found")
+    assert_eq!(
+        db.bind_error("SELECT * FROM t"),
+        BinderError::TableNotFound { table: "t".into() }
     );
     let again = Plan::DropTable(DropTablePlanNode {
         table_oid,

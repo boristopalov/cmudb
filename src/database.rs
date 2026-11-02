@@ -130,8 +130,8 @@ impl fmt::Display for QueryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             QueryError::Parse(e) => write!(f, "parse: {e}"),
-            QueryError::Bind(e) => write!(f, "bind: {}", e.0),
-            QueryError::Plan(e) => write!(f, "plan: {}", e.0),
+            QueryError::Bind(e) => write!(f, "bind: {e}"),
+            QueryError::Plan(e) => write!(f, "plan: {e}"),
             QueryError::Execute(e) => write!(f, "exec: {}", e.0),
             QueryError::AlreadyInTransaction => f.write_str("a transaction is already in progress"),
             QueryError::NoTransaction => f.write_str("no transaction in progress"),

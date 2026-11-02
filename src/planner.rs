@@ -1,3 +1,4 @@
+use std::fmt;
 use std::ops::Bound;
 
 use crate::catalog::Value;
@@ -25,8 +26,39 @@ pub struct Planner<'a> {
     catalog: &'a Catalog,
 }
 
-#[derive(Debug)]
-pub struct PlannerError(pub String);
+/// Why a bound statement could not be planned. Each variant is a bound statement the binder
+/// does not produce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlannerError {
+    /// A statement that reads one table has `tables` tables in scope.
+    NotOneTable {
+        statement: &'static str,
+        tables: usize,
+    },
+    /// A join's scope does not hold exactly one left and one right table.
+    JoinSides { tables: usize },
+    /// A CREATE INDEX key column is not a column of the indexed table.
+    UnknownIndexColumn { column: String },
+}
+
+impl fmt::Display for PlannerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PlannerError::NotOneTable { statement, tables } => {
+                write!(f, "{statement} needs exactly one table, got {tables}")
+            }
+            PlannerError::JoinSides { tables } => write!(
+                f,
+                "a join needs exactly one left and one right table, got {tables} tables"
+            ),
+            PlannerError::UnknownIndexColumn { column } => {
+                write!(f, "CREATE INDEX references unknown column: {column}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PlannerError {}
 
 impl<'a> Planner<'a> {
     pub fn new(catalog: &'a Catalog) -> Self {
@@ -238,11 +270,8 @@ impl<'a> Planner<'a> {
                 ts.schema
                     .col_idx(&col.name)
                     .map(|i| ColIdx(i as u32))
-                    .ok_or_else(|| {
-                        PlannerError(format!(
-                            "CREATE INDEX references unknown column: {}",
-                            col.name
-                        ))
+                    .ok_or_else(|| PlannerError::UnknownIndexColumn {
+                        column: col.name.clone(),
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -369,21 +398,23 @@ fn join_sides(scope: &Scope) -> Result<(&TableScope, &TableScope), PlannerError>
         |side: Side| -> Vec<&TableScope> { scope.values().filter(|ts| ts.side == side).collect() };
     match (on(Side::Left).as_slice(), on(Side::Right).as_slice()) {
         ([left], [right]) => Ok((left, right)),
-        _ => Err(PlannerError(format!(
-            "a join needs exactly one left and one right table, got {} tables",
-            scope.len()
-        ))),
+        _ => Err(PlannerError::JoinSides {
+            tables: scope.len(),
+        }),
     }
 }
 
-fn only_table<'s>(scope: &'s Scope, statement: &str) -> Result<&'s TableScope, PlannerError> {
+fn only_table<'s>(
+    scope: &'s Scope,
+    statement: &'static str,
+) -> Result<&'s TableScope, PlannerError> {
     let mut tables = scope.values();
     match (tables.next(), tables.next()) {
         (Some(ts), None) => Ok(ts),
-        _ => Err(PlannerError(format!(
-            "{statement} needs exactly one table, got {}",
-            scope.len()
-        ))),
+        _ => Err(PlannerError::NotOneTable {
+            statement,
+            tables: scope.len(),
+        }),
     }
 }
 
@@ -593,5 +624,103 @@ mod tests {
             left_right_equi_join(&eq(join_column(Side::Left, 4), join_column(Side::Left, 1))),
             None
         );
+    }
+
+    fn int_schema(cols: &[&str]) -> Schema {
+        Schema::new(
+            cols.iter()
+                .map(|c| (DataType::INT, c.to_string()))
+                .collect(),
+        )
+    }
+
+    fn table_scope(side: Side, cols: &[&str]) -> TableScope {
+        TableScope {
+            oid: 0,
+            side,
+            first_col: 0,
+            schema: int_schema(cols),
+        }
+    }
+
+    fn plan_error(stmt: BoundStatement) -> PlannerError {
+        let (catalog, _bpm, _dir) = crate::testing::catalog(16);
+        match Planner::new(&catalog).plan(stmt) {
+            Ok(_) => panic!("expected the statement to fail to plan"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn single_table_statements_without_exactly_one_table_are_rejected() {
+        let err = plan_error(BoundStatement::Insert(BoundInsert {
+            scope: Scope::new(),
+            rows: vec![],
+        }));
+        assert_eq!(
+            err,
+            PlannerError::NotOneTable {
+                statement: "INSERT",
+                tables: 0
+            }
+        );
+        assert_eq!(err.to_string(), "INSERT needs exactly one table, got 0");
+
+        let two_tables = Scope::from([
+            ("a".to_string(), table_scope(Side::Left, &["x"])),
+            ("b".to_string(), table_scope(Side::Left, &["y"])),
+        ]);
+        assert_eq!(
+            plan_error(BoundStatement::Delete(BoundDelete {
+                scope: two_tables,
+                filters: None,
+            })),
+            PlannerError::NotOneTable {
+                statement: "DELETE",
+                tables: 2
+            }
+        );
+    }
+
+    #[test]
+    fn join_without_one_left_and_one_right_table_is_rejected() {
+        let scope = Scope::from([
+            ("a".to_string(), table_scope(Side::Left, &["x"])),
+            ("b".to_string(), table_scope(Side::Left, &["y"])),
+        ]);
+        let err = plan_error(BoundStatement::Select(BoundSelect {
+            scope,
+            join: Some(BoundJoin {
+                join_type: JoinType::Inner,
+                predicate: Expression::Constant(Some(Value::BOOLEAN(true))),
+            }),
+            projections: vec![],
+            filters: None,
+            group_bys: vec![],
+            aggregates: vec![],
+            sort: None,
+            limit: None,
+        }));
+        assert_eq!(err, PlannerError::JoinSides { tables: 2 });
+        assert_eq!(
+            err.to_string(),
+            "a join needs exactly one left and one right table, got 2 tables"
+        );
+    }
+
+    #[test]
+    fn create_index_on_a_column_the_table_lacks_is_rejected() {
+        let err = plan_error(BoundStatement::CreateIndex(BoundCreateIndex {
+            scope: Scope::from([("t".to_string(), table_scope(Side::Left, &["a"]))]),
+            name: "i".to_string(),
+            index_schema: int_schema(&["b"]),
+        }));
+        assert_eq!(
+            err,
+            PlannerError::UnknownIndexColumn {
+                column: "b".to_string()
+            }
+        );
+        assert_eq!(err.to_string(), "CREATE INDEX references unknown column: b");
     }
 }
