@@ -512,6 +512,8 @@ impl BufferPoolManager {
                 "tid={} get_free_frame: attempted to evict pinned frame_id={frame_id}",
                 Self::tid()
             );
+            drop(eviction);
+            meta.replacer.set_evictable(frame_id, false);
             return Err(BpmError::FrameInUse);
         }
         let mut frame = self.frame(frame_id)?.write();
@@ -1054,6 +1056,61 @@ mod tests {
     #[test]
     fn a_failed_victim_flush_during_a_write_miss_keeps_the_victim_cached_and_dirty() {
         assert_a_failed_victim_flush_keeps_the_victim_cached(FrameRequest::WriteMiss);
+    }
+
+    fn mark_pinned_frame_evictable(bpm: &BufferPoolManager, frame_id: usize) {
+        let mut meta = bpm.meta.lock();
+        assert!(meta.pins[frame_id] > 0, "setup expected a pinned frame");
+        meta.replacer.set_evictable(frame_id, true);
+    }
+
+    #[test]
+    fn a_pinned_victim_stays_in_the_pool_after_frame_in_use() {
+        let (bpm, _dir) = crate::testing::bpm(1);
+        let pinned = bpm.new_page().unwrap();
+        let pinned_id = pinned.page_id().unwrap();
+        let frame_id = pinned.frame_id();
+        mark_pinned_frame_evictable(&bpm, frame_id);
+
+        assert!(matches!(bpm.new_page(), Err(BpmError::FrameInUse)));
+        {
+            let meta = bpm.meta.lock();
+            assert_eq!(meta.page_table.get(&pinned_id), Some(&frame_id));
+            assert!(meta.free_list.is_empty(), "the pinned frame was freed");
+            assert_eq!(meta.pins[frame_id], 1, "pins changed");
+        }
+
+        drop(pinned);
+        assert_eq!(
+            bpm.meta.lock().replacer.size(),
+            1,
+            "the frame did not become evictable once unpinned"
+        );
+        let replacement = bpm.new_page().unwrap().page_id().unwrap();
+        assert!(bpm.is_resident(replacement));
+        assert!(!bpm.is_resident(pinned_id));
+    }
+
+    #[test]
+    fn eviction_after_frame_in_use_picks_another_victim() {
+        let (bpm, _dir) = crate::testing::bpm(2);
+        let pinned = bpm.new_page().unwrap();
+        let pinned_id = pinned.page_id().unwrap();
+        let unpinned = bpm.new_page().unwrap().page_id().unwrap();
+        mark_pinned_frame_evictable(&bpm, pinned.frame_id());
+
+        assert!(matches!(bpm.new_page(), Err(BpmError::FrameInUse)));
+        assert_eq!(
+            bpm.meta.lock().replacer.size(),
+            1,
+            "the pinned victim was left evictable"
+        );
+
+        let replacement = bpm.new_page().unwrap().page_id().unwrap();
+        assert!(bpm.is_resident(pinned_id));
+        assert!(bpm.is_resident(replacement));
+        assert!(!bpm.is_resident(unpinned));
+        drop(pinned);
     }
 
     const MISS_STALL_WINDOW: Duration = Duration::from_millis(200);
