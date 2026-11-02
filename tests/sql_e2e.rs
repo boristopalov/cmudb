@@ -390,6 +390,50 @@ fn order_by_options_that_are_not_supported_are_rejected() {
 }
 
 #[test]
+fn having_is_rejected_instead_of_returning_every_group() {
+    let db = emp_db();
+    for sql in [
+        "SELECT dept, COUNT(*) FROM emp GROUP BY dept HAVING COUNT(*) > 1",
+        "SELECT COUNT(*) FROM emp HAVING COUNT(*) > 1",
+        "SELECT id FROM emp HAVING id > 1",
+    ] {
+        let err = db.bind_error(sql);
+        assert_eq!(err, BinderError::Unsupported(Unsupported::Having), "{sql}");
+        assert_eq!(err.to_string(), "HAVING is not supported", "{sql}");
+    }
+}
+
+#[test]
+fn select_clauses_the_binder_does_not_bind_are_rejected() {
+    let db = emp_db();
+    for (sql, expected) in [
+        ("SELECT TOP 1 id FROM emp", Unsupported::Top),
+        ("SELECT id INTO emp2 FROM emp", Unsupported::SelectInto),
+        ("SELECT id FROM emp PREWHERE id = 1", Unsupported::Prewhere),
+        (
+            "SELECT id FROM emp START WITH id = 1 CONNECT BY PRIOR id = dept",
+            Unsupported::ConnectBy,
+        ),
+        ("SELECT id FROM emp CLUSTER BY id", Unsupported::ClusterBy),
+        (
+            "SELECT id FROM emp DISTRIBUTE BY id",
+            Unsupported::DistributeBy,
+        ),
+        ("SELECT id FROM emp SORT BY id", Unsupported::SortBy),
+        (
+            "SELECT id FROM emp LATERAL VIEW explode(dept) x AS y",
+            Unsupported::LateralView,
+        ),
+    ] {
+        assert_eq!(
+            db.bind_error(sql),
+            BinderError::Unsupported(expected),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn values_statement() {
     let db = Db::new(8);
     assert_eq!(
