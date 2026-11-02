@@ -676,12 +676,29 @@ mod tests {
         condition()
     }
 
-    #[test]
-    fn a_hit_waits_while_a_miss_holds_the_meta_lock_through_its_disk_requests() {
+    #[derive(Clone, Copy, PartialEq)]
+    enum StalledDiskRequest {
+        DirtyVictimWriteBack,
+        PageRead,
+    }
+
+    fn assert_a_hit_waits_while_a_miss_is_stalled_on(stalled: StalledDiskRequest) {
         let (bpm, _dir) = make_bpm(2);
         let evicted = bpm.new_page().unwrap().page_id().unwrap();
-        drop(bpm.new_page().unwrap());
+        let victim = bpm.new_page().unwrap().page_id().unwrap();
         let resident = bpm.new_page().unwrap().page_id().unwrap();
+        if stalled == StalledDiskRequest::PageRead {
+            bpm.flush_page(victim).unwrap();
+        }
+        let victim_frame = bpm.meta.lock().page_table[&victim];
+        assert_eq!(
+            bpm.frames[victim_frame]
+                .read()
+                .dirty
+                .load(Ordering::Acquire),
+            stalled == StalledDiskRequest::DirtyVictimWriteBack,
+            "setup expected the victim to be dirty only when the write-back is the stalled request"
+        );
         assert!(
             !bpm.is_resident(evicted),
             "setup expected the first page to be evicted"
@@ -709,7 +726,7 @@ mod tests {
         assert!(
             hit_done_rx.recv_timeout(MISS_STALL_WINDOW).is_err(),
             "a hit finished while a miss was waiting on disk; if misses no longer hold the meta \
-             lock across disk I/O, update the miss bullet in buffer_pool_manager.md and flip this test"
+             lock across disk I/O, update the miss bullet in buffer_pool_manager.md and flip these tests"
         );
 
         drop(disk_stalled);
@@ -723,5 +740,15 @@ mod tests {
             "the miss failed after its disk requests ran"
         );
         drop(resident_pin);
+    }
+
+    #[test]
+    fn a_hit_waits_while_a_miss_holds_the_meta_lock_through_the_dirty_victim_write_back() {
+        assert_a_hit_waits_while_a_miss_is_stalled_on(StalledDiskRequest::DirtyVictimWriteBack);
+    }
+
+    #[test]
+    fn a_hit_waits_while_a_miss_holds_the_meta_lock_through_the_page_read() {
+        assert_a_hit_waits_while_a_miss_is_stalled_on(StalledDiskRequest::PageRead);
     }
 }
