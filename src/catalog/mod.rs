@@ -1,4 +1,5 @@
 pub mod index_schema;
+pub mod timestamp;
 use crate::{buffer_pool::BufferPoolManager, table_heap::TableHeap};
 use crate::{catalog::index_schema::TableIndex, table_heap::Tuple};
 use ordered_float::OrderedFloat;
@@ -12,6 +13,20 @@ use std::sync::atomic::Ordering::AcqRel;
 #[derive(Debug)]
 pub enum CatalogError {
     TupleSchemaMismatch,
+    /// A value of type `found` was stored in column `column` of type `expected`, and no
+    /// implicit conversion exists between the two.
+    ColumnType {
+        column: String,
+        expected: DataType,
+        found: DataType,
+    },
+    /// A value was stored in column `column` of type `expected` that the type cannot hold,
+    /// such as a BIGINT past the INT range.
+    ColumnOutOfRange {
+        column: String,
+        expected: DataType,
+        value: Value,
+    },
     ColumnOutOfBounds,
     ColumnNotFound,
     TableExists,
@@ -28,6 +43,19 @@ impl fmt::Display for CatalogError {
             CatalogError::TupleSchemaMismatch => {
                 write!(f, "the tuple does not match the table's schema")
             }
+            CatalogError::ColumnType {
+                column,
+                expected,
+                found,
+            } => write!(f, "column `{column}` is {expected}, got {found}"),
+            CatalogError::ColumnOutOfRange {
+                column,
+                expected,
+                value,
+            } => write!(
+                f,
+                "{value} is out of range for {expected} column `{column}`"
+            ),
             CatalogError::ColumnOutOfBounds => {
                 write!(f, "the column index is past the schema's last column")
             }
@@ -343,6 +371,10 @@ impl Schema {
         Ok(Some(Value::decode(bytes, &col.dtype)))
     }
 
+    /// Encodes one row, converting each value to its column's type as [`Value::coerce_to`]
+    /// does. Fails with [`CatalogError::ColumnType`] or [`CatalogError::ColumnOutOfRange`] when
+    /// a value does not convert, and [`CatalogError::TupleSchemaMismatch`] when the row has
+    /// other than one value per column.
     pub fn encode_tuple(&self, values: &[Option<Value>]) -> Result<Tuple, CatalogError> {
         if values.len() != self.cols.len() {
             return Err(CatalogError::TupleSchemaMismatch);
@@ -351,12 +383,7 @@ impl Schema {
         data.reserve(self.data_len);
         for (i, (col, val)) in self.cols.iter().zip(values).enumerate() {
             match val {
-                Some(v) => {
-                    if v.data_type() != col.dtype {
-                        return Err(CatalogError::TupleSchemaMismatch);
-                    }
-                    v.encode(&mut data);
-                }
+                Some(v) => col.coerce(*v)?.encode(&mut data),
                 None => {
                     data[i / 8] |= 1 << (i % 8);
                     data.resize(data.len() + col.dtype.size(), 0);
@@ -389,19 +416,47 @@ pub struct Column {
 }
 
 impl Column {
+    /// Converts `value` to this column's type, naming the column in the error.
+    pub fn coerce(&self, value: Value) -> Result<Value, CatalogError> {
+        value.coerce_to(self.dtype).map_err(|e| match e {
+            CoercionError::WrongType => CatalogError::ColumnType {
+                column: self.name.clone(),
+                expected: self.dtype,
+                found: value.data_type(),
+            },
+            CoercionError::OutOfRange => CatalogError::ColumnOutOfRange {
+                column: self.name.clone(),
+                expected: self.dtype,
+                value,
+            },
+        })
+    }
+
     fn payload_range(&self) -> std::ops::Range<usize> {
         self.offset..self.offset + self.dtype.size()
     }
 }
 
 /// A non-NULL SQL value. FLOAT is totally ordered through `OrderedFloat`: NaN equals itself and
-/// sorts above every other float.
+/// sorts above every other float. The derived order only ranks values of the same type; values of
+/// different types compare through [`Value::compare`].
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash)]
 pub enum Value {
     BOOLEAN(bool),
     INT(i32),
-    FLOAT(OrderedFloat<f32>),
+    BIGINT(i64),
+    FLOAT(OrderedFloat<f64>),
+    /// Microseconds since 1970-01-01 00:00:00 UTC.
     TIMESTAMP(i64),
+}
+
+/// Why a value could not be converted to another type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoercionError {
+    /// No implicit conversion exists between the two types, such as BOOLEAN to INT.
+    WrongType,
+    /// The conversion exists but the value does not fit the target type.
+    OutOfRange,
 }
 
 impl Value {
@@ -409,14 +464,105 @@ impl Value {
         match self {
             Value::BOOLEAN(_) => DataType::BOOLEAN,
             Value::INT(_) => DataType::INT,
+            Value::BIGINT(_) => DataType::BIGINT,
             Value::FLOAT(_) => DataType::FLOAT,
             Value::TIMESTAMP(_) => DataType::TIMESTAMP,
         }
     }
+
+    /// The narrowest integer value holding `i`: an INT when it fits 32 bits, otherwise a BIGINT.
+    pub fn integer(i: i64) -> Value {
+        i32::try_from(i).map_or(Value::BIGINT(i), Value::INT)
+    }
+
+    /// A FLOAT value.
+    pub fn float(f: f64) -> Value {
+        Value::FLOAT(OrderedFloat(f))
+    }
+
+    /// The value as an `i64`, for INT and BIGINT values.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Value::INT(i) => Some(i64::from(*i)),
+            Value::BIGINT(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// The value as an `f64`, for INT, BIGINT and FLOAT values. A BIGINT beyond 2^53 rounds to
+    /// the nearest `f64`.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::INT(i) => Some(f64::from(*i)),
+            Value::BIGINT(i) => Some(*i as f64),
+            Value::FLOAT(f) => Some(f.0),
+            _ => None,
+        }
+    }
+
+    /// Converts the value to `to` the way an INSERT or UPDATE stores it in a column of that type:
+    /// INT widens to BIGINT and FLOAT, BIGINT widens to FLOAT and narrows to INT when it fits.
+    /// FLOAT does not convert to an integer type, and BOOLEAN and TIMESTAMP convert to nothing
+    /// but themselves.
+    pub fn coerce_to(self, to: DataType) -> Result<Value, CoercionError> {
+        if self.data_type() == to {
+            return Ok(self);
+        }
+        match (self, to) {
+            (Value::INT(i), DataType::BIGINT) => Ok(Value::BIGINT(i64::from(i))),
+            (Value::BIGINT(i), DataType::INT) => i32::try_from(i)
+                .map(Value::INT)
+                .map_err(|_| CoercionError::OutOfRange),
+            (Value::INT(_) | Value::BIGINT(_), DataType::FLOAT) => {
+                Ok(Value::float(self.as_f64().ok_or(CoercionError::WrongType)?))
+            }
+            _ => Err(CoercionError::WrongType),
+        }
+    }
+
+    /// The value converted to `to` without losing anything: an integer to a wider integer type or
+    /// to a FLOAT that holds it exactly, or a whole FLOAT to an integer type that holds it.
+    /// `None` when no such conversion exists.
+    pub fn exactly_as(self, to: DataType) -> Option<Value> {
+        if self.data_type() == to {
+            return Some(self);
+        }
+        match (self, to) {
+            (Value::INT(_) | Value::BIGINT(_), DataType::INT | DataType::BIGINT) => {
+                self.coerce_to(to).ok()
+            }
+            (Value::INT(_) | Value::BIGINT(_), DataType::FLOAT) => {
+                let i = self.as_i64()?;
+                ((i.unsigned_abs() as f64) < I64_EXACT_FLOAT_BOUND).then(|| Value::float(i as f64))
+            }
+            (Value::FLOAT(f), DataType::INT | DataType::BIGINT) => {
+                if f.0.fract() != 0.0 || f.0.abs() >= I64_EXACT_FLOAT_BOUND {
+                    return None;
+                }
+                Value::BIGINT(f.0 as i64).coerce_to(to).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Orders two values, comparing INT, BIGINT and FLOAT numerically. `None` when the types do
+    /// not compare, such as BOOLEAN with INT.
+    pub fn compare(&self, other: &Value) -> Option<std::cmp::Ordering> {
+        if self.data_type() == other.data_type() {
+            return Some(self.cmp(other));
+        }
+        if let (Some(a), Some(b)) = (self.as_i64(), other.as_i64()) {
+            return Some(a.cmp(&b));
+        }
+        let (a, b) = (self.as_f64()?, other.as_f64()?);
+        Some(OrderedFloat(a).cmp(&OrderedFloat(b)))
+    }
+
     fn encode(&self, out: &mut Vec<u8>) {
         match self {
             Value::BOOLEAN(b) => out.push(*b as u8),
             Value::INT(i) => out.extend_from_slice(&i.to_le_bytes()),
+            Value::BIGINT(i) => out.extend_from_slice(&i.to_le_bytes()),
             Value::FLOAT(f) => out.extend_from_slice(&f.to_le_bytes()),
             Value::TIMESTAMP(t) => out.extend_from_slice(&t.to_le_bytes()),
         }
@@ -426,10 +572,26 @@ impl Value {
         match dtype {
             DataType::BOOLEAN => Value::BOOLEAN(bytes[0] != 0),
             DataType::INT => Value::INT(i32::from_le_bytes(bytes.try_into().unwrap())),
-            DataType::FLOAT => {
-                Value::FLOAT(OrderedFloat(f32::from_le_bytes(bytes.try_into().unwrap())))
-            }
+            DataType::BIGINT => Value::BIGINT(i64::from_le_bytes(bytes.try_into().unwrap())),
+            DataType::FLOAT => Value::float(f64::from_le_bytes(bytes.try_into().unwrap())),
             DataType::TIMESTAMP => Value::TIMESTAMP(i64::from_le_bytes(bytes.try_into().unwrap())),
+        }
+    }
+}
+
+/// Integers below this magnitude (2^53) convert to `f64` and back without rounding.
+const I64_EXACT_FLOAT_BOUND: f64 = 9_007_199_254_740_992.0;
+
+impl fmt::Display for Value {
+    /// Writes the value the way the shell prints it; a TIMESTAMP prints as
+    /// `YYYY-MM-DD HH:MM:SS`, with a fraction when it has microseconds.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::BOOLEAN(b) => write!(f, "{b}"),
+            Value::INT(i) => write!(f, "{i}"),
+            Value::BIGINT(i) => write!(f, "{i}"),
+            Value::FLOAT(x) => write!(f, "{}", x.0),
+            Value::TIMESTAMP(t) => f.write_str(&timestamp::format(*t)),
         }
     }
 }
@@ -444,77 +606,29 @@ impl Value {
         match self {
             Value::BOOLEAN(b) => out.push(*b as u8),
             Value::INT(i) => out.extend_from_slice(&((*i as u32) ^ SIGN_BIT_32).to_be_bytes()),
-            Value::FLOAT(f) => out.extend_from_slice(&order_preserving_f32_bits(f.0).to_be_bytes()),
-            Value::TIMESTAMP(t) => {
-                out.extend_from_slice(&((*t as u64) ^ SIGN_BIT_64).to_be_bytes())
+            Value::BIGINT(i) | Value::TIMESTAMP(i) => {
+                out.extend_from_slice(&((*i as u64) ^ SIGN_BIT_64).to_be_bytes())
             }
+            Value::FLOAT(f) => out.extend_from_slice(&order_preserving_f64_bits(f.0).to_be_bytes()),
         }
     }
 }
 
-/// Maps an `f32` to a `u32` that orders like `OrderedFloat<f32>`: every NaN maps to one value above
+/// Maps an `f64` to a `u64` that orders like `OrderedFloat<f64>`: every NaN maps to one value above
 /// positive infinity, and `-0.0` maps to the same value as `0.0`.
-fn order_preserving_f32_bits(f: f32) -> u32 {
+fn order_preserving_f64_bits(f: f64) -> u64 {
     let canonical = if f.is_nan() {
-        f32::NAN
+        f64::NAN
     } else if f == 0.0 {
         0.0
     } else {
         f
     };
     let bits = canonical.to_bits();
-    if bits & SIGN_BIT_32 == 0 {
-        bits | SIGN_BIT_32
+    if bits & SIGN_BIT_64 == 0 {
+        bits | SIGN_BIT_64
     } else {
         !bits
-    }
-}
-
-impl std::ops::Add for Value {
-    type Output = Value;
-    fn add(self, rhs: Value) -> Value {
-        use Value::*;
-        match (self, rhs) {
-            (INT(a), INT(b)) => INT(a + b),
-            (FLOAT(a), FLOAT(b)) => FLOAT(a + b),
-            _ => unreachable!("type-checked at plan time"),
-        }
-    }
-}
-
-impl std::ops::Sub for Value {
-    type Output = Value;
-    fn sub(self, rhs: Value) -> Value {
-        use Value::*;
-        match (self, rhs) {
-            (INT(a), INT(b)) => INT(a - b),
-            (FLOAT(a), FLOAT(b)) => FLOAT(a - b),
-            _ => unreachable!("type-checked at plan time"),
-        }
-    }
-}
-
-impl std::ops::Mul for Value {
-    type Output = Value;
-    fn mul(self, rhs: Value) -> Value {
-        use Value::*;
-        match (self, rhs) {
-            (INT(a), INT(b)) => INT(a * b),
-            (FLOAT(a), FLOAT(b)) => FLOAT(a * b),
-            _ => unreachable!("type-checked at plan time"),
-        }
-    }
-}
-
-impl std::ops::Div for Value {
-    type Output = Value;
-    fn div(self, rhs: Value) -> Value {
-        use Value::*;
-        match (self, rhs) {
-            (INT(a), INT(b)) => INT(a / b),
-            (FLOAT(a), FLOAT(b)) => FLOAT(a / b),
-            _ => unreachable!("type-checked at plan time"),
-        }
     }
 }
 
@@ -525,11 +639,13 @@ impl std::ops::Div for Value {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
     BOOLEAN,
-    /// Signed 32-bit integer.
+    /// Signed 32-bit integer (`INT`, `INTEGER`, `INT4`).
     INT,
-    /// 32-bit IEEE 754 float.
+    /// Signed 64-bit integer (`BIGINT`, `INT8`).
+    BIGINT,
+    /// 64-bit IEEE 754 float (`FLOAT`, `REAL`, `DOUBLE`, `FLOAT4`, `FLOAT8`).
     FLOAT,
-    /// Signed 64-bit timestamp, interpreted as UTC.
+    /// Microseconds since 1970-01-01 00:00:00 UTC, with no time zone.
     TIMESTAMP,
 }
 
@@ -538,9 +654,56 @@ impl DataType {
         match self {
             DataType::BOOLEAN => 1,
             DataType::INT => 4,
-            DataType::FLOAT => 4,
+            DataType::BIGINT => 8,
+            DataType::FLOAT => 8,
             DataType::TIMESTAMP => 8,
         }
+    }
+
+    /// True for INT, BIGINT and FLOAT.
+    pub fn is_numeric(&self) -> bool {
+        matches!(self, DataType::INT | DataType::BIGINT | DataType::FLOAT)
+    }
+
+    /// The type arithmetic on these two types yields: the wider of the two, where INT is
+    /// narrower than BIGINT and BIGINT narrower than FLOAT. `None` unless both are numeric.
+    pub fn common_numeric(self, other: DataType) -> Option<DataType> {
+        let rank = |t: DataType| match t {
+            DataType::INT => Some(0),
+            DataType::BIGINT => Some(1),
+            DataType::FLOAT => Some(2),
+            _ => None,
+        };
+        let (a, b) = (rank(self)?, rank(other)?);
+        Some(if a >= b { self } else { other })
+    }
+
+    /// True when a value of this type can be stored in a column of type `to` (see
+    /// [`Value::coerce_to`]); a BIGINT stored as INT can still be out of range.
+    pub fn coerces_to(self, to: DataType) -> bool {
+        self == to
+            || matches!(
+                (self, to),
+                (DataType::INT, DataType::BIGINT | DataType::FLOAT)
+                    | (DataType::BIGINT, DataType::INT | DataType::FLOAT)
+            )
+    }
+
+    /// True when values of the two types can be compared with `=`, `<` and the like.
+    pub fn compares_with(self, other: DataType) -> bool {
+        self == other || self.common_numeric(other).is_some()
+    }
+}
+
+impl fmt::Display for DataType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            DataType::BOOLEAN => "BOOLEAN",
+            DataType::INT => "INT",
+            DataType::BIGINT => "BIGINT",
+            DataType::FLOAT => "FLOAT",
+            DataType::TIMESTAMP => "TIMESTAMP",
+        })
     }
 }
 
@@ -586,14 +749,14 @@ mod tests {
             (DataType::FLOAT, "c".to_string()),
             (DataType::TIMESTAMP, "d".to_string()),
         ]);
-        assert_eq!(4 + 1 + 4 + 8, schema.data_len);
+        assert_eq!(4 + 1 + 8 + 8, schema.data_len);
         assert_eq!(1, schema.bitmap_len);
 
         let values = vec![
             Some(Value::INT(-42)),
             Some(Value::BOOLEAN(true)),
             Some(Value::FLOAT(OrderedFloat(3.5))),
-            Some(Value::TIMESTAMP(1_700_000_000_000)),
+            Some(Value::TIMESTAMP(1_700_000_000_000_000)),
         ];
         let tuple = schema.encode_tuple(&values).unwrap();
         assert_eq!(schema.bitmap_len + schema.data_len, tuple.data.len());
@@ -665,28 +828,104 @@ mod tests {
         ]);
 
         let bad = vec![Some(Value::INT(1)), Some(Value::INT(2))];
+        let err = schema.encode_tuple(&bad).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                CatalogError::ColumnType { column, expected: DataType::BOOLEAN, found: DataType::INT }
+                    if column == "b"
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), "column `b` is BOOLEAN, got INT");
+    }
+
+    #[test]
+    fn encode_tuple_widens_numbers_and_range_checks_narrowing() {
+        let schema = Schema::new(vec![
+            (DataType::INT, "i".to_string()),
+            (DataType::BIGINT, "big".to_string()),
+            (DataType::FLOAT, "f".to_string()),
+        ]);
+        let tuple = schema
+            .encode_tuple(&[
+                Some(Value::BIGINT(7)),
+                Some(Value::INT(-3)),
+                Some(Value::INT(2)),
+            ])
+            .unwrap();
+        assert_eq!(schema.get_value(&tuple, 0).unwrap(), Some(Value::INT(7)));
+        assert_eq!(
+            schema.get_value(&tuple, 1).unwrap(),
+            Some(Value::BIGINT(-3))
+        );
+        assert_eq!(
+            schema.get_value(&tuple, 2).unwrap(),
+            Some(Value::float(2.0))
+        );
+
+        let err = schema
+            .encode_tuple(&[Some(Value::BIGINT(1 << 40)), None, None])
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "1099511627776 is out of range for INT column `i`"
+        );
         assert!(matches!(
-            schema.encode_tuple(&bad),
-            Err(CatalogError::TupleSchemaMismatch)
+            schema.encode_tuple(&[None, Some(Value::float(1.0)), None]),
+            Err(CatalogError::ColumnType { .. })
         ));
+    }
+
+    #[test]
+    fn exactly_as_converts_only_without_loss() {
+        assert_eq!(
+            Value::INT(3).exactly_as(DataType::FLOAT),
+            Some(Value::float(3.0))
+        );
+        assert_eq!(
+            Value::float(3.0).exactly_as(DataType::INT),
+            Some(Value::INT(3))
+        );
+        assert_eq!(Value::float(3.5).exactly_as(DataType::INT), None);
+        assert_eq!(Value::float(f64::NAN).exactly_as(DataType::BIGINT), None);
+        assert_eq!(Value::BIGINT(1 << 40).exactly_as(DataType::INT), None);
+        assert_eq!(
+            Value::BIGINT((1 << 53) + 1).exactly_as(DataType::FLOAT),
+            None
+        );
+        assert_eq!(Value::BOOLEAN(true).exactly_as(DataType::INT), None);
+    }
+
+    #[test]
+    fn values_print_like_sql_literals() {
+        assert_eq!(Value::INT(-4).to_string(), "-4");
+        assert_eq!(Value::BIGINT(1 << 40).to_string(), "1099511627776");
+        assert_eq!(Value::float(2.5).to_string(), "2.5");
+        assert_eq!(Value::BOOLEAN(false).to_string(), "false");
+        assert_eq!(
+            Value::TIMESTAMP(1_700_000_000_000_000).to_string(),
+            "2023-11-14 22:13:20"
+        );
     }
 
     #[test]
     fn order_preserving_encoding_sorts_like_value_ord() {
         let mut values = vec![
-            Value::FLOAT(OrderedFloat(f32::NAN)),
-            Value::FLOAT(OrderedFloat(f32::INFINITY)),
+            Value::FLOAT(OrderedFloat(f64::NAN)),
+            Value::FLOAT(OrderedFloat(f64::INFINITY)),
             Value::FLOAT(OrderedFloat(3.7)),
             Value::FLOAT(OrderedFloat(3.2)),
             Value::FLOAT(OrderedFloat(0.0)),
             Value::FLOAT(OrderedFloat(-0.0)),
             Value::FLOAT(OrderedFloat(-1.5)),
             Value::FLOAT(OrderedFloat(-3.7)),
-            Value::FLOAT(OrderedFloat(f32::NEG_INFINITY)),
-            Value::FLOAT(OrderedFloat(-f32::NAN)),
+            Value::FLOAT(OrderedFloat(f64::NEG_INFINITY)),
+            Value::FLOAT(OrderedFloat(-f64::NAN)),
         ];
         values.extend([i32::MIN, -7, -1, 0, 1, 7, i32::MAX].map(Value::INT));
         values.extend([i64::MIN, -1, 0, 1, i64::MAX].map(Value::TIMESTAMP));
+        values.extend([i64::MIN, -1, 0, 1, i64::MAX].map(Value::BIGINT));
         values.extend([false, true].map(Value::BOOLEAN));
         let encode = |v: &Value| {
             let mut out = Vec::new();

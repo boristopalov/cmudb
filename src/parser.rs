@@ -2,17 +2,18 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
 
-use ordered_float::OrderedFloat;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, CreateIndex as SqlCreateIndex,
     CreateTable as SqlCreateTable, DataType as SqlDataType, Delete, Distinct, Expr, FromTable,
     Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Insert, JoinConstraint,
     JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderByExpr, OrderByKind,
     Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
-    Update, Value as SqlValue, WildcardAdditionalOptions, WindowSpec, WindowType,
+    TimezoneInfo, UnaryOperator, Update, Value as SqlValue, WildcardAdditionalOptions, WindowSpec,
+    WindowType,
 };
 
-use crate::catalog::{Catalog, DataType, Schema, Value};
+use crate::catalog::timestamp::{self, InvalidTimestamp};
+use crate::catalog::{Catalog, CoercionError, Column, DataType, Schema, Value};
 use crate::processor::plan::{
     AggType, ColIdx, Expression, JoinColumn, JoinPredicate, JoinType, NullOrdering, Op, Side,
     SortDirection, SortExpr,
@@ -146,17 +147,53 @@ pub enum BinderError {
     BareNullProjection,
     /// A `SELECT DISTINCT` ORDER BY key that is not one of the select list's expressions.
     DistinctOrderByNotInSelectList,
-    /// A numeric literal fits neither an INT nor a FLOAT.
+    /// A numeric literal fits neither an INT, a BIGINT nor a finite FLOAT.
     InvalidNumber { literal: String },
+    /// A TIMESTAMP literal that is not a valid date and time.
+    InvalidTimestamp(InvalidTimestamp),
+    /// An aggregate is called on a type it does not take, such as SUM of a BOOLEAN.
+    AggregateArgumentType { function: String, arg: DataType },
+    /// A binary operator applied to operand types it does not take, such as `TRUE + 1` or a
+    /// TIMESTAMP compared with an INT. A `None` side is a bare NULL.
+    OperandTypes {
+        operator: BinaryOperator,
+        left: Option<DataType>,
+        right: Option<DataType>,
+    },
+    /// Unary `-` or `+` applied to a value that is not a number.
+    NegateNonNumber { operand: DataType },
+    /// An INSERT or UPDATE stores a value of type `found` in column `column` of type
+    /// `expected`, with no implicit conversion between the two.
+    ColumnType {
+        column: String,
+        expected: DataType,
+        found: DataType,
+    },
+    /// An INSERT or UPDATE stores a constant the column's type cannot hold, such as
+    /// 2147483648 in an INT column.
+    ColumnOutOfRange {
+        column: String,
+        expected: DataType,
+        value: Value,
+    },
+    /// An INSERT row has other than one value per target column.
+    InsertArity {
+        table: String,
+        columns: usize,
+        values: usize,
+    },
+    /// An INSERT column list names the same column twice.
+    DuplicateInsertColumn { column: String },
     /// A LIMIT literal is not a non-negative integer that fits a `u32`.
     InvalidLimit { limit: String },
     /// A table or index name has more than one part, such as `schema.table`.
     QualifiedName { name: String },
-    /// A column type other than INT, FLOAT, BOOLEAN or TIMESTAMP.
+    /// A column type other than INT, BIGINT, FLOAT, BOOLEAN or TIMESTAMP (without time zone).
     UnsupportedType { type_name: String },
     /// A binary operator with no bound counterpart, such as `%`.
     UnsupportedOperator { operator: BinaryOperator },
-    /// A literal other than a number, a boolean or NULL.
+    /// A literal other than a number, a boolean or NULL, such as a string where no TIMESTAMP is
+    /// expected.
     UnsupportedLiteral { literal: String },
     /// An expression form the binder does not handle, such as `IN (...)`.
     UnsupportedExpression { expr: String },
@@ -228,6 +265,47 @@ impl fmt::Display for BinderError {
             BinderError::InvalidNumber { literal } => {
                 write!(f, "invalid numeric literal: {literal}")
             }
+            BinderError::InvalidTimestamp(e) => write!(f, "{e}"),
+            BinderError::AggregateArgumentType { function, arg } => {
+                write!(f, "aggregate `{function}` does not take a {arg} argument")
+            }
+            BinderError::OperandTypes {
+                operator,
+                left,
+                right,
+            } => write!(
+                f,
+                "operator `{operator}` does not take {} and {}",
+                type_name(*left),
+                type_name(*right)
+            ),
+            BinderError::NegateNonNumber { operand } => {
+                write!(f, "cannot negate a {operand}")
+            }
+            BinderError::ColumnType {
+                column,
+                expected,
+                found,
+            } => write!(f, "column `{column}` is {expected}, got {found}"),
+            BinderError::ColumnOutOfRange {
+                column,
+                expected,
+                value,
+            } => write!(
+                f,
+                "{value} is out of range for {expected} column `{column}`"
+            ),
+            BinderError::InsertArity {
+                table,
+                columns,
+                values,
+            } => write!(
+                f,
+                "INSERT into `{table}` has {values} values for {columns} columns"
+            ),
+            BinderError::DuplicateInsertColumn { column } => {
+                write!(f, "column `{column}` is listed more than once in INSERT")
+            }
             BinderError::DistinctOrderByNotInSelectList => f.write_str(
                 "for SELECT DISTINCT, ORDER BY expressions must appear in the select list",
             ),
@@ -262,6 +340,11 @@ impl fmt::Display for BinderError {
 }
 
 impl std::error::Error for BinderError {}
+
+/// A type's name, or `NULL` for a bare NULL.
+fn type_name(t: Option<DataType>) -> String {
+    t.map_or_else(|| "NULL".to_string(), |t| t.to_string())
+}
 
 impl From<Unsupported> for BinderError {
     fn from(feature: Unsupported) -> Self {
@@ -531,8 +614,12 @@ impl<'a> Binder<'a> {
                 Ok(ts.column(idx))
             }
 
-            Expr::BinaryOp { left, op, right } => {
-                let op = match op {
+            Expr::BinaryOp {
+                left,
+                op: sql_op,
+                right,
+            } => {
+                let op = match sql_op {
                     BinaryOperator::Plus => Op::Add,
                     BinaryOperator::Minus => Op::Sub,
                     BinaryOperator::Multiply => Op::Mul,
@@ -551,8 +638,20 @@ impl<'a> Binder<'a> {
                         });
                     }
                 };
-                let l = self.resolve_expr(left, scope)?;
-                let r = self.resolve_expr(right, scope)?;
+                let (l, r) = if string_literal(left).is_some() && string_literal(right).is_none() {
+                    let r = self.resolve_expr(right, scope)?;
+                    (self.resolve_expr_expecting(left, scope, r.dtype())?, r)
+                } else {
+                    let l = self.resolve_expr(left, scope)?;
+                    let r = self.resolve_expr_expecting(right, scope, l.dtype())?;
+                    (l, r)
+                };
+                check_operand_types(sql_op, &op, l.dtype(), r.dtype())?;
+                let (l, r) = if is_comparison(&op) {
+                    match_constant_to_other_side(l, r)
+                } else {
+                    (l, r)
+                };
                 Ok(Expression::Binary {
                     left: Box::new(l),
                     right: Box::new(r),
@@ -560,19 +659,44 @@ impl<'a> Binder<'a> {
                 })
             }
 
+            Expr::UnaryOp {
+                op: op @ (UnaryOperator::Minus | UnaryOperator::Plus),
+                expr: inner,
+            } => {
+                if let (UnaryOperator::Minus, Expr::Value(v)) = (op, inner.as_ref())
+                    && let SqlValue::Number(s, _) = &v.value
+                {
+                    return Ok(Expression::Constant(Some(number_literal(&format!(
+                        "-{s}"
+                    ))?)));
+                }
+                let inner = self.resolve_expr(inner, scope)?;
+                if let Some(t) = inner.dtype()
+                    && !t.is_numeric()
+                {
+                    return Err(BinderError::NegateNonNumber { operand: t });
+                }
+                match op {
+                    UnaryOperator::Minus => negate(inner),
+                    _ => Ok(inner),
+                }
+            }
+
+            Expr::TypedString(ts) => match (&ts.data_type, &ts.value.value) {
+                (
+                    SqlDataType::Timestamp(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone),
+                    SqlValue::SingleQuotedString(text),
+                ) => timestamp_constant(text),
+                _ => Err(BinderError::UnsupportedExpression {
+                    expr: expr.to_string(),
+                }),
+            },
+
             Expr::Value(v) => {
                 let val = match &v.value {
                     SqlValue::Null => None,
                     SqlValue::Boolean(b) => Some(Value::BOOLEAN(*b)),
-                    SqlValue::Number(s, _) => {
-                        if let Ok(i) = s.parse::<i32>() {
-                            Some(Value::INT(i))
-                        } else if let Ok(f) = s.parse::<f32>() {
-                            Some(Value::FLOAT(OrderedFloat(f)))
-                        } else {
-                            return Err(BinderError::InvalidNumber { literal: s.clone() });
-                        }
-                    }
+                    SqlValue::Number(s, _) => Some(number_literal(s)?),
                     other => {
                         return Err(BinderError::UnsupportedLiteral {
                             literal: other.to_string(),
@@ -601,6 +725,57 @@ impl<'a> Binder<'a> {
         let result = f();
         self.inside_agg_arg.set(was_inside);
         result
+    }
+
+    /// Resolves `expr` where a value of type `expected` belongs, such as an INSERT value or the
+    /// other side of a comparison. A string literal there is read as that type; elsewhere it is
+    /// resolved as [`Binder::resolve_expr`] resolves it.
+    fn resolve_expr_expecting(
+        &self,
+        expr: &Expr,
+        scope: &Scope,
+        expected: Option<DataType>,
+    ) -> Result<Expression, BinderError> {
+        match (expected, string_literal(expr)) {
+            (Some(DataType::TIMESTAMP), Some(text)) => timestamp_constant(text),
+            _ => self.resolve_expr(expr, scope),
+        }
+    }
+
+    /// Resolves a value an INSERT or UPDATE stores in `col`. A constant is converted to the
+    /// column's type here; any other expression has to have a type that converts to it.
+    fn bind_column_value(
+        &self,
+        expr: &Expr,
+        scope: &Scope,
+        col: &Column,
+    ) -> Result<Expression, BinderError> {
+        let resolved = self.resolve_expr_expecting(expr, scope, Some(col.dtype))?;
+        match resolved {
+            Expression::Constant(Some(v)) => v
+                .coerce_to(col.dtype)
+                .map(|v| Expression::Constant(Some(v)))
+                .map_err(|e| match e {
+                    CoercionError::WrongType => BinderError::ColumnType {
+                        column: col.name.clone(),
+                        expected: col.dtype,
+                        found: v.data_type(),
+                    },
+                    CoercionError::OutOfRange => BinderError::ColumnOutOfRange {
+                        column: col.name.clone(),
+                        expected: col.dtype,
+                        value: v,
+                    },
+                }),
+            other => match other.dtype() {
+                Some(found) if !found.coerces_to(col.dtype) => Err(BinderError::ColumnType {
+                    column: col.name.clone(),
+                    expected: col.dtype,
+                    found,
+                }),
+                _ => Ok(other),
+            },
+        }
     }
 
     /// Inside an aggregating SELECT, maps an expression equal to a GROUP BY expression, or an
@@ -647,11 +822,7 @@ impl<'a> Binder<'a> {
             return Err(BinderError::AggregateOutsideProjection);
         }
         let arg_expr = self.bind_aggregate_argument(f, scope, &agg_type)?;
-        let result_dtype = aggregate_result_type(&agg_type, &arg_expr).ok_or_else(|| {
-            BinderError::UntypedAggregateArgument {
-                function: f.name.to_string(),
-            }
-        })?;
+        let result_dtype = aggregate_result_type(&agg_type, &arg_expr, &f.name)?;
 
         let mut ctx_mut = self.agg_ctx.borrow_mut();
         let ctx = ctx_mut
@@ -749,11 +920,7 @@ impl<'a> Binder<'a> {
             }
             _ => self.bind_aggregate_argument(f, scope, &agg_type)?,
         };
-        let dtype = aggregate_result_type(&agg_type, &arg).ok_or_else(|| {
-            BinderError::UntypedAggregateArgument {
-                function: f.name.to_string(),
-            }
-        })?;
+        let dtype = aggregate_result_type(&agg_type, &arg, &f.name)?;
         let window = self.window_for(inline_window_spec(over)?, scope)?;
 
         let mut ctx_mut = self.window_ctx.borrow_mut();
@@ -1085,7 +1252,10 @@ impl<'a> Binder<'a> {
         let TableObject::TableName(name) = &stmt.table else {
             return Err(Unsupported::InsertTarget.into());
         };
-        let scope = self.build_scope(&ident_name(name)?)?;
+        let table_name = ident_name(name)?;
+        let scope = self.build_scope(&table_name)?;
+        let schema = &scope[&table_name].schema;
+        let targets = insert_targets(schema, &stmt.columns)?;
 
         let source = stmt
             .source
@@ -1100,10 +1270,19 @@ impl<'a> Binder<'a> {
             .rows
             .iter()
             .map(|row| {
-                row.content
-                    .iter()
-                    .map(|e| self.resolve_expr(e, &no_input_columns))
-                    .collect()
+                if row.content.len() != targets.len() {
+                    return Err(BinderError::InsertArity {
+                        table: table_name.clone(),
+                        columns: targets.len(),
+                        values: row.content.len(),
+                    });
+                }
+                let mut full_row = vec![Expression::Constant(None); schema.cols.len()];
+                for (e, &col) in row.content.iter().zip(&targets) {
+                    full_row[col] =
+                        self.bind_column_value(e, &no_input_columns, &schema.cols[col])?;
+                }
+                Ok(full_row)
             })
             .collect::<Result<_, _>>()?;
 
@@ -1150,7 +1329,7 @@ impl<'a> Binder<'a> {
                     column: col.clone(),
                 })?;
             cols.push(ColIdx(idx as u32));
-            new_cols.push(self.resolve_expr(value, &scope)?);
+            new_cols.push(self.bind_column_value(value, &scope, &schema.cols[idx])?);
         }
 
         let filters = stmt
@@ -1593,12 +1772,27 @@ fn column_path(expr: &Expr) -> Option<String> {
     }
 }
 
-/// COUNT and RANK yield INT; every other aggregate yields its argument's type.
-fn aggregate_result_type(agg_type: &AggType, arg: &Expression) -> Option<DataType> {
-    match agg_type {
-        AggType::COUNT | AggType::RANK => Some(DataType::INT),
-        _ => arg.dtype(),
+/// The type of `agg_type` over `arg` (see [`AggType::result_type`]). COUNT and RANK take any
+/// argument, a bare NULL included.
+fn aggregate_result_type(
+    agg_type: &AggType,
+    arg: &Expression,
+    function: &ObjectName,
+) -> Result<DataType, BinderError> {
+    if matches!(agg_type, AggType::COUNT | AggType::RANK) {
+        return Ok(DataType::INT);
     }
+    let arg_type = arg
+        .dtype()
+        .ok_or_else(|| BinderError::UntypedAggregateArgument {
+            function: function.to_string(),
+        })?;
+    agg_type
+        .result_type(arg_type)
+        .ok_or_else(|| BinderError::AggregateArgumentType {
+            function: function.to_string(),
+            arg: arg_type,
+        })
 }
 
 fn expr_has_aggregate(e: &Expr) -> bool {
@@ -1606,6 +1800,7 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         Expr::Function(f) => f.over.is_none() && parse_agg_type(&f.name).is_some(),
         Expr::Nested(inner) => expr_has_aggregate(inner),
         Expr::BinaryOp { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
+        Expr::UnaryOp { expr, .. } => expr_has_aggregate(expr),
         _ => false,
     }
 }
@@ -1613,12 +1808,160 @@ fn expr_has_aggregate(e: &Expr) -> bool {
 fn sql_to_dtype(t: &SqlDataType) -> Result<DataType, BinderError> {
     match t {
         SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => Ok(DataType::INT),
-        SqlDataType::Float(_) | SqlDataType::Float4 | SqlDataType::Real => Ok(DataType::FLOAT),
+        SqlDataType::BigInt(_) | SqlDataType::Int8(_) => Ok(DataType::BIGINT),
+        SqlDataType::Float(_)
+        | SqlDataType::Float4
+        | SqlDataType::Float8
+        | SqlDataType::Real
+        | SqlDataType::Double(_)
+        | SqlDataType::DoublePrecision => Ok(DataType::FLOAT),
         SqlDataType::Bool | SqlDataType::Boolean => Ok(DataType::BOOLEAN),
-        SqlDataType::Timestamp(_, _) => Ok(DataType::TIMESTAMP),
+        SqlDataType::Timestamp(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
+            Ok(DataType::TIMESTAMP)
+        }
         other => Err(BinderError::UnsupportedType {
             type_name: other.to_string(),
         }),
+    }
+}
+
+/// The column positions an INSERT fills, in the order its rows list values: every column when
+/// the INSERT has no column list.
+fn insert_targets(schema: &Schema, columns: &[ObjectName]) -> Result<Vec<usize>, BinderError> {
+    if columns.is_empty() {
+        return Ok((0..schema.cols.len()).collect());
+    }
+    let mut targets = Vec::with_capacity(columns.len());
+    for name in columns {
+        let column = ident_name(name)?;
+        let idx = schema
+            .col_idx(&column)
+            .ok_or_else(|| BinderError::ColumnNotFound {
+                column: column.clone(),
+            })?;
+        if targets.contains(&idx) {
+            return Err(BinderError::DuplicateInsertColumn { column });
+        }
+        targets.push(idx);
+    }
+    Ok(targets)
+}
+
+/// The text of a single-quoted string literal, looking through parentheses.
+fn string_literal(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Nested(inner) => string_literal(inner),
+        Expr::Value(v) => match &v.value {
+            SqlValue::SingleQuotedString(s) => Some(s),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn timestamp_constant(text: &str) -> Result<Expression, BinderError> {
+    timestamp::parse(text)
+        .map(|micros| Expression::Constant(Some(Value::TIMESTAMP(micros))))
+        .map_err(BinderError::InvalidTimestamp)
+}
+
+/// An integer literal as the narrowest of INT and BIGINT that holds it, or else a FLOAT.
+fn number_literal(literal: &str) -> Result<Value, BinderError> {
+    if let Ok(i) = literal.parse::<i64>() {
+        return Ok(Value::integer(i));
+    }
+    match literal.parse::<f64>() {
+        Ok(f) if f.is_finite() => Ok(Value::float(f)),
+        _ => Err(BinderError::InvalidNumber {
+            literal: literal.to_string(),
+        }),
+    }
+}
+
+/// `-inner` for a numeric (or NULL) expression. A constant is negated here; any other
+/// expression becomes `0 - inner`. `resolve_expr` reads a negative number literal such as
+/// `-9223372036854775808` as one literal before calling this.
+fn negate(inner: Expression) -> Result<Expression, BinderError> {
+    match inner {
+        Expression::Constant(None) => Ok(Expression::Constant(None)),
+        Expression::Constant(Some(v)) => {
+            let negated = match v {
+                Value::FLOAT(f) => Some(Value::float(-f.0)),
+                other => other
+                    .as_i64()
+                    .and_then(i64::checked_neg)
+                    .map(Value::integer),
+            };
+            negated
+                .map(|v| Expression::Constant(Some(v)))
+                .ok_or_else(|| BinderError::InvalidNumber {
+                    literal: format!("-{v}"),
+                })
+        }
+        other => Ok(Expression::Binary {
+            left: Box::new(Expression::Constant(Some(Value::INT(0)))),
+            right: Box::new(other),
+            op: Op::Sub,
+        }),
+    }
+}
+
+fn is_comparison(op: &Op) -> bool {
+    matches!(op, Op::Eq | Op::NEq | Op::Lt | Op::Gt | Op::Lte | Op::Gte)
+}
+
+/// Fails when `op` does not take operands of these types. A `None` side is a bare NULL, which
+/// every operator takes.
+fn check_operand_types(
+    operator: &BinaryOperator,
+    op: &Op,
+    left: Option<DataType>,
+    right: Option<DataType>,
+) -> Result<(), BinderError> {
+    let takes = |t: Option<DataType>, ok: fn(DataType) -> bool| t.is_none_or(ok);
+    let fits = match op {
+        Op::Add | Op::Sub | Op::Mul | Op::Div => {
+            takes(left, |t| t.is_numeric()) && takes(right, |t| t.is_numeric())
+        }
+        Op::And | Op::Or => {
+            let boolean = |t| t == DataType::BOOLEAN;
+            takes(left, boolean) && takes(right, boolean)
+        }
+        Op::Eq | Op::NEq | Op::Lt | Op::Gt | Op::Lte | Op::Gte => match (left, right) {
+            (Some(l), Some(r)) => l.compares_with(r),
+            _ => true,
+        },
+    };
+    if fits {
+        Ok(())
+    } else {
+        Err(BinderError::OperandTypes {
+            operator: operator.clone(),
+            left,
+            right,
+        })
+    }
+}
+
+/// In a comparison between a constant and an expression of another numeric type, converts the
+/// constant to that type when it converts exactly, so that `f = 1` on a FLOAT column compares
+/// FLOATs and can use an index on `f`.
+fn match_constant_to_other_side(l: Expression, r: Expression) -> (Expression, Expression) {
+    let exactly = |constant: &Expression, target: Option<DataType>| match (constant, target) {
+        (Expression::Constant(Some(v)), Some(t)) => v.exactly_as(t),
+        _ => None,
+    };
+    match (&l, &r) {
+        (Expression::Constant(_), Expression::Constant(_)) => (l, r),
+        (Expression::Constant(_), other) => match exactly(&l, other.dtype()) {
+            Some(v) => (Expression::Constant(Some(v)), r),
+            None => (l, r),
+        },
+        (other, Expression::Constant(_)) => match exactly(&r, other.dtype()) {
+            Some(v) => (l, Expression::Constant(Some(v))),
+            None => (l, r),
+        },
+        _ => (l, r),
     }
 }
 

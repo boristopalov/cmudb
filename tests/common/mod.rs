@@ -237,28 +237,31 @@ pub fn int(v: i32) -> Option<Value> {
     Some(Value::INT(v))
 }
 
+/// Each row's INT columns; a BIGINT in the INT range reads as an INT, and any other value
+/// panics.
 pub fn ints(rows: &[Row]) -> Vec<Vec<i32>> {
     rows.iter()
         .map(|r| {
             r.iter()
-                .map(|v| match v {
-                    Some(Value::INT(i)) => *i,
-                    other => panic!("expected INT, got {other:?}"),
+                .map(|v| match v.and_then(|v| v.as_i64()).map(i32::try_from) {
+                    Some(Ok(i)) => i,
+                    _ => panic!("expected an INT, or a BIGINT in the INT range, got {v:?}"),
                 })
                 .collect()
         })
         .collect()
 }
 
-/// Each row's INT columns, with NULL as `None`; panics on any other type.
+/// Each row's INT columns, with NULL as `None`; a BIGINT in the INT range reads as an INT, and
+/// any other value panics.
 pub fn nullable_ints(rows: &[Row]) -> Vec<Vec<Option<i32>>> {
     rows.iter()
         .map(|r| {
             r.iter()
-                .map(|v| match v {
-                    Some(Value::INT(i)) => Some(*i),
+                .map(|v| match v.map(|v| v.as_i64().map(i32::try_from)) {
+                    Some(Some(Ok(i))) => Some(i),
                     None => None,
-                    other => panic!("expected INT or NULL, got {other:?}"),
+                    _ => panic!("expected INT or NULL, got {v:?}"),
                 })
                 .collect()
         })

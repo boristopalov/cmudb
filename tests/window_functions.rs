@@ -3,6 +3,7 @@
 
 mod common;
 
+use cmudb::catalog::Value;
 use cmudb::parser::{BinderError, Unsupported};
 use cmudb::processor::plan::Plan;
 use common::*;
@@ -14,8 +15,9 @@ fn sales_db() -> Db {
     db
 }
 
-/// Every window function the executor computes, each over `OVER (<window>)`, after
-/// `dept, amount`, ordered by `dept, amount` so tied rows are identical.
+/// Every window function the executor computes with an INT result, each over
+/// `OVER (<window>)`, after `dept, amount`, ordered by `dept, amount` so tied rows are
+/// identical. AVG, a FLOAT, is checked by `avg_over_a_window_is_a_float`.
 fn every_function_over(db: &Db, window: &str) -> Vec<Vec<i32>> {
     let functions = [
         "SUM(amount)",
@@ -23,7 +25,6 @@ fn every_function_over(db: &Db, window: &str) -> Vec<Vec<i32>> {
         "COUNT(*)",
         "MIN(amount)",
         "MAX(amount)",
-        "AVG(amount)",
         "RANK()",
     ];
     let calls: Vec<String> = functions
@@ -50,7 +51,7 @@ fn window_node_count(plan: &Plan) -> usize {
 #[test]
 fn empty_over_clause_aggregates_the_whole_table_on_every_row() {
     let db = sales_db();
-    let every_row = vec![77, 6, 6, 5, 30, 12, 1];
+    let every_row = vec![77, 6, 6, 5, 30, 1];
     let expected: Vec<Vec<i32>> = [[1, 10], [1, 20], [1, 30], [2, 5], [2, 5], [2, 7]]
         .iter()
         .map(|key| key.iter().chain(&every_row).copied().collect())
@@ -64,12 +65,12 @@ fn partition_by_without_order_by_aggregates_each_whole_partition() {
     assert_eq!(
         every_function_over(&db, "PARTITION BY dept"),
         vec![
-            vec![1, 10, 60, 3, 3, 10, 30, 20, 1],
-            vec![1, 20, 60, 3, 3, 10, 30, 20, 1],
-            vec![1, 30, 60, 3, 3, 10, 30, 20, 1],
-            vec![2, 5, 17, 3, 3, 5, 7, 5, 1],
-            vec![2, 5, 17, 3, 3, 5, 7, 5, 1],
-            vec![2, 7, 17, 3, 3, 5, 7, 5, 1],
+            vec![1, 10, 60, 3, 3, 10, 30, 1],
+            vec![1, 20, 60, 3, 3, 10, 30, 1],
+            vec![1, 30, 60, 3, 3, 10, 30, 1],
+            vec![2, 5, 17, 3, 3, 5, 7, 1],
+            vec![2, 5, 17, 3, 3, 5, 7, 1],
+            vec![2, 7, 17, 3, 3, 5, 7, 1],
         ],
         "without ORDER BY every row of a partition is a peer, so RANK is 1 throughout"
     );
@@ -81,12 +82,12 @@ fn order_by_without_partition_by_runs_over_the_table_and_ties_share_a_rank() {
     assert_eq!(
         every_function_over(&db, "ORDER BY amount"),
         vec![
-            vec![1, 10, 27, 4, 4, 5, 10, 6, 4],
-            vec![1, 20, 47, 5, 5, 5, 20, 9, 5],
-            vec![1, 30, 77, 6, 6, 5, 30, 12, 6],
-            vec![2, 5, 10, 2, 2, 5, 5, 5, 1],
-            vec![2, 5, 10, 2, 2, 5, 5, 5, 1],
-            vec![2, 7, 17, 3, 3, 5, 7, 5, 3],
+            vec![1, 10, 27, 4, 4, 5, 10, 4],
+            vec![1, 20, 47, 5, 5, 5, 20, 5],
+            vec![1, 30, 77, 6, 6, 5, 30, 6],
+            vec![2, 5, 10, 2, 2, 5, 5, 1],
+            vec![2, 5, 10, 2, 2, 5, 5, 1],
+            vec![2, 7, 17, 3, 3, 5, 7, 3],
         ],
         "the two 5s are peers: both rank 1, both see each other, and 7 ranks 3"
     );
@@ -98,12 +99,12 @@ fn partition_by_and_order_by_run_within_each_partition() {
     assert_eq!(
         every_function_over(&db, "PARTITION BY dept ORDER BY amount"),
         vec![
-            vec![1, 10, 10, 1, 1, 10, 10, 10, 1],
-            vec![1, 20, 30, 2, 2, 10, 20, 15, 2],
-            vec![1, 30, 60, 3, 3, 10, 30, 20, 3],
-            vec![2, 5, 10, 2, 2, 5, 5, 5, 1],
-            vec![2, 5, 10, 2, 2, 5, 5, 5, 1],
-            vec![2, 7, 17, 3, 3, 5, 7, 5, 3],
+            vec![1, 10, 10, 1, 1, 10, 10, 1],
+            vec![1, 20, 30, 2, 2, 10, 20, 2],
+            vec![1, 30, 60, 3, 3, 10, 30, 3],
+            vec![2, 5, 10, 2, 2, 5, 5, 1],
+            vec![2, 5, 10, 2, 2, 5, 5, 1],
+            vec![2, 7, 17, 3, 3, 5, 7, 3],
         ]
     );
 }
@@ -368,4 +369,38 @@ fn qualify_filters_on_a_window_result() {
         )),
         vec![[1, 30], [2, 7]]
     );
+}
+
+#[test]
+fn avg_over_a_window_is_a_float() {
+    let db = sales_db();
+    let third = 17.0 / 3.0;
+    for (window, expected) in [
+        ("", vec![77.0 / 6.0; 6]),
+        (
+            "PARTITION BY dept",
+            vec![20.0, 20.0, 20.0, third, third, third],
+        ),
+        (
+            "ORDER BY amount",
+            vec![6.75, 9.4, 77.0 / 6.0, 5.0, 5.0, third],
+        ),
+        (
+            "PARTITION BY dept ORDER BY amount",
+            vec![10.0, 15.0, 20.0, 5.0, 5.0, third],
+        ),
+    ] {
+        let avgs: Vec<Option<Value>> = db
+            .exec(&format!(
+                "SELECT AVG(amount) OVER ({window}) FROM sales ORDER BY dept, amount"
+            ))
+            .into_iter()
+            .map(|r| r[0])
+            .collect();
+        let expected: Vec<Option<Value>> = expected
+            .into_iter()
+            .map(|f| Some(Value::float(f)))
+            .collect();
+        assert_eq!(avgs, expected, "AVG(amount) OVER ({window})");
+    }
 }

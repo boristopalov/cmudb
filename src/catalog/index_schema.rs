@@ -337,7 +337,7 @@ mod tests {
             IndexType::BPlusTree,
         )
         .unwrap();
-        let floats = [3.7_f32, -1.5, 3.2, -0.25, 0.5];
+        let floats = [3.7_f64, -1.5, 3.2, -0.25, 0.5];
         for (slot, f) in floats.iter().enumerate() {
             let tuple = schema
                 .encode_tuple(&[Some(Value::FLOAT(OrderedFloat(*f)))])

@@ -44,19 +44,19 @@ pub enum ExecutorError {
     NotBoolean { value: Value },
     /// A comparison between values of types that do not compare.
     Incomparable { left: Value, right: Value },
-    /// Arithmetic on a value that is not an INT or a FLOAT.
+    /// Arithmetic on a value that is not an INT, BIGINT or FLOAT.
     ArithmeticOperands {
         op: Arithmetic,
         left: Value,
         right: Value,
     },
-    /// INT division by zero.
-    DivisionByZero { dividend: i32 },
-    /// INT arithmetic whose result does not fit an INT.
+    /// INT or BIGINT division by zero.
+    DivisionByZero { dividend: i64 },
+    /// INT or BIGINT arithmetic whose result does not fit the operands' type.
     IntegerOverflow {
         op: Arithmetic,
-        left: i32,
-        right: i32,
+        left: i64,
+        right: i64,
     },
     /// An INSERT wrote more rows than its INT count column holds.
     CountOverflow { count: u64 },
@@ -894,7 +894,7 @@ enum AggState {
     Max(Option<Value>),
     Min(Option<Value>),
     Sum(Option<Value>),
-    Avg { sum: Option<Value>, count: i32 },
+    Avg { sum: f64, count: i64 },
     Count(i32),
     Rank(i32),
 }
@@ -902,10 +902,7 @@ enum AggState {
 impl AggState {
     fn new(agg_type: &AggType) -> Self {
         match agg_type {
-            AggType::AVG => Self::Avg {
-                sum: None,
-                count: 0,
-            },
+            AggType::AVG => Self::Avg { sum: 0.0, count: 0 },
             AggType::MAX => Self::Max(None),
             AggType::MIN => Self::Min(None),
             AggType::SUM => Self::Sum(None),
@@ -924,15 +921,20 @@ impl AggState {
     }
 
     /// Folds one input value in. NULLs are skipped, so `COUNT(col)` counts non-NULL values;
-    /// RANK ignores values and moves through `update_rank`. Errors when a SUM or AVG
-    /// overflows INT.
+    /// RANK ignores values and moves through `update_rank`. SUM adds INTs as BIGINTs and errors
+    /// when the total overflows a BIGINT; AVG adds as FLOAT, so its total does not overflow.
     fn update(&mut self, v: Option<Value>) -> Result<(), ExecutorError> {
         let Some(v) = v else { return Ok(()) };
         match self {
             Self::Count(count) => *count += 1,
-            Self::Sum(current) => *current = Some(add_to(*current, v)?),
+            Self::Sum(current) => *current = Some(add_to(*current, sum_operand(v))?),
             Self::Avg { sum, count } => {
-                *sum = Some(add_to(*sum, v)?);
+                let operand = v.as_f64().ok_or(ExecutorError::ArithmeticOperands {
+                    op: Arithmetic::Add,
+                    left: Value::float(*sum),
+                    right: v,
+                })?;
+                *sum += operand;
                 *count += 1;
             }
             Self::Max(current) => *current = Some(current.map_or(v, |c| c.max(v))),
@@ -942,17 +944,22 @@ impl AggState {
         Ok(())
     }
 
-    /// The aggregate over the values folded in so far. AVG of INTs truncates toward zero.
+    /// The aggregate over the values folded in so far. AVG is a FLOAT for every input type.
     fn value(&self) -> Result<Option<Value>, ExecutorError> {
         Ok(match self {
             Self::Sum(v) | Self::Max(v) | Self::Min(v) => *v,
             Self::Count(c) | Self::Rank(c) => Some(Value::INT(*c)),
-            Self::Avg { sum: None, .. } => None,
-            Self::Avg {
-                sum: Some(sum),
-                count,
-            } => Some(Arithmetic::Div.apply(*sum, Value::INT(*count))?),
+            Self::Avg { count: 0, .. } => None,
+            Self::Avg { sum, count } => Some(Value::float(*sum / *count as f64)),
         })
+    }
+}
+
+/// The value SUM adds: an INT widened to BIGINT, anything else as it is.
+fn sum_operand(v: Value) -> Value {
+    match v {
+        Value::INT(i) => Value::BIGINT(i64::from(i)),
+        other => other,
     }
 }
 
@@ -2370,7 +2377,7 @@ mod tests {
             (
                 ExecutorError::IntegerOverflow {
                     op: Arithmetic::Mul,
-                    left: i32::MAX,
+                    left: i32::MAX.into(),
                     right: 2,
                 },
                 "integer overflow: Mul of 2147483647 and 2",
@@ -2903,16 +2910,55 @@ mod tests {
     }
 
     #[test]
-    fn sum_that_overflows_int_is_an_error() {
+    fn sum_of_ints_is_a_bigint_past_the_int_range() {
         let mut sum = AggState::new(&AggType::SUM);
         sum.update(Some(Value::INT(i32::MAX))).unwrap();
+        sum.update(Some(Value::INT(1))).unwrap();
+        assert_eq!(
+            sum.value().unwrap(),
+            Some(Value::BIGINT(i64::from(i32::MAX) + 1))
+        );
+    }
+
+    #[test]
+    fn sum_that_overflows_bigint_is_an_error() {
+        let mut sum = AggState::new(&AggType::SUM);
+        sum.update(Some(Value::BIGINT(i64::MAX))).unwrap();
         assert!(matches!(
             sum.update(Some(Value::INT(1))).unwrap_err(),
             ExecutorError::IntegerOverflow {
                 op: Arithmetic::Add,
-                left: i32::MAX,
+                left: i64::MAX,
                 right: 1
             }
+        ));
+    }
+
+    #[test]
+    fn avg_of_ints_is_a_float() {
+        let mut avg = AggState::new(&AggType::AVG);
+        avg.update(Some(Value::INT(1))).unwrap();
+        avg.update(Some(Value::INT(2))).unwrap();
+        assert_eq!(avg.value().unwrap(), Some(Value::float(1.5)));
+    }
+
+    #[test]
+    fn avg_of_bigints_past_the_bigint_range_is_a_float() {
+        let mut avg = AggState::new(&AggType::AVG);
+        avg.update(Some(Value::BIGINT(i64::MAX))).unwrap();
+        avg.update(Some(Value::BIGINT(1))).unwrap();
+        assert_eq!(
+            avg.value().unwrap(),
+            Some(Value::float((i64::MAX as f64 + 1.0) / 2.0))
+        );
+    }
+
+    #[test]
+    fn avg_of_a_non_number_is_an_error() {
+        let mut avg = AggState::new(&AggType::AVG);
+        assert!(matches!(
+            avg.update(Some(Value::BOOLEAN(true))),
+            Err(ExecutorError::ArithmeticOperands { .. })
         ));
     }
 

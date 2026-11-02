@@ -363,18 +363,21 @@ fn window(
     order: Option<Vec<Expression>>,
     aggs: Vec<AggType>,
 ) -> Plan {
-    let mut names = vec!["dept".to_string(), "amount".to_string()];
+    let mut cols = vec![
+        (DataType::INT, "dept".to_string()),
+        (DataType::INT, "amount".to_string()),
+    ];
     let aggregates: Vec<_> = aggs
         .into_iter()
         .enumerate()
         .map(|(i, a)| {
-            names.push(format!("agg{i}"));
+            let dtype = a.result_type(DataType::INT).expect("takes INT");
+            cols.push((dtype, format!("agg{i}")));
             (col(1), a)
         })
         .collect();
-    let names: Vec<&str> = names.iter().map(String::as_str).collect();
     Plan::WindowFunction(WindowFunctionPlanNode {
-        schema: int_schema(&names),
+        schema: Schema::new(cols),
         child: Box::new(scan(db, "sales", &["dept", "amount"])),
         order_by_exprs: order.map(|keys| keys.into_iter().map(SortExpr::ascending).collect()),
         partition_by_exprs: partition,
@@ -390,25 +393,40 @@ fn window_partition_without_order_gives_partition_totals() {
         &db,
         Some(vec![col(0)]),
         None,
-        vec![
-            AggType::SUM,
-            AggType::COUNT,
-            AggType::MIN,
-            AggType::MAX,
-            AggType::AVG,
-        ],
+        vec![AggType::SUM, AggType::COUNT, AggType::MIN, AggType::MAX],
     );
     let mut rows = ints(&db.run_plan(&plan).unwrap());
     rows.sort();
     assert_eq!(
         rows,
         vec![
-            vec![1, 10, 60, 3, 10, 30, 20],
-            vec![1, 20, 60, 3, 10, 30, 20],
-            vec![1, 30, 60, 3, 10, 30, 20],
-            vec![2, 5, 17, 3, 5, 7, 5],
-            vec![2, 5, 17, 3, 5, 7, 5],
-            vec![2, 7, 17, 3, 5, 7, 5],
+            vec![1, 10, 60, 3, 10, 30],
+            vec![1, 20, 60, 3, 10, 30],
+            vec![1, 30, 60, 3, 10, 30],
+            vec![2, 5, 17, 3, 5, 7],
+            vec![2, 5, 17, 3, 5, 7],
+            vec![2, 7, 17, 3, 5, 7],
+        ]
+    );
+}
+
+#[test]
+fn window_avg_over_ints_is_a_float() {
+    let db = sales_db();
+    let plan = window(&db, Some(vec![col(0)]), None, vec![AggType::AVG]);
+    let mut avgs: Vec<(Option<Value>, Option<Value>)> = db
+        .run_plan(&plan)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r[0], r[2]))
+        .collect();
+    avgs.sort();
+    avgs.dedup();
+    assert_eq!(
+        avgs,
+        vec![
+            (int(1), Some(Value::float(20.0))),
+            (int(2), Some(Value::float(17.0 / 3.0))),
         ]
     );
 }
@@ -603,21 +621,23 @@ fn drop_plans_without_a_target_fail_unless_if_exists() {
 }
 
 #[test]
-fn values_are_comparable_and_support_arithmetic_across_types() {
-    assert_eq!(Value::INT(2) + Value::INT(3), Value::INT(5));
+fn values_compare_numerically_across_numeric_types() {
+    use std::cmp::Ordering;
+    assert_eq!(Value::INT(1).compare(&Value::INT(2)), Some(Ordering::Less));
     assert_eq!(
-        Value::FLOAT(1.5.into()) * Value::FLOAT(2.0.into()),
-        Value::FLOAT(3.0.into())
+        Value::INT(2).compare(&Value::float(2.0)),
+        Some(Ordering::Equal)
     );
     assert_eq!(
-        Value::FLOAT(4.0.into()) - Value::FLOAT(1.0.into()),
-        Value::FLOAT(3.0.into())
+        Value::BIGINT(3_000_000_000).compare(&Value::INT(7)),
+        Some(Ordering::Greater)
     );
     assert_eq!(
-        Value::FLOAT(4.0.into()) / Value::FLOAT(2.0.into()),
-        Value::FLOAT(2.0.into())
+        Value::float(-0.5).compare(&Value::BIGINT(0)),
+        Some(Ordering::Less)
     );
-    assert!(Value::INT(1) < Value::INT(2));
+    assert_eq!(Value::BOOLEAN(true).compare(&Value::INT(1)), None);
+    assert_eq!(Value::TIMESTAMP(5).compare(&Value::BIGINT(5)), None);
     assert_eq!(Value::TIMESTAMP(5).data_type(), DataType::TIMESTAMP);
     assert_eq!(Value::BOOLEAN(true).data_type(), DataType::BOOLEAN);
 }
