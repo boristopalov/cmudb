@@ -7,6 +7,7 @@ use std::fmt;
 use std::ops::Bound;
 
 use crate::buffer_pool::BpmError;
+use crate::catalog::CatalogError;
 use crate::catalog::index_schema::{IndexKey, IndexValue};
 use crate::index::page_codec::PageCodecError;
 pub use b_plus_tree::*;
@@ -25,11 +26,16 @@ pub trait Index {
 pub enum IndexError {
     Insert(InsertError),
     Remove(RemoveError),
-    KeyLength { expected: usize, actual: usize },
+    KeyLength {
+        expected: usize,
+        actual: usize,
+    },
     UnsupportedKeyLength(u32),
     BpmError(BpmError),
     PageError(PageCodecError),
     Structure(&'static str),
+    /// A key column could not be read from a table tuple.
+    Catalog(CatalogError),
 }
 
 #[derive(Debug)]
@@ -54,6 +60,12 @@ impl From<PageCodecError> for IndexError {
     }
 }
 
+impl From<CatalogError> for IndexError {
+    fn from(err: CatalogError) -> Self {
+        IndexError::Catalog(err)
+    }
+}
+
 impl From<RemoveError> for IndexError {
     fn from(err: RemoveError) -> Self {
         IndexError::Remove(err)
@@ -74,6 +86,7 @@ impl fmt::Display for IndexError {
             IndexError::BpmError(e) => write!(f, "BPM error: {e}"),
             IndexError::PageError(e) => write!(f, "page decode/encode error: {e}"),
             IndexError::Structure(msg) => write!(f, "b+ tree structure violated: {msg}"),
+            IndexError::Catalog(e) => write!(f, "cannot read the key from the tuple: {e:?}"),
         }
     }
 }
@@ -106,6 +119,11 @@ mod tests {
         assert_eq!(e.to_string(), "page decode/encode error: bad page magic");
         let e: IndexError = BpmError::NoFreeFrame.into();
         assert!(e.to_string().starts_with("BPM error"));
+        let e: IndexError = CatalogError::TupleSchemaMismatch.into();
+        assert_eq!(
+            e.to_string(),
+            "cannot read the key from the tuple: TupleSchemaMismatch"
+        );
         let cases = [
             (
                 IndexError::Insert(InsertError::DuplicateKey),

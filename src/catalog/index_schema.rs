@@ -96,18 +96,20 @@ impl TableIndex {
         })
     }
 
-    /// Encodes the key columns of a table tuple, or returns `None` when any of them is NULL.
-    pub fn key_of_tuple(&self, tuple: &Tuple) -> Option<IndexKey> {
-        let values = self
-            .indexed_col_idxs
-            .iter()
-            .map(|&i| {
-                self.table_schema
-                    .get_value(tuple, i)
-                    .expect("indexed column index was validated against the table schema")
-            })
-            .collect::<Option<Vec<Value>>>()?;
-        Some(self.key_of_values(&values))
+    /// Encodes the key columns of a table tuple, or returns `Ok(None)` when any of them is
+    /// NULL.
+    ///
+    /// Fails with [`IndexError::Catalog`] when a key column cannot be read from the tuple, such
+    /// as a tuple too short for the table schema.
+    pub fn key_of_tuple(&self, tuple: &Tuple) -> Result<Option<IndexKey>, IndexError> {
+        let mut values = Vec::with_capacity(self.indexed_col_idxs.len());
+        for &i in &self.indexed_col_idxs {
+            match self.table_schema.get_value(tuple, i)? {
+                Some(v) => values.push(v),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(self.key_of_values(&values)))
     }
 
     fn key_of_values(&self, vals: &[Value]) -> IndexKey {
@@ -133,7 +135,7 @@ impl TableIndex {
     /// Files `rid` under the tuple's key. A tuple with a NULL key column is skipped, and adding
     /// an entry that already exists is a no-op.
     pub fn insert(&self, tuple: &Tuple, rid: RecordId) -> InsertResult {
-        let Some(key) = self.key_of_tuple(tuple) else {
+        let Some(key) = self.key_of_tuple(tuple)? else {
             return Ok(());
         };
         match self
@@ -148,7 +150,7 @@ impl TableIndex {
     /// Removes the entry filing `rid` under the tuple's key. A tuple with a NULL key column is
     /// skipped.
     pub fn remove(&self, tuple: &Tuple, rid: RecordId) -> RemoveResult {
-        match self.key_of_tuple(tuple) {
+        match self.key_of_tuple(tuple)? {
             Some(key) => self.idx.remove(self.entry_key(&key, rid)),
             None => Ok(()),
         }
@@ -220,7 +222,8 @@ mod tests {
 
     use super::TableIndex;
 
-    use crate::catalog::{DataType, IndexType, Schema, Value};
+    use crate::catalog::{CatalogError, DataType, IndexType, Schema, Value};
+    use crate::index::IndexError;
 
     use crate::table_heap::RecordId;
 
@@ -252,8 +255,43 @@ mod tests {
             TableIndex::new(bpm, "i".into(), schema, vec![0, 2], IndexType::BPlusTree).unwrap();
 
         assert_eq!(8, index.schema.data_len);
-        let key = index.key_of_tuple(&tuple).expect("no NULL key columns");
+        let key = index
+            .key_of_tuple(&tuple)
+            .unwrap()
+            .expect("no NULL key columns");
         assert_eq!(key, index.key_of_values(&[Value::INT(12), Value::INT(13)]));
+    }
+
+    #[test]
+    fn a_tuple_too_short_for_the_table_schema_is_an_error_not_a_panic() {
+        let table_schema = Schema::new(vec![
+            (DataType::INT, "a".to_string()),
+            (DataType::INT, "b".to_string()),
+            (DataType::INT, "c".to_string()),
+        ]);
+        let one_col = Schema::new(vec![(DataType::INT, "a".to_string())]);
+        let short = one_col.encode_tuple(&[Some(Value::INT(1))]).unwrap();
+        let (bpm, _dir) = crate::testing::bpm(10);
+        let index =
+            TableIndex::new(bpm, "i".into(), table_schema, vec![2], IndexType::BPlusTree).unwrap();
+
+        assert!(matches!(
+            index.key_of_tuple(&short),
+            Err(IndexError::Catalog(CatalogError::TupleSchemaMismatch))
+        ));
+        assert!(matches!(
+            index.insert(&short, rid(0)),
+            Err(IndexError::Catalog(CatalogError::TupleSchemaMismatch))
+        ));
+        assert!(matches!(
+            index.remove(&short, rid(0)),
+            Err(IndexError::Catalog(CatalogError::TupleSchemaMismatch))
+        ));
+        let entries: Vec<_> = index
+            .scan(Bound::Unbounded, Bound::Unbounded)
+            .unwrap()
+            .collect();
+        assert!(entries.is_empty(), "a failed insert stores nothing");
     }
 
     #[test]
@@ -273,7 +311,7 @@ mod tests {
         .unwrap();
         let null_key = schema.encode_tuple(&[None, Some(Value::INT(1))]).unwrap();
 
-        assert!(index.key_of_tuple(&null_key).is_none());
+        assert!(index.key_of_tuple(&null_key).unwrap().is_none());
         index
             .insert(&null_key, rid(0))
             .expect("NULL keys are skipped");
