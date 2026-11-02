@@ -131,11 +131,11 @@ handoff:
   skip_when: [list is empty, list unchanged since the last handoff post]
   coordinator:
     max_running: stages.implement.max_parallel
-    skip: issues with a running agent
+    skip: issues not in Todo now, or with a running agent   # the post is a snapshot; check Linear first
     # An unchanged list posts nothing, so issues left over when all slots were
     # full would wait for the next change to Todo. When an implement agent
-    # finishes, the coordinator starts the next issue from the latest handoff.
-    on_agent_done: start the next issue from the latest handoff post
+    # finishes, the coordinator starts the next one still in Todo.
+    on_agent_done: start the highest-priority issue from the latest handoff post that is still in Todo
 
 # When the loop pings Boris. Everything else, agents handle.
 ping_boris:
