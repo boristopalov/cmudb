@@ -661,4 +661,67 @@ mod tests {
             "frame stayed pinned after its last guard dropped"
         );
     }
+
+    const MISS_STALL_WINDOW: Duration = Duration::from_millis(200);
+    const UNBLOCKED_LIMIT: Duration = Duration::from_secs(5);
+
+    fn wait_until(limit: Duration, condition: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        condition()
+    }
+
+    #[test]
+    fn a_hit_waits_while_a_miss_holds_the_meta_lock_through_its_disk_requests() {
+        let (bpm, _dir) = make_bpm(2);
+        let evicted = bpm.new_page().unwrap().page_id().unwrap();
+        drop(bpm.new_page().unwrap());
+        let resident = bpm.new_page().unwrap().page_id().unwrap();
+        assert!(
+            !bpm.is_resident(evicted),
+            "setup expected the first page to be evicted"
+        );
+        let resident_pin = bpm.read_page(resident).unwrap();
+
+        let disk_stalled = bpm.scheduler.lock();
+        let miss = {
+            let bpm = Arc::clone(&bpm);
+            thread::spawn(move || bpm.read_page(evicted).is_ok())
+        };
+        assert!(
+            wait_until(UNBLOCKED_LIMIT, || bpm.meta.is_locked()),
+            "the miss never took the meta lock"
+        );
+
+        let (hit_done_tx, hit_done_rx) = mpsc::channel();
+        {
+            let bpm = Arc::clone(&bpm);
+            thread::spawn(move || {
+                let hit = bpm.read_page(resident).is_ok();
+                let _ = hit_done_tx.send(hit);
+            });
+        }
+        assert!(
+            hit_done_rx.recv_timeout(MISS_STALL_WINDOW).is_err(),
+            "a hit finished while a miss was waiting on disk; if misses no longer hold the meta \
+             lock across disk I/O, update the miss bullet in buffer_pool_manager.md and flip this test"
+        );
+
+        drop(disk_stalled);
+        assert_eq!(
+            hit_done_rx.recv_timeout(UNBLOCKED_LIMIT).ok(),
+            Some(true),
+            "the hit did not finish once the miss's disk requests could run"
+        );
+        assert!(
+            miss.join().unwrap(),
+            "the miss failed after its disk requests ran"
+        );
+        drop(resident_pin);
+    }
 }
