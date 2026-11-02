@@ -5,7 +5,8 @@ use crate::catalog::Value;
 use crate::catalog::{Catalog, DataType, Schema};
 use crate::parser::{
     BoundCreateIndex, BoundCreateTable, BoundDelete, BoundDropIndex, BoundDropTable, BoundInsert,
-    BoundJoin, BoundSelect, BoundStatement, BoundUpdate, BoundValues, Scope, TableScope,
+    BoundJoin, BoundSelect, BoundStatement, BoundUpdate, BoundValues, BoundWindow, Scope,
+    TableScope,
 };
 use crate::processor::plan::{
     AggType, AggregationPlanNode, ColIdx, ColumnAssignment, CreateIndexPlanNode,
@@ -13,7 +14,7 @@ use crate::processor::plan::{
     ExternalMergeSortPlanNode, FilterPlanNode, HashJoinPlanNode, IndexScanPlanNode, InsertPlanNode,
     JoinColumn, JoinPredicate, JoinType, LimitPlanNode, NestedIndexJoinPlanNode,
     NestedLoopJoinPlanNode, Op, Plan, ProjectionPlanNode, SeqScanPlanNode, Side, UpdatePlanNode,
-    ValuesPlanNode,
+    ValuesPlanNode, WindowFunctionPlanNode,
 };
 
 /// Turns bound statements into plans, without statistics or a cost model.
@@ -25,6 +26,8 @@ use crate::processor::plan::{
 /// equalities, with the rest of the condition as its residual. Everything else is a `SeqScan`
 /// or a `NestedLoopJoin`. `ORDER BY` is an `ExternalMergeSort`, which sorts in memory until
 /// its input passes the executor's sort memory budget and spills sorted runs after that.
+/// Window functions run in one `WindowFunction` node per distinct OVER clause, stacked over the
+/// filtered FROM output, each passing its input's columns through and appending its calls.
 pub struct Planner<'a> {
     catalog: &'a Catalog,
 }
@@ -42,6 +45,9 @@ pub enum PlannerError {
     JoinSides { tables: usize },
     /// A CREATE INDEX key column is not a column of the indexed table.
     UnknownIndexColumn { column: String },
+    /// The planned FROM output has `planned` columns, but the binder placed the SELECT's window
+    /// call results after `bound` FROM columns.
+    WindowInputWidth { bound: usize, planned: usize },
 }
 
 impl fmt::Display for PlannerError {
@@ -57,6 +63,10 @@ impl fmt::Display for PlannerError {
             PlannerError::UnknownIndexColumn { column } => {
                 write!(f, "CREATE INDEX references unknown column: {column}")
             }
+            PlannerError::WindowInputWidth { bound, planned } => write!(
+                f,
+                "window calls were bound after {bound} FROM columns, but the planned FROM output has {planned}"
+            ),
         }
     }
 }
@@ -90,6 +100,7 @@ impl<'a> Planner<'a> {
             filters,
             group_bys,
             aggregates,
+            windows,
             sort,
             limit,
         } = sel;
@@ -131,6 +142,17 @@ impl<'a> Planner<'a> {
                 predicate: pred,
                 child: Box::new(plan),
             });
+        }
+
+        if !windows.is_empty() {
+            check_window_input_width(&scope, &source_schema)?;
+        }
+        let mut window_calls = 0;
+        for window in windows {
+            let window_schema = window_output_schema(&window, &source_schema, window_calls);
+            window_calls += window.calls.len();
+            plan = window_plan(window, plan, &source_schema, window_schema.clone());
+            source_schema = window_schema;
         }
 
         if !group_bys.is_empty() || !aggregates.is_empty() {
@@ -530,6 +552,57 @@ fn output_column_name(
         .unwrap_or_else(fallback)
 }
 
+/// Checks that `input`, the planned FROM output, is as wide as the FROM output the binder placed
+/// window call results after: every column of every table in `scope`.
+fn check_window_input_width(scope: &Scope, input: &Schema) -> Result<(), PlannerError> {
+    let bound = scope.values().map(|ts| ts.schema.cols.len()).sum();
+    let planned = input.cols.len();
+    if bound == planned {
+        Ok(())
+    } else {
+        Err(PlannerError::WindowInputWidth { bound, planned })
+    }
+}
+
+/// The input's columns followed by one column per call of `window`, named after the call's
+/// function and its position `first_call..` among the SELECT's window calls.
+fn window_output_schema(window: &BoundWindow, input: &Schema, first_call: usize) -> Schema {
+    let input_cols = input.cols.iter().map(|c| (c.dtype, c.name.clone()));
+    let call_cols = window.calls.iter().enumerate().map(|(i, call)| {
+        (
+            call.dtype,
+            format!("{}_{}", agg_type_name(&call.agg_type), first_call + i),
+        )
+    });
+    Schema::new(input_cols.chain(call_cols).collect())
+}
+
+/// A `WindowFunction` node over `child` that passes every column of `input` through and
+/// appends `window`'s calls.
+fn window_plan(window: BoundWindow, child: Plan, input: &Schema, schema: Schema) -> Plan {
+    let columns = input
+        .cols
+        .iter()
+        .enumerate()
+        .map(|(i, c)| Expression::Column {
+            col: ColIdx(i as u32),
+            dtype: c.dtype,
+        })
+        .collect();
+    Plan::WindowFunction(WindowFunctionPlanNode {
+        schema,
+        child: Box::new(child),
+        order_by_exprs: (!window.order_by.is_empty()).then_some(window.order_by),
+        partition_by_exprs: (!window.partition_by.is_empty()).then_some(window.partition_by),
+        aggregates: window
+            .calls
+            .into_iter()
+            .map(|call| (call.arg, call.agg_type))
+            .collect(),
+        columns,
+    })
+}
+
 /// One column per group-by expression followed by one column per aggregate, the row
 /// layout `AggregationExecutor` emits.
 fn aggregation_output_schema(
@@ -772,6 +845,24 @@ mod tests {
     }
 
     #[test]
+    fn window_input_narrower_than_the_bound_from_output_is_rejected() {
+        let scope = Scope::from([("a".to_string(), table_scope(Side::Left, &["x", "y"]))]);
+        let one_column = Schema::new(vec![(DataType::INT, "x".to_string())]);
+        let err = super::check_window_input_width(&scope, &one_column).unwrap_err();
+        assert_eq!(
+            err,
+            PlannerError::WindowInputWidth {
+                bound: 2,
+                planned: 1
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "window calls were bound after 2 FROM columns, but the planned FROM output has 1"
+        );
+    }
+
+    #[test]
     fn join_without_one_left_and_one_right_table_is_rejected() {
         let scope = Scope::from([
             ("a".to_string(), table_scope(Side::Left, &["x"])),
@@ -787,6 +878,7 @@ mod tests {
             filters: None,
             group_bys: vec![],
             aggregates: vec![],
+            windows: vec![],
             sort: None,
             limit: None,
         }));

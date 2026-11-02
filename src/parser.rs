@@ -9,7 +9,7 @@ use sqlparser::ast::{
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Insert, JoinConstraint,
     JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderByExpr, OrderByKind,
     Query, SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins, Update,
-    Value as SqlValue,
+    Value as SqlValue, WindowSpec, WindowType,
 };
 
 use crate::catalog::{Catalog, DataType, Schema, Value};
@@ -22,6 +22,10 @@ use crate::processor::plan::{
 /// every row.
 const COUNT_STAR_ARGUMENT: Expression = Expression::Constant(Some(Value::INT(1)));
 
+/// Argument bound for `RANK()`, which reads no value: the window executor ranks rows by their
+/// peer group.
+const RANK_ARGUMENT: Expression = Expression::Constant(None);
+
 /// Resolves parsed SQL statements against the catalog into bound statements for the planner.
 pub struct Binder<'a> {
     pub catalog: &'a Catalog,
@@ -32,6 +36,9 @@ pub struct Binder<'a> {
     /// function's argument and should not perform group-by / aggregate
     /// rewrites — bare column refs are legal there.
     inside_agg_arg: Cell<bool>,
+    /// Window function calls of the non-aggregating SELECT whose projection or ORDER BY is
+    /// being resolved. `None` everywhere else, which is where window functions are rejected.
+    window_ctx: RefCell<Option<WindowCtx>>,
 }
 
 /// Bookkeeping accumulated by the binder while resolving an aggregating
@@ -46,6 +53,55 @@ struct AggCtx {
     group_bys: Vec<Expression>,
     /// Discovered aggregate function calls, in projection / ORDER BY order.
     aggregates: Vec<(Expression, AggType)>,
+}
+
+/// Window function calls found while resolving a SELECT's projection and ORDER BY, grouped by
+/// OVER clause. Each call first resolves to the placeholder column `input_width + n`, where `n`
+/// counts the calls found before it; [`WindowCtx::output_columns`] maps each placeholder to the
+/// call's column in the window output.
+struct WindowCtx {
+    /// Number of columns in the FROM output, which the window output starts with.
+    input_width: usize,
+    /// The OVER clause of each entry of `windows`, matched by structural equality so calls over
+    /// the same window share one.
+    specs: Vec<WindowSpec>,
+    windows: Vec<BoundWindow>,
+    /// For each call in discovery order, its window and its position among that window's calls.
+    calls: Vec<(usize, usize)>,
+}
+
+impl WindowCtx {
+    fn new(input_width: usize) -> Self {
+        Self {
+            input_width,
+            specs: vec![],
+            windows: vec![],
+            calls: vec![],
+        }
+    }
+
+    /// Where each call, in discovery order, lands in the window output: after the FROM columns
+    /// and the calls of every earlier window.
+    fn output_columns(&self) -> Vec<ColIdx> {
+        let mut first_call_col = Vec::with_capacity(self.windows.len());
+        let mut next = self.input_width;
+        for w in &self.windows {
+            first_call_col.push(next);
+            next += w.calls.len();
+        }
+        self.calls
+            .iter()
+            .map(|&(window, pos)| ColIdx((first_call_col[window] + pos) as u32))
+            .collect()
+    }
+
+    /// `expr` with each window call placeholder replaced by the call's output column.
+    fn place_calls(&self, expr: Expression, output: &[ColIdx]) -> Expression {
+        expr.map_columns(|col| match col.index().checked_sub(self.input_width) {
+            Some(call) => output[call],
+            None => col,
+        })
+    }
 }
 
 /// Why a parsed statement could not be bound against the catalog.
@@ -66,6 +122,16 @@ pub enum BinderError {
     AggregateOutsideProjection,
     /// An aggregate call appears inside another aggregate's argument.
     NestedAggregate,
+    /// A window function call appears outside a SELECT projection and ORDER BY, such as in WHERE.
+    WindowOutsideProjection,
+    /// A window function call appears inside a function argument or an OVER clause.
+    NestedWindowFunction,
+    /// A function the window executor does not compute is called with OVER.
+    UnknownWindowFunction { function: String },
+    /// A window-only function such as RANK is called without OVER.
+    WindowFunctionWithoutOver { function: String },
+    /// A window function that reads no argument, such as RANK, is passed one.
+    WindowFunctionArguments { function: String },
     /// An aggregate is called without a parenthesized argument list.
     AggregateWithoutArguments { function: String },
     /// An aggregate is called with other than one argument.
@@ -118,6 +184,21 @@ impl fmt::Display for BinderError {
             }
             BinderError::NestedAggregate => {
                 f.write_str("nested aggregate functions are not allowed")
+            }
+            BinderError::WindowOutsideProjection => {
+                f.write_str("window functions are only allowed in a SELECT projection or ORDER BY")
+            }
+            BinderError::NestedWindowFunction => f.write_str(
+                "window functions cannot be nested inside a function argument or an OVER clause",
+            ),
+            BinderError::UnknownWindowFunction { function } => {
+                write!(f, "unsupported window function: {function}")
+            }
+            BinderError::WindowFunctionWithoutOver { function } => {
+                write!(f, "{function}() requires an OVER clause")
+            }
+            BinderError::WindowFunctionArguments { function } => {
+                write!(f, "{function}() takes no arguments")
             }
             BinderError::AggregateWithoutArguments { function } => {
                 write!(f, "aggregate `{function}` must be called with arguments")
@@ -227,6 +308,18 @@ pub enum Unsupported {
     AggregateNamedArgument,
     /// A qualified wildcard such as `t.*` passed to an aggregate.
     AggregateQualifiedWildcard,
+    /// An explicit window frame (`ROWS`, `RANGE` or `GROUPS`). The window executor computes
+    /// only the default frame: the whole partition without ORDER BY, and the rows up to the
+    /// current row's last peer with it.
+    WindowFrame,
+    /// A named window, `OVER w` or a `WINDOW` clause.
+    NamedWindow,
+    /// FILTER, IGNORE NULLS or WITHIN GROUP on a window function call.
+    WindowFunctionClauses,
+    /// A window function call in a SELECT with GROUP BY or aggregate functions.
+    WindowInAggregatingSelect,
+    /// A `QUALIFY` filter on window function results.
+    Qualify,
     /// An INSERT target that is not a table name, such as a table function.
     InsertTarget,
     /// An INSERT with no source rows.
@@ -292,6 +385,19 @@ impl fmt::Display for Unsupported {
             Unsupported::AggregateQualifiedWildcard => {
                 "qualified wildcards in aggregates are not supported"
             }
+            Unsupported::WindowFrame => {
+                "window frame clauses (ROWS / RANGE / GROUPS) are not supported"
+            }
+            Unsupported::NamedWindow => {
+                "named windows are not supported; write the window inline in OVER (...)"
+            }
+            Unsupported::WindowFunctionClauses => {
+                "FILTER, IGNORE NULLS and WITHIN GROUP are not supported on window functions"
+            }
+            Unsupported::WindowInAggregatingSelect => {
+                "window functions in a SELECT with GROUP BY or aggregate functions are not supported"
+            }
+            Unsupported::Qualify => "QUALIFY is not supported",
             Unsupported::InsertTarget => "unsupported INSERT target",
             Unsupported::InsertWithoutSource => "INSERT without source",
             Unsupported::InsertSource => "INSERT requires VALUES",
@@ -317,10 +423,16 @@ impl<'a> Binder<'a> {
             catalog,
             agg_ctx: RefCell::new(None),
             inside_agg_arg: Cell::new(false),
+            window_ctx: RefCell::new(None),
         }
     }
 
     fn resolve_expr(&self, expr: &Expr, scope: &Scope) -> Result<Expression, BinderError> {
+        if let Expr::Function(f) = expr
+            && let Some(over) = &f.over
+        {
+            return self.register_window_call(f, over, scope);
+        }
         if self.inside_agg_arg.get() {
             reject_nested_aggregate(expr)?;
         } else if let Some(rewritten) = self.rewrite_for_aggregation(expr, scope)? {
@@ -417,10 +529,25 @@ impl<'a> Binder<'a> {
                 Ok(Expression::Constant(val))
             }
 
+            Expr::Function(f) if is_window_only_function(&f.name) => {
+                Err(BinderError::WindowFunctionWithoutOver {
+                    function: f.name.to_string(),
+                })
+            }
+
             other => Err(BinderError::UnsupportedExpression {
                 expr: other.to_string(),
             }),
         }
+    }
+
+    /// Runs `f` as the binder runs an aggregate's argument, where aggregate and window calls are
+    /// rejected as nested.
+    fn resolve_nested<R>(&self, f: impl FnOnce() -> R) -> R {
+        let was_inside = self.inside_agg_arg.replace(true);
+        let result = f();
+        self.inside_agg_arg.set(was_inside);
+        result
     }
 
     /// Inside an aggregating SELECT, maps an expression equal to a GROUP BY expression, or an
@@ -466,6 +593,33 @@ impl<'a> Binder<'a> {
         if self.agg_ctx.borrow().is_none() {
             return Err(BinderError::AggregateOutsideProjection);
         }
+        let arg_expr = self.bind_aggregate_argument(f, scope, &agg_type)?;
+        let result_dtype = aggregate_result_type(&agg_type, &arg_expr).ok_or_else(|| {
+            BinderError::UntypedAggregateArgument {
+                function: f.name.to_string(),
+            }
+        })?;
+
+        let mut ctx_mut = self.agg_ctx.borrow_mut();
+        let ctx = ctx_mut
+            .as_mut()
+            .ok_or(BinderError::AggregateOutsideProjection)?;
+        let col_idx = ctx.group_bys.len() + ctx.aggregates.len();
+        ctx.aggregates.push((arg_expr, agg_type));
+        Ok(Expression::Column {
+            col: ColIdx(col_idx as u32),
+            dtype: result_dtype,
+        })
+    }
+
+    /// Binds the single argument of an aggregate call `f`, with `*` standing for every row of a
+    /// COUNT.
+    fn bind_aggregate_argument(
+        &self,
+        f: &Function,
+        scope: &Scope,
+        agg_type: &AggType,
+    ) -> Result<Expression, BinderError> {
         let FunctionArguments::List(list) = &f.args else {
             return Err(BinderError::AggregateWithoutArguments {
                 function: f.name.to_string(),
@@ -487,42 +641,110 @@ impl<'a> Binder<'a> {
             return Err(Unsupported::AggregateNamedArgument.into());
         };
 
-        let arg_expr = match arg {
+        match arg {
             FunctionArgExpr::Wildcard => {
                 if !matches!(agg_type, AggType::COUNT) {
                     return Err(BinderError::StarArgumentNotCount {
                         function: f.name.to_string(),
                     });
                 }
-                COUNT_STAR_ARGUMENT
+                Ok(COUNT_STAR_ARGUMENT)
             }
-            FunctionArgExpr::Expr(e) => {
-                let was_inside = self.inside_agg_arg.replace(true);
-                let result = self.resolve_expr(e, scope);
-                self.inside_agg_arg.set(was_inside);
-                result?
-            }
+            FunctionArgExpr::Expr(e) => self.resolve_nested(|| self.resolve_expr(e, scope)),
             FunctionArgExpr::QualifiedWildcard(_) | FunctionArgExpr::WildcardWithOptions(_) => {
-                return Err(Unsupported::AggregateQualifiedWildcard.into());
+                Err(Unsupported::AggregateQualifiedWildcard.into())
             }
-        };
+        }
+    }
 
-        let result_dtype = aggregate_result_type(&agg_type, &arg_expr).ok_or_else(|| {
+    /// Records a window function call `f OVER over` of the current SELECT and returns the
+    /// placeholder column that [`WindowCtx::place_calls`] later moves to the call's result.
+    fn register_window_call(
+        &self,
+        f: &Function,
+        over: &WindowType,
+        scope: &Scope,
+    ) -> Result<Expression, BinderError> {
+        if self.inside_agg_arg.get() {
+            return Err(BinderError::NestedWindowFunction);
+        }
+        if self.agg_ctx.borrow().is_some() {
+            return Err(Unsupported::WindowInAggregatingSelect.into());
+        }
+        if self.window_ctx.borrow().is_none() {
+            return Err(BinderError::WindowOutsideProjection);
+        }
+        let agg_type = parse_window_function_type(&f.name).ok_or_else(|| {
+            BinderError::UnknownWindowFunction {
+                function: f.name.to_string(),
+            }
+        })?;
+        if f.filter.is_some() || f.null_treatment.is_some() || !f.within_group.is_empty() {
+            return Err(Unsupported::WindowFunctionClauses.into());
+        }
+        let arg = match agg_type {
+            AggType::RANK => {
+                reject_arguments(f)?;
+                RANK_ARGUMENT
+            }
+            _ => self.bind_aggregate_argument(f, scope, &agg_type)?,
+        };
+        let dtype = aggregate_result_type(&agg_type, &arg).ok_or_else(|| {
             BinderError::UntypedAggregateArgument {
                 function: f.name.to_string(),
             }
         })?;
+        let window = self.window_for(inline_window_spec(over)?, scope)?;
 
-        let mut ctx_mut = self.agg_ctx.borrow_mut();
+        let mut ctx_mut = self.window_ctx.borrow_mut();
         let ctx = ctx_mut
             .as_mut()
-            .ok_or(BinderError::AggregateOutsideProjection)?;
-        let col_idx = ctx.group_bys.len() + ctx.aggregates.len();
-        ctx.aggregates.push((arg_expr, agg_type));
+            .ok_or(BinderError::WindowOutsideProjection)?;
+        let placeholder = ctx.input_width + ctx.calls.len();
+        ctx.calls.push((window, ctx.windows[window].calls.len()));
+        ctx.windows[window].calls.push(BoundWindowCall {
+            arg,
+            agg_type,
+            dtype,
+        });
         Ok(Expression::Column {
-            col: ColIdx(col_idx as u32),
-            dtype: result_dtype,
+            col: ColIdx(placeholder as u32),
+            dtype,
         })
+    }
+
+    /// The index of the current SELECT's window over `spec`, binding it on its first use.
+    fn window_for(&self, spec: &WindowSpec, scope: &Scope) -> Result<usize, BinderError> {
+        let existing = self
+            .window_ctx
+            .borrow()
+            .as_ref()
+            .and_then(|ctx| ctx.specs.iter().position(|s| s == spec));
+        if let Some(window) = existing {
+            return Ok(window);
+        }
+        let window = self.resolve_nested(|| {
+            Ok::<_, BinderError>(BoundWindow {
+                partition_by: spec
+                    .partition_by
+                    .iter()
+                    .map(|e| self.resolve_expr(e, scope))
+                    .collect::<Result<_, _>>()?,
+                order_by: spec
+                    .order_by
+                    .iter()
+                    .map(|oe| self.resolve_sort_expr(oe, scope))
+                    .collect::<Result<_, _>>()?,
+                calls: vec![],
+            })
+        })?;
+        let mut ctx_mut = self.window_ctx.borrow_mut();
+        let ctx = ctx_mut
+            .as_mut()
+            .ok_or(BinderError::WindowOutsideProjection)?;
+        ctx.specs.push(spec.clone());
+        ctx.windows.push(window);
+        Ok(ctx.windows.len() - 1)
     }
 
     /// Runs `f` with `ctx` as the active aggregation context, then restores the previous context.
@@ -552,6 +774,12 @@ impl<'a> Binder<'a> {
             }
 
             SetExpr::Select(s) => {
+                if !s.named_window.is_empty() {
+                    return Err(Unsupported::NamedWindow.into());
+                }
+                if s.qualify.is_some() {
+                    return Err(Unsupported::Qualify.into());
+                }
                 let (scope, join) = self.build_select_scope(&s.from)?;
                 let filters = s
                     .selection
@@ -582,12 +810,35 @@ impl<'a> Binder<'a> {
                     group_bys,
                     aggregates: vec![],
                 });
+                let from_width = scope.values().map(|ts| ts.schema.cols.len()).sum();
+                let window_ctx = (!aggregating).then(|| WindowCtx::new(from_width));
+                let prev_window_ctx = self.window_ctx.replace(window_ctx);
                 let (resolved, agg_ctx) = self.with_agg_ctx(agg_ctx, || {
                     let projections = self.resolve_projections(&s.projection, &scope)?;
                     let sort = self.resolve_order_by(q, &scope)?;
                     Ok::<_, BinderError>((projections, sort))
                 });
-                let (projections, sort) = resolved?;
+                let window_ctx = self.window_ctx.replace(prev_window_ctx);
+                let (mut projections, mut sort) = resolved?;
+                let windows = match window_ctx {
+                    Some(ctx) if !ctx.calls.is_empty() => {
+                        let output = ctx.output_columns();
+                        projections = projections
+                            .into_iter()
+                            .map(|e| ctx.place_calls(e, &output))
+                            .collect();
+                        sort = sort.map(|keys| {
+                            keys.into_iter()
+                                .map(|key| SortExpr {
+                                    expr: ctx.place_calls(key.expr, &output),
+                                    ..key
+                                })
+                                .collect()
+                        });
+                        ctx.windows
+                    }
+                    _ => vec![],
+                };
                 let limit = resolve_limit(q.limit_clause.as_ref())?;
                 let (group_bys, aggregates) = agg_ctx
                     .map(|ctx| (ctx.group_bys, ctx.aggregates))
@@ -600,6 +851,7 @@ impl<'a> Binder<'a> {
                     filters,
                     group_bys,
                     aggregates,
+                    windows,
                     sort,
                     limit,
                 }))
@@ -1076,6 +1328,54 @@ fn parse_agg_type(name: &ObjectName) -> Option<AggType> {
     }
 }
 
+/// Maps a window function name to the function the window executor computes, case-insensitively:
+/// every aggregate plus RANK. Returns `None` for any other function name.
+fn parse_window_function_type(name: &ObjectName) -> Option<AggType> {
+    if is_window_only_function(name) {
+        return Some(AggType::RANK);
+    }
+    parse_agg_type(name)
+}
+
+/// True for RANK, the one function the binder accepts only with an OVER clause.
+fn is_window_only_function(name: &ObjectName) -> bool {
+    matches!(
+        name.0.as_slice(),
+        [ObjectNamePart::Identifier(id)] if id.value.eq_ignore_ascii_case("RANK")
+    )
+}
+
+/// Rejects a call `f` that passes any argument, as `RANK(x)` does.
+fn reject_arguments(f: &Function) -> Result<(), BinderError> {
+    match &f.args {
+        FunctionArguments::List(list)
+            if list.args.is_empty()
+                && list.duplicate_treatment.is_none()
+                && list.clauses.is_empty() =>
+        {
+            Ok(())
+        }
+        _ => Err(BinderError::WindowFunctionArguments {
+            function: f.name.to_string(),
+        }),
+    }
+}
+
+/// The inline `OVER (PARTITION BY ... ORDER BY ...)` clause of a window call, rejecting named
+/// windows and explicit frames.
+fn inline_window_spec(over: &WindowType) -> Result<&WindowSpec, BinderError> {
+    let WindowType::WindowSpec(spec) = over else {
+        return Err(Unsupported::NamedWindow.into());
+    };
+    if spec.window_name.is_some() {
+        return Err(Unsupported::NamedWindow.into());
+    }
+    if spec.window_frame.is_some() {
+        return Err(Unsupported::WindowFrame.into());
+    }
+    Ok(spec)
+}
+
 /// True iff any projection item syntactically contains an aggregate function
 /// call. Used to decide whether to set up an aggregation context even when
 /// the query has no GROUP BY (`SELECT COUNT(*) FROM t`).
@@ -1110,17 +1410,17 @@ fn column_path(expr: &Expr) -> Option<String> {
     }
 }
 
-/// COUNT yields INT; every other aggregate yields its argument's type.
+/// COUNT and RANK yield INT; every other aggregate yields its argument's type.
 fn aggregate_result_type(agg_type: &AggType, arg: &Expression) -> Option<DataType> {
     match agg_type {
-        AggType::COUNT => Some(DataType::INT),
+        AggType::COUNT | AggType::RANK => Some(DataType::INT),
         _ => arg.dtype(),
     }
 }
 
 fn expr_has_aggregate(e: &Expr) -> bool {
     match e {
-        Expr::Function(f) => parse_agg_type(&f.name).is_some(),
+        Expr::Function(f) => f.over.is_none() && parse_agg_type(&f.name).is_some(),
         Expr::Nested(inner) => expr_has_aggregate(inner),
         Expr::BinaryOp { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
         _ => false,
@@ -1166,8 +1466,28 @@ pub struct BoundSelect {
     /// and ORDER BY. Each is `(argument_expr, agg_type)` and is evaluated
     /// against the child schema by the AggregationExecutor.
     pub aggregates: Vec<(Expression, AggType)>,
+    /// Window function calls grouped by OVER clause, in order of first use. Empty unless the
+    /// SELECT calls one, and empty whenever `group_bys` or `aggregates` is not. The projection and
+    /// ORDER BY read call `j` of window `k` at column `from_width + c + j`, where `from_width` is
+    /// the FROM output's width and `c` counts the calls of windows `0..k`.
+    pub windows: Vec<BoundWindow>,
     pub sort: Option<Vec<SortExpr>>,
     pub limit: Option<u32>,
+}
+
+/// One OVER clause of a SELECT and the window function calls over it.
+pub struct BoundWindow {
+    pub partition_by: Vec<Expression>,
+    pub order_by: Vec<SortExpr>,
+    pub calls: Vec<BoundWindowCall>,
+}
+
+/// A window function call: its argument, evaluated against the FROM output, the function, and
+/// the type of its result, which the SELECT's projection and ORDER BY read.
+pub struct BoundWindowCall {
+    pub arg: Expression,
+    pub agg_type: AggType,
+    pub dtype: DataType,
 }
 
 pub struct BoundJoin {

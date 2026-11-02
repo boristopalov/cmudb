@@ -376,7 +376,7 @@ fn window(
     Plan::WindowFunction(WindowFunctionPlanNode {
         schema: int_schema(&names),
         child: Box::new(scan(db, "sales", &["dept", "amount"])),
-        order_by_exprs: order,
+        order_by_exprs: order.map(|keys| keys.into_iter().map(SortExpr::ascending).collect()),
         partition_by_exprs: partition,
         aggregates,
         columns: vec![col(0), col(1)],
