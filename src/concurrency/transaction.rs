@@ -1,6 +1,7 @@
 use crate::table_heap::RecordId;
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub type TxnId = u64;
 pub type Timestamp = u64;
@@ -49,6 +50,8 @@ pub struct Transaction {
     read_ts: Timestamp,
     isolation_level: IsolationLevel,
     inner: Mutex<TxnInner>,
+    /// Whether the write-ahead log holds this transaction's [`crate::wal::TxnRecord::Writes`].
+    logged_writes: AtomicBool,
 }
 
 impl Transaction {
@@ -62,7 +65,18 @@ impl Transaction {
                 commit_ts: None,
                 write_set: HashMap::new(),
             }),
+            logged_writes: AtomicBool::new(false),
         }
+    }
+
+    /// Marks the transaction's first write as logged, returning whether it already was.
+    pub(crate) fn mark_writes_logged(&self) -> bool {
+        self.logged_writes.swap(true, Ordering::AcqRel)
+    }
+
+    /// Whether the transaction's first write was logged.
+    pub(crate) fn writes_logged(&self) -> bool {
+        self.logged_writes.load(Ordering::Acquire)
     }
 
     /// The transaction id, which also stamps its uncommitted writes until commit.

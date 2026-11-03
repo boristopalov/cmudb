@@ -143,6 +143,7 @@ fn write_version(
     rid: RecordId,
     new: Option<&Tuple>,
 ) -> Result<(), MvccError> {
+    txn_mgr.log_first_write(txn);
     let pushed_undo = heap.write_with_then(
         rid,
         |meta, bytes| {
@@ -151,6 +152,9 @@ fn write_version(
                 return Err(MvccError::from(TableHeapError::Deleted { rid }));
             }
             let first_write_in_txn = meta.ts != txn.id();
+            if first_write_in_txn {
+                txn_mgr.log_undo(txn, rid, meta, bytes);
+            }
             let undo = first_write_in_txn.then(|| (meta, bytes.to_vec()));
             let write = SlotWrite {
                 meta: TupleMeta {
@@ -224,6 +228,7 @@ fn check_unique(
 /// Inserts `tuple` as a new uncommitted version and files it in every index.
 pub fn insert_tuple(
     txn: &Transaction,
+    txn_mgr: &TransactionManager,
     heap: &TableHeap,
     indexes: &[Arc<IndexInfo>],
     tuple: &Tuple,
@@ -238,6 +243,7 @@ pub fn insert_tuple(
             for info in &indexes {
                 check_unique(txn, heap, info, tuple, None)?;
             }
+            txn_mgr.log_first_write(txn);
             let rid = heap.insert_with_meta(
                 TupleMeta {
                     ts: txn.id(),

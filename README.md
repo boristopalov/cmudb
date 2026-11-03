@@ -11,9 +11,10 @@ cargo run -- mydb   # the same shell on the database in directory mydb/, kept ac
 cargo test
 ```
 
-`cargo run -- mydb` keeps tables, rows and indexes in `mydb/cmudb.data`, written after every
-commit and on exit. There is no WAL yet, so a crash or kill between those writes can damage the
-file. Data folders made before data file version 2 do not open.
+`cargo run -- mydb` keeps tables, rows and indexes in `mydb/cmudb.data`, behind a write-ahead
+log in `mydb/cmudb.log`. A commit is durable once the shell prints it: after a crash or
+`kill -9`, the next open replays the log, keeps every commit and rolls back every transaction
+that had not committed. Data folders made before data file version 2 do not open.
 
 CONTRIBUTING.md lists the checks CI runs, and ARCHITECTURE.md maps the code.
 
@@ -48,7 +49,6 @@ SQL the shell runs:
 ## What's missing:
 - a cost-based optimizer (the planner uses fixed rules and no statistics)
 - serializable isolation
-- a write-ahead log and crash recovery
 - `HAVING`, subqueries, `WITH`, `OFFSET`, `IS NULL`, `NOT`, `LIKE`, `IN`, `CAST`, `%`, string
   functions and `||`, joins of more than two tables, window frames (`ROWS`/`RANGE`) and window
   functions in a `SELECT` that also aggregates

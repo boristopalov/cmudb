@@ -77,6 +77,9 @@ pub enum PersistError {
     Catalog(CatalogError),
     /// Rolling back the transaction `BEGIN` left open failed, so nothing was written.
     AbortOpenTransaction(String),
+    /// Rolling back a transaction a crash left unfinished failed; the log keeps it, so the
+    /// next open tries again.
+    Recovery(String),
 }
 
 impl fmt::Display for PersistError {
@@ -98,6 +101,12 @@ impl fmt::Display for PersistError {
             PersistError::Catalog(e) => write!(f, "catalog: {e}"),
             PersistError::AbortOpenTransaction(e) => {
                 write!(f, "rolling back the open transaction failed: {e}")
+            }
+            PersistError::Recovery(e) => {
+                write!(
+                    f,
+                    "rolling back a transaction left unfinished by a crash failed: {e}"
+                )
             }
         }
     }

@@ -1,6 +1,7 @@
 //! A database opened with `Database::open` keeps its tables, rows and indexes across
 //! closing and reopening it.
 use cmudb::catalog::Value;
+use cmudb::concurrency::IsolationLevel;
 use cmudb::database::Row;
 use cmudb::database_file::{CHAIN_PAGE_CAPACITY, DatabaseMeta, PersistError};
 use cmudb::processor::plan::Plan;
@@ -389,7 +390,6 @@ fn a_new_database_is_on_disk_before_its_first_commit() {
 }
 
 #[test]
-#[ignore = "known gap: BOR-71, pages evicted between commits can link past the recorded allocation"]
 fn a_kill_while_a_block_grows_a_table_leaves_a_database_that_opens() {
     let dir = tempfile::tempdir().unwrap();
     {
@@ -409,4 +409,255 @@ fn a_kill_while_a_block_grows_a_table_leaves_a_database_that_opens() {
     run(&db, &format!("INSERT INTO u VALUES {};", values.join(", ")));
     assert_eq!(rows(&db, "SELECT a FROM t;").len(), 0);
     assert_eq!(rows(&db, "SELECT a FROM u;").len(), 20_000);
+}
+
+fn begin(db: &Database) -> std::sync::Arc<cmudb::concurrency::Transaction> {
+    db.txn_mgr().begin(IsolationLevel::SnapshotIsolation)
+}
+
+#[test]
+fn a_kill_rolls_back_a_transaction_whose_writes_another_commit_made_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open(dir.path());
+        run(
+            &db,
+            "CREATE TABLE t (a INTEGER, b TEXT); CREATE INDEX t_a ON t (a);\
+             INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');",
+        );
+        let open_txn = begin(&db);
+        db.execute_in(
+            &open_txn,
+            "UPDATE t SET b = 'a much longer text than before' WHERE a = 1;\
+             UPDATE t SET b = 'twice' WHERE a = 1;\
+             DELETE FROM t WHERE a = 2; INSERT INTO t VALUES (4, 'four');\
+             UPDATE t SET a = 40 WHERE a = 4;",
+        )
+        .unwrap();
+        run(&db, "INSERT INTO t VALUES (5, 'five');");
+        db.abandon();
+    }
+
+    let db = open(dir.path());
+    assert_eq!(
+        rows(&db, "SELECT a, b FROM t ORDER BY a;"),
+        vec![
+            vec![Some(Value::INT(1)), Some(Value::text("one"))],
+            vec![Some(Value::INT(2)), Some(Value::text("two"))],
+            vec![Some(Value::INT(3)), Some(Value::text("three"))],
+            vec![Some(Value::INT(5)), Some(Value::text("five"))],
+        ],
+        "the open transaction's writes are gone and the commit after them is kept"
+    );
+    run(
+        &db,
+        "UPDATE t SET b = 'mine' WHERE a = 1; DELETE FROM t WHERE a = 2;\
+         INSERT INTO t VALUES (4, 'again');",
+    );
+    assert_eq!(
+        ints(
+            &db,
+            "SELECT a FROM t WHERE b = 'mine' OR b = 'again' ORDER BY a;"
+        ),
+        vec![vec![1], vec![4]],
+        "the rows the open transaction held can be written again"
+    );
+    assert_eq!(
+        ints(&db, "SELECT a FROM t WHERE a = 40;"),
+        Vec::<Vec<i32>>::new()
+    );
+}
+
+#[test]
+fn a_kill_rolls_back_an_update_that_moved_its_row_to_another_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let long = |c: char, n: usize| c.to_string().repeat(n);
+    {
+        let db = open(dir.path());
+        run(
+            &db,
+            "CREATE TABLE t (a INTEGER, b TEXT); CREATE INDEX t_a ON t (a);",
+        );
+        for a in 1..=6 {
+            run(
+                &db,
+                &format!("INSERT INTO t VALUES ({a}, '{}');", long('x', 1200)),
+            );
+        }
+        let open_txn = begin(&db);
+        db.execute_in(
+            &open_txn,
+            &format!("UPDATE t SET b = '{}' WHERE a = 1;", long('y', 4000)),
+        )
+        .unwrap();
+        run(&db, "INSERT INTO t VALUES (7, 'seven');");
+        db.abandon();
+    }
+
+    let db = open(dir.path());
+    assert_eq!(
+        rows(&db, "SELECT a, b FROM t WHERE a = 1 OR a = 7 ORDER BY a;"),
+        vec![
+            vec![Some(Value::INT(1)), Some(Value::text(&long('x', 1200)))],
+            vec![Some(Value::INT(7)), Some(Value::text("seven"))],
+        ],
+        "the moved row is back at its old version and the later commit is kept"
+    );
+    assert_eq!(ints(&db, "SELECT COUNT(*) FROM t;"), vec![vec![7]]);
+    run(
+        &db,
+        &format!("UPDATE t SET b = '{}' WHERE a = 1;", long('z', 4000)),
+    );
+    assert_eq!(
+        ints(
+            &db,
+            "SELECT a FROM t WHERE b <> 'seven' AND a < 3 ORDER BY a;"
+        ),
+        vec![vec![1], vec![2]],
+        "the row the open transaction moved can be moved again"
+    );
+}
+
+#[test]
+fn a_kill_after_writes_evicted_from_a_small_pool_keeps_only_the_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let values: Vec<String> = (0..5_000).map(|i| format!("({i})")).collect();
+    {
+        let db = Database::open(dir.path(), 8).unwrap();
+        run(
+            &db,
+            "CREATE TABLE t (a INTEGER); CREATE INDEX t_a ON t (a);",
+        );
+        run(&db, &format!("INSERT INTO t VALUES {};", values.join(", ")));
+        let open_txn = begin(&db);
+        db.execute_in(&open_txn, "UPDATE t SET a = a + 100000;")
+            .unwrap();
+        db.execute_in(
+            &open_txn,
+            &format!("INSERT INTO t VALUES {};", values.join(", ")),
+        )
+        .unwrap();
+        run(&db, "CREATE TABLE u (a INTEGER); INSERT INTO u VALUES (1);");
+        db.abandon();
+    }
+
+    let db = Database::open(dir.path(), 8).expect("reopen after a kill");
+    assert_eq!(rows(&db, "SELECT a FROM t;").len(), 5_000);
+    assert_eq!(
+        ints(&db, "SELECT a FROM t WHERE a >= 100000;"),
+        Vec::<Vec<i32>>::new()
+    );
+    assert_eq!(
+        ints(&db, "SELECT a FROM t WHERE a = 4321;"),
+        vec![vec![4321]]
+    );
+    assert_eq!(ints(&db, "SELECT a FROM u;"), vec![vec![1]]);
+    run(&db, "UPDATE t SET a = a + 1000000;");
+    assert_eq!(
+        ints(&db, "SELECT a FROM t WHERE a = 1004321;"),
+        vec![vec![1004321]],
+        "every row the open transaction held can be written again"
+    );
+}
+
+#[test]
+fn an_open_transaction_survives_a_checkpoint_and_is_rolled_back_after_a_kill() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open(dir.path());
+        db.bpm().disk_manager().set_checkpoint_log_bytes(0);
+        run(
+            &db,
+            "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2);",
+        );
+        let open_txn = begin(&db);
+        db.execute_in(
+            &open_txn,
+            "UPDATE t SET a = 10 WHERE a = 1; INSERT INTO t VALUES (3);",
+        )
+        .unwrap();
+        for i in 0..5 {
+            run(&db, &format!("INSERT INTO t VALUES ({});", 100 + i));
+        }
+        db.abandon();
+    }
+
+    let db = open(dir.path());
+    assert_eq!(
+        ints(&db, "SELECT a FROM t ORDER BY a;"),
+        vec![
+            vec![1],
+            vec![2],
+            vec![100],
+            vec![101],
+            vec![102],
+            vec![103],
+            vec![104]
+        ]
+    );
+    db.close().unwrap();
+    let db = open(dir.path());
+    assert_eq!(
+        rows(&db, "SELECT a FROM t;").len(),
+        7,
+        "recovery is not repeated"
+    );
+}
+
+#[test]
+fn a_commit_that_is_not_durable_yet_is_lost_whole_by_a_kill() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open(dir.path());
+        run(&db, "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);");
+        let txn = begin(&db);
+        db.execute_in(
+            &txn,
+            "INSERT INTO t VALUES (2); UPDATE t SET a = 10 WHERE a = 1;",
+        )
+        .unwrap();
+        db.txn_mgr().commit(&txn).unwrap();
+        db.bpm().flush_all().unwrap();
+        db.abandon();
+    }
+
+    let db = open(dir.path());
+    assert_eq!(
+        ints(&db, "SELECT a FROM t ORDER BY a;"),
+        vec![vec![1]],
+        "a commit on the transaction manager is durable at the next commit through the \
+         database, and flushing pages alone does not make it so"
+    );
+}
+
+#[test]
+fn a_torn_write_at_the_end_of_the_log_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open(dir.path());
+        run(&db, "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);");
+        db.abandon();
+    }
+    let log = dir.path().join(cmudb::database::LOG_FILE);
+    let mut bytes = std::fs::read(&log).unwrap();
+    bytes.extend_from_slice(&[1, 0x10, 0x20, 0, 0, 7, 7, 7, 7, 42, 42]);
+    std::fs::write(&log, bytes).unwrap();
+
+    let db = open(dir.path());
+    assert_eq!(ints(&db, "SELECT a FROM t;"), vec![vec![1]]);
+}
+
+#[test]
+fn a_log_that_is_not_a_cmudb_log_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    open(dir.path()).close().unwrap();
+    std::fs::write(
+        dir.path().join(cmudb::database::LOG_FILE),
+        b"not a log at all",
+    )
+    .unwrap();
+    assert!(matches!(
+        Database::open(dir.path(), FRAMES),
+        Err(PersistError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidData
+    ));
 }

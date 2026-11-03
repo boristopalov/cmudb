@@ -354,6 +354,11 @@ impl BufferPoolManager {
         Ok(())
     }
 
+    /// The disk manager behind this pool's disk scheduler.
+    pub fn disk_manager(&self) -> Arc<disk::DiskManager> {
+        self.scheduler.lock().disk_manager()
+    }
+
     /// Returns how many pages this pool has handed out and not deleted.
     pub fn live_page_count(&self) -> usize {
         let meta = self.meta.lock();

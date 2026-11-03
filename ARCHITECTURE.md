@@ -23,13 +23,26 @@ A SQL statement flows top to bottom:
 temporary directory instead. Page 0 of the data file is a header that points at a chain of
 metadata pages (`src/database_file.rs`) holding the catalog, the page allocator's next and free
 ids, and the transaction clocks. The data file is locked while a `Database` has it open, so a
-second process gets `PersistError::InUse`. The data file is written after every commit through `Database`
-and on close or drop. There is no WAL (BOR-71): the buffer pool also writes pages when it evicts
-them, so a crash or kill between those writes can leave the file unopenable or inconsistent.
-Opening a table whose page links point past the recorded allocation fails with
-`TableHeapError::UnallocatedPageLink`. Page `id` lives at byte `id * PAGE_SIZE` of the data file.
+second process gets `PersistError::InUse`. Page `id` lives at byte `id * PAGE_SIZE` of the data file.
 Page, frame, table, index and record ids are the newtypes in `src/ids.rs`; a missing page
 link is `Option<PageId>`, and only the encode/decode helpers there know its on-disk sentinel.
+
+Pages of an opened database go through a write-ahead log, `dir/cmudb.log` (`src/wal.rs`): the
+`DiskManager` appends every page write to it and reads a page's newest image from it first, so
+the data file changes only at a log checkpoint. `Database::checkpoint`, run after every commit
+through `Database` and on close, writes the metadata chain and flushes every dirty page, then
+records a durable point and fsyncs the log; it holds the transaction manager's commit latch
+meanwhile, so a durable point never splits a commit or an abort. Opening replays the log up to
+its last durable point and drops the rest. Since evicted pages can carry uncommitted versions,
+transactions also log a `Writes` record before their first write, an `Undo` record with each
+version they overwrite (under the page latch, before the page can be logged) and an `End`
+record when they finish; a transaction without a durable `End` is rolled back on open from its
+undo images. Once the log passes `CHECKPOINT_LOG_BYTES`, a durable point also copies the
+logged pages into the data file and replaces the log with one holding only the records of
+transactions still running. After a failed fsync of the log, the data file or the log's
+directory, the log refuses every later page and durable point, since a later fsync can succeed
+without the bytes the failed one covered; reopening recovers from the log. Opening a table whose page links point past the recorded
+allocation fails with `TableHeapError::UnallocatedPageLink`.
 
 `cmudb::Database` (`src/database.rs`) runs the whole pipeline and
 owns the session's transaction block (`BEGIN`, `COMMIT`, `ROLLBACK`, autocommit). It returns a
