@@ -3,7 +3,7 @@
 mod common;
 
 use cmudb::QueryError;
-use cmudb::catalog::{CatalogError, Value};
+use cmudb::catalog::{CatalogError, DataType, Value};
 use cmudb::parser::{BinderError, Unsupported};
 use cmudb::processor::executor::ExecutorError;
 use cmudb::processor::plan::Plan;
@@ -1126,9 +1126,9 @@ fn binder_errors_are_reported() {
             unsupported(Unsupported::CompoundIdentifier),
         ),
         (
-            "CREATE TABLE s (name CHAR(3))",
+            "CREATE TABLE s (name BYTEA)",
             BinderError::UnsupportedType {
-                type_name: "CHAR(3)".into(),
+                type_name: "BYTEA".into(),
             },
         ),
         (
@@ -1411,6 +1411,14 @@ fn type_cases() -> Vec<TypeCase> {
         TypeCase {
             sql_type: "VARCHAR(12)",
             values: text_values(),
+            indexable: true,
+        },
+        TypeCase {
+            sql_type: "CHAR(12)",
+            values: text_values()
+                .into_iter()
+                .map(|(sql, v)| (sql, Value::text(&format!("{:<12}", v.to_string()))))
+                .collect(),
             indexable: true,
         },
     ]
@@ -2086,7 +2094,7 @@ fn varchar_limits_count_characters_and_name_the_column() {
     match db.exec_error("UPDATE t SET short = long") {
         ExecutorError::Catalog(CatalogError::ColumnTooLong {
             column,
-            max_chars: 3,
+            expected: DataType::VARCHAR(3),
             len: 6,
         }) => assert_eq!(column, "short"),
         other => panic!("expected the column limit, got {other:?}"),
@@ -2095,6 +2103,140 @@ fn varchar_limits_count_characters_and_name_the_column() {
     assert_eq!(
         texts(&db.exec("SELECT short FROM t ORDER BY short")),
         vec![vec![some("x")], vec![some("ééé")]]
+    );
+}
+
+fn char_db() -> Db {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE t (id INT, c CHAR(4), x TEXT)");
+    db.exec(
+        "INSERT INTO t VALUES (1, 'ab', 'ab'), (2, 'ab  ', 'ab  '), (3, 'abcd      ', NULL), \
+         (4, ' a', NULL), (5, 'éé', NULL), (6, '', '')",
+    );
+    db
+}
+
+#[test]
+fn char_columns_pad_values_to_their_length() {
+    let db = char_db();
+    assert_eq!(
+        texts(&db.exec("SELECT c FROM t ORDER BY id")),
+        vec![
+            vec![some("ab  ")],
+            vec![some("ab  ")],
+            vec![some("abcd")],
+            vec![some(" a  ")],
+            vec![some("éé  ")],
+            vec![some("    ")],
+        ],
+        "spaces past the length are dropped, and every value prints with 4 characters"
+    );
+    assert_eq!(
+        texts(&db.exec("SELECT MIN(c), MAX(c) FROM t WHERE id < 6")),
+        vec![vec![some(" a  "), some("éé  ")]]
+    );
+    db.exec("CREATE TABLE one (c CHAR, ch CHARACTER(2))");
+    db.exec("INSERT INTO one VALUES ('x', 'y')");
+    assert_eq!(
+        texts(&db.exec("SELECT c, ch FROM one")),
+        vec![vec![some("x"), some("y ")]],
+        "CHAR without a length is CHAR(1)"
+    );
+}
+
+#[test]
+fn char_comparisons_ignore_trailing_spaces() {
+    let db = char_db();
+    for (filter, expected) in [
+        ("c = 'ab'", vec![vec![1], vec![2]]),
+        ("'ab   ' = c", vec![vec![1], vec![2]]),
+        ("c <> 'ab'", vec![vec![3], vec![4], vec![5], vec![6]]),
+        ("c = ''", vec![vec![6]]),
+        ("c = '  '", vec![vec![6]]),
+        ("c = ' a'", vec![vec![4]]),
+        ("c = 'a'", vec![]),
+        ("c < 'ab'", vec![vec![4], vec![6]]),
+        ("c = 'abcde'", vec![]),
+        ("c = x", vec![vec![1], vec![6]]),
+    ] {
+        assert_eq!(
+            sorted(ints(&db.exec(&format!("SELECT id FROM t WHERE {filter}")))),
+            expected,
+            "WHERE {filter}"
+        );
+    }
+    assert_eq!(
+        ints(&db.exec("SELECT COUNT(*) FROM t GROUP BY c ORDER BY c")),
+        vec![[1], [1], [2], [1], [1]],
+        "'ab' and 'ab  ' are one group"
+    );
+    assert_eq!(
+        texts(&db.exec("SELECT DISTINCT c FROM t WHERE id < 3")),
+        vec![vec![some("ab  ")]]
+    );
+
+    db.exec("UPDATE t SET x = c WHERE id = 2");
+    assert_eq!(
+        texts(&db.exec("SELECT x FROM t WHERE id = 2")),
+        vec![vec![some("ab")]],
+        "a CHAR stored in TEXT loses its padding"
+    );
+}
+
+#[test]
+fn char_columns_reject_longer_values() {
+    let db = char_db();
+    let too_long =
+        |chars: usize| format!("value of {chars} characters is too long for CHAR(4) column `c`");
+    for (sql, expected) in [
+        ("INSERT INTO t VALUES (7, 'abcde', NULL)", too_long(5)),
+        ("INSERT INTO t VALUES (7, 'abc de  ', NULL)", too_long(6)),
+        ("UPDATE t SET c = 'ééééé'", too_long(5)),
+    ] {
+        match db.query_error(sql) {
+            QueryError::Bind(e) => assert_eq!(e.to_string(), expected, "{sql}"),
+            other => panic!("{sql}: expected a bind error, got {other}"),
+        }
+    }
+    db.exec("UPDATE t SET x = 'hello' WHERE id = 1");
+    match db.exec_error("UPDATE t SET c = x WHERE id = 1") {
+        ExecutorError::Catalog(CatalogError::ColumnTooLong {
+            column,
+            expected: DataType::CHAR(4),
+            len: 5,
+        }) => assert_eq!(column, "c"),
+        other => panic!("expected the column limit, got {other:?}"),
+    }
+    db.exec("UPDATE t SET x = 'wxyz    ' WHERE id = 1");
+    db.exec("UPDATE t SET c = x WHERE id = 1");
+    assert_eq!(
+        texts(&db.exec("SELECT c FROM t WHERE id = 1")),
+        vec![vec![some("wxyz")]]
+    );
+}
+
+#[test]
+fn char_indexes_look_up_values_whatever_their_trailing_spaces() {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE t (id INT, c CHAR(4))");
+    db.exec("INSERT INTO t VALUES (1, 'ab'), (2, 'abcd'), (3, NULL)");
+    db.exec("CREATE INDEX t_c ON t (c)");
+    for (lookup, expected) in [
+        ("c = 'ab'", vec![[1]]),
+        ("c = 'ab    '", vec![[1]]),
+        ("c = 'abcd'", vec![[2]]),
+    ] {
+        let query = format!("SELECT id FROM t WHERE {lookup}");
+        assert!(
+            plan_contains(&db.plan_of(&query), |p| matches!(p, Plan::IndexScan(_))),
+            "{query} uses the index"
+        );
+        assert_eq!(ints(&db.exec(&query)), expected, "{query}");
+    }
+    assert!(db.exec("SELECT id FROM t WHERE c = 'abcde'").is_empty());
+    assert!(
+        db.try_exec("INSERT INTO t VALUES (4, 'ab ')").is_err(),
+        "'ab ' is the key 'ab' already has"
     );
 }
 
@@ -2131,7 +2273,11 @@ fn text_type_errors_are_clear() {
             "UPDATE people SET team = id",
             "column `team` is TEXT, got INT",
         ),
-        ("CREATE TABLE z (c CHAR(3))", "unsupported type: CHAR(3)"),
+        ("CREATE TABLE z (c CHAR(0))", "unsupported type: CHAR(0)"),
+        (
+            "CREATE TABLE z (c CHARACTER(10485761))",
+            "unsupported type: CHARACTER(10485761)",
+        ),
         (
             "CREATE TABLE z (c VARCHAR(0))",
             "unsupported type: VARCHAR(0)",

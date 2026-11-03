@@ -178,11 +178,11 @@ pub enum BinderError {
         expected: DataType,
         value: Value,
     },
-    /// An INSERT or UPDATE stores a string constant of `len` characters in a `VARCHAR(max_chars)`
-    /// column.
+    /// An INSERT or UPDATE stores a string constant of `len` characters in a `VARCHAR(n)` or
+    /// `CHAR(n)` column that holds fewer; a CHAR counts no trailing spaces.
     ColumnTooLong {
         column: String,
-        max_chars: u32,
+        expected: DataType,
         len: usize,
     },
     /// An INSERT row has other than one value per target column.
@@ -198,7 +198,8 @@ pub enum BinderError {
     /// A table or index name has more than one part, such as `schema.table`.
     QualifiedName { name: String },
     /// A column type other than INT, BIGINT, FLOAT, BOOLEAN, TIMESTAMP (without time zone), TEXT,
-    /// VARCHAR or VARCHAR(n) with `n` from 1 to `u32::MAX` characters.
+    /// VARCHAR, VARCHAR(n) with `n` from 1 to `u32::MAX` characters, or CHAR and CHAR(n) with `n`
+    /// from 1 to [`MAX_CHAR_LENGTH`] characters.
     UnsupportedType { type_name: String },
     /// A binary operator with no bound counterpart, such as `%`.
     UnsupportedOperator { operator: BinaryOperator },
@@ -307,11 +308,11 @@ impl fmt::Display for BinderError {
             ),
             BinderError::ColumnTooLong {
                 column,
-                max_chars,
+                expected,
                 len,
             } => write!(
                 f,
-                "value of {len} characters is too long for VARCHAR({max_chars}) column `{column}`"
+                "value of {len} characters is too long for {expected} column `{column}`"
             ),
             BinderError::InsertArity {
                 table,
@@ -815,9 +816,9 @@ impl<'a> Binder<'a> {
                         expected: col.dtype,
                         value: v,
                     },
-                    CoercionError::TooLong { max_chars, len } => BinderError::ColumnTooLong {
+                    CoercionError::TooLong { len } => BinderError::ColumnTooLong {
                         column: col.name.clone(),
-                        max_chars,
+                        expected: col.dtype,
                         len,
                     },
                 }),
@@ -1930,20 +1931,38 @@ fn sql_to_dtype(t: &SqlDataType) -> Result<DataType, BinderError> {
         | SqlDataType::CharVarying(None) => Ok(DataType::TEXT),
         SqlDataType::Varchar(Some(length))
         | SqlDataType::CharacterVarying(Some(length))
-        | SqlDataType::CharVarying(Some(length)) => varchar_limit(length)
+        | SqlDataType::CharVarying(Some(length)) => character_limit(length)
             .map(DataType::VARCHAR)
             .ok_or_else(|| BinderError::UnsupportedType {
                 type_name: t.to_string(),
             }),
+        SqlDataType::Char(None) | SqlDataType::Character(None) => {
+            Ok(DataType::CHAR(DEFAULT_CHAR_LENGTH))
+        }
+        SqlDataType::Char(Some(length)) | SqlDataType::Character(Some(length)) => {
+            character_limit(length)
+                .filter(|&n| n <= MAX_CHAR_LENGTH)
+                .map(DataType::CHAR)
+                .ok_or_else(|| BinderError::UnsupportedType {
+                    type_name: t.to_string(),
+                })
+        }
         other => Err(BinderError::UnsupportedType {
             type_name: other.to_string(),
         }),
     }
 }
 
-/// The character limit of a `VARCHAR(n)`: `n` when it counts characters and is from 1 to
-/// `u32::MAX`.
-fn varchar_limit(length: &CharacterLength) -> Option<u32> {
+/// The length of a `CHAR` declared without one.
+const DEFAULT_CHAR_LENGTH: u32 = 1;
+
+/// The longest `CHAR(n)`, as in Postgres. A result pads each value to `n` characters, so `n`
+/// is bounded where a VARCHAR's limit is not.
+pub const MAX_CHAR_LENGTH: u32 = 10_485_760;
+
+/// The character limit of a `VARCHAR(n)` or `CHAR(n)`: `n` when it counts characters and is
+/// from 1 to `u32::MAX`.
+fn character_limit(length: &CharacterLength) -> Option<u32> {
     match length {
         CharacterLength::IntegerLength {
             length,
@@ -2071,9 +2090,11 @@ fn check_operand_types(
     }
 }
 
-/// In a comparison between a constant and an expression of another numeric type, converts the
-/// constant to that type when it converts exactly, so that `f = 1` on a FLOAT column compares
-/// FLOATs and can use an index on `f`.
+/// In a comparison between a constant and an expression of another type, converts the constant
+/// with [`Value::exactly_as`]: a number to the other side's numeric type when it converts
+/// exactly, so that `f = 1` on a FLOAT column compares FLOATs and can use an index on `f`, and a
+/// string compared with a CHAR to one without trailing spaces, so that `c = 'ab   '` matches
+/// the CHAR value `'ab'` and can use an index on `c`.
 fn match_constant_to_other_side(l: Expression, r: Expression) -> (Expression, Expression) {
     let exactly = |constant: &Expression, target: Option<DataType>| match (constant, target) {
         (Expression::Constant(Some(v)), Some(t)) => v.clone().exactly_as(t),

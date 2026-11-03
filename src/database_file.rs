@@ -6,9 +6,9 @@
 //! the metadata chain, a linked list of pages whose payloads, concatenated, are one encoded
 //! [`DatabaseMeta`]. Every other page belongs to a table heap or an index, as before.
 //!
-//! A column type is stored as a one-byte tag followed by that type's own parameters. The
-//! types there are today take no parameters, so a new type adds a tag (and the parameter
-//! bytes it needs) without changing how the existing ones are read.
+//! A column type is stored as a one-byte tag followed by that type's own parameters, such as
+//! the character limit of a `VARCHAR(n)` or `CHAR(n)`, so a new type adds a tag (and the
+//! parameter bytes it needs) without changing how the existing ones are read.
 
 use crate::buffer_pool::{BpmError, BufferPoolManager, PageAllocation};
 use crate::catalog::{CatalogError, CatalogSnapshot, DataType, IndexEntry, IndexType, TableEntry};
@@ -51,6 +51,8 @@ const TYPE_TAG_BIGINT: u8 = 4;
 const TYPE_TAG_TEXT: u8 = 5;
 /// Followed by the type's character limit, a `u32`.
 const TYPE_TAG_VARCHAR: u8 = 6;
+/// Followed by the type's length in characters, a `u32`.
+const TYPE_TAG_CHAR: u8 = 7;
 
 const INDEX_TAG_BPLUS_TREE: u8 = 0;
 
@@ -245,9 +247,10 @@ fn encode_type(w: &mut Writer, dtype: DataType) {
         DataType::BIGINT => TYPE_TAG_BIGINT,
         DataType::TEXT => TYPE_TAG_TEXT,
         DataType::VARCHAR(_) => TYPE_TAG_VARCHAR,
+        DataType::CHAR(_) => TYPE_TAG_CHAR,
     });
-    if let DataType::VARCHAR(max_chars) = dtype {
-        w.u32(max_chars);
+    if let DataType::VARCHAR(chars) | DataType::CHAR(chars) = dtype {
+        w.u32(chars);
     }
 }
 
@@ -260,6 +263,7 @@ fn decode_type(r: &mut Reader<'_>) -> Result<DataType, PersistError> {
         TYPE_TAG_BIGINT => Ok(DataType::BIGINT),
         TYPE_TAG_TEXT => Ok(DataType::TEXT),
         TYPE_TAG_VARCHAR => Ok(DataType::VARCHAR(r.u32()?)),
+        TYPE_TAG_CHAR => Ok(DataType::CHAR(r.u32()?)),
         tag => Err(PersistError::UnknownColumnType(tag)),
     }
 }
@@ -467,6 +471,7 @@ mod tests {
                             (DataType::TIMESTAMP, "at".into()),
                             (DataType::TEXT, "note".into()),
                             (DataType::VARCHAR(20), "name".into()),
+                            (DataType::CHAR(2), "code".into()),
                         ],
                         first_page_id: pid(2),
                     },
@@ -542,6 +547,14 @@ mod tests {
         );
         assert!(matches!(
             decode_type(&mut Reader(&[TYPE_TAG_VARCHAR, 1])),
+            Err(PersistError::CorruptMeta(_))
+        ));
+        let mut w = Writer::default();
+        encode_type(&mut w, DataType::CHAR(12));
+        assert_eq!(w.0, [&[TYPE_TAG_CHAR][..], &12u32.to_le_bytes()].concat());
+        assert_eq!(decode_type(&mut Reader(&w.0)).unwrap(), DataType::CHAR(12));
+        assert!(matches!(
+            decode_type(&mut Reader(&[TYPE_TAG_CHAR, 1, 0])),
             Err(PersistError::CorruptMeta(_))
         ));
         assert!(matches!(
