@@ -110,11 +110,13 @@ pub struct Wal {
     /// checkpoint can carry them into the fresh log.
     open_txns: BTreeMap<TxnId, Vec<u8>>,
     checkpoint_bytes: u64,
-    /// The log was renamed into place and its directory not synced since.
-    rename_unsynced: bool,
-    /// Directory syncs left to fail, for tests.
+    /// An fsync of the log, the data file or the log's directory failed. A later fsync of
+    /// the same file can succeed without the bytes the failed one covered, so the log then
+    /// refuses every page and durable point until the database is reopened and recovered.
+    broken: bool,
+    /// For tests: how many fsyncs succeed before one fails.
     #[cfg(test)]
-    failing_dir_syncs: u32,
+    syncs_before_failure: Option<u32>,
 }
 
 /// A record read back from the log, with the page image left in the file.
@@ -177,9 +179,9 @@ impl Wal {
             dirty: false,
             open_txns,
             checkpoint_bytes: CHECKPOINT_LOG_BYTES,
-            rename_unsynced: false,
+            broken: false,
             #[cfg(test)]
-            failing_dir_syncs: 0,
+            syncs_before_failure: None,
         };
         let pages_replayed = wal.pages.len();
         wal.checkpoint(data)?;
@@ -244,6 +246,7 @@ impl Wal {
     /// Appends a page image, after the transaction records logged before it. Reads of
     /// `page_id` return it from now on.
     pub fn log_page(&mut self, page_id: PageId, page: &[u8; PAGE_SIZE]) -> io::Result<()> {
+        self.refuse_if_broken()?;
         let mut payload = Vec::with_capacity(PAGE_ID_LEN + PAGE_SIZE);
         payload.extend_from_slice(&u64::from(page_id.get()).to_le_bytes());
         payload.extend_from_slice(page);
@@ -277,14 +280,12 @@ impl Wal {
     /// `data` if the log has outgrown its limit. Does nothing when nothing was logged since
     /// the last durable point.
     pub fn durable_point(&mut self, data: &File) -> io::Result<()> {
+        self.refuse_if_broken()?;
         if !self.dirty {
             return Ok(());
         }
         self.write_out_with(KIND_DURABLE, &[])?;
-        self.file.sync_data()?;
-        if self.rename_unsynced {
-            self.sync_dir()?;
-        }
+        self.sync(|wal| wal.file.sync_data())?;
         self.dirty = false;
         if self.end > self.checkpoint_bytes {
             self.checkpoint(data)?;
@@ -302,7 +303,7 @@ impl Wal {
             self.file.read_exact_at(&mut image[..], offset)?;
             data.write_all_at(&image[..], u64::from(page_id.get()) * PAGE_SIZE as u64)?;
         }
-        data.sync_data()?;
+        self.sync(|_| data.sync_data())?;
 
         let mut fresh = Vec::new();
         fresh.extend_from_slice(&LOG_MAGIC);
@@ -319,29 +320,44 @@ impl Wal {
             .truncate(true)
             .open(&aside)?;
         file.write_all_at(&fresh, 0)?;
-        file.sync_data()?;
+        self.sync(|_| file.sync_data())?;
         std::fs::rename(&aside, &self.path)?;
         self.file = file;
         self.end = fresh.len() as u64;
         self.buffered.clear();
         self.pages.clear();
         self.dirty = false;
-        self.rename_unsynced = true;
-        self.sync_dir()
+        self.sync(|wal| match wal.path.parent() {
+            Some(dir) => File::open(dir)?.sync_all(),
+            None => Ok(()),
+        })
     }
 
-    /// Syncs the log's directory, so the last rename of the log survives a crash. Until it
-    /// succeeds, every durable point retries it before reporting success.
-    fn sync_dir(&mut self) -> io::Result<()> {
+    /// Runs one fsync, and marks the log broken if it fails.
+    fn sync(&mut self, sync: impl FnOnce(&Self) -> io::Result<()>) -> io::Result<()> {
         #[cfg(test)]
-        if self.failing_dir_syncs > 0 {
-            self.failing_dir_syncs -= 1;
-            return Err(io::Error::other("injected directory sync failure"));
+        if let Some(left) = self.syncs_before_failure.as_mut() {
+            if *left == 0 {
+                self.syncs_before_failure = None;
+                self.broken = true;
+                return Err(io::Error::other("injected fsync failure"));
+            }
+            *left -= 1;
         }
-        if let Some(dir) = self.path.parent() {
-            File::open(dir)?.sync_all()?;
+        let result = sync(self);
+        if result.is_err() {
+            self.broken = true;
         }
-        self.rename_unsynced = false;
+        result
+    }
+
+    fn refuse_if_broken(&self) -> io::Result<()> {
+        if self.broken {
+            return Err(io::Error::other(
+                "an earlier fsync of the write-ahead log failed, so it takes no more writes; \
+                 reopen the database to recover from the log",
+            ));
+        }
         Ok(())
     }
 
@@ -749,34 +765,71 @@ mod tests {
     }
 
     #[test]
-    fn after_a_failed_directory_sync_the_log_keeps_writing_to_the_renamed_file() {
+    fn a_failed_log_sync_refuses_every_later_write_until_a_reopen() {
+        let files = Files::new();
+        {
+            let (mut wal, _) = files.open();
+            wal.log_page(PageId::new(0), &page(1)).unwrap();
+            wal.durable_point(&files.data).unwrap();
+            wal.syncs_before_failure = Some(0);
+            wal.log_page(PageId::new(0), &page(2)).unwrap();
+            wal.durable_point(&files.data).unwrap_err();
+            wal.log_page(PageId::new(1), &page(3))
+                .expect_err("no page is logged after a failed sync");
+            wal.log_txn(&TxnRecord::Writes(7));
+            wal.durable_point(&files.data)
+                .expect_err("a later sync could succeed without the bytes the failed one held");
+        }
+        let (mut wal, _) = files.open();
+        assert_eq!(
+            files.data_page(0),
+            page(2),
+            "reopening recovers from the log"
+        );
+        wal.log_page(PageId::new(1), &page(3)).unwrap();
+        wal.durable_point(&files.data).unwrap();
+    }
+
+    #[test]
+    fn a_failed_directory_sync_after_a_checkpoint_breaks_the_log() {
         let files = Files::new();
         {
             let (mut wal, _) = files.open();
             wal.set_checkpoint_bytes(0);
-            wal.failing_dir_syncs = 2;
-            wal.log_page(0, &page(1)).unwrap();
-            wal.durable_point(&files.data).unwrap_err();
+            wal.syncs_before_failure = Some(3);
+            wal.log_page(PageId::new(0), &page(1)).unwrap();
+            wal.durable_point(&files.data)
+                .expect_err("the log, data file and new log synced; the directory failed");
             assert_eq!(
                 files.data_page(0),
                 page(1),
                 "the checkpoint copied the page"
             );
-            wal.set_checkpoint_bytes(u64::MAX);
-            wal.log_page(0, &page(2)).unwrap();
-            wal.durable_point(&files.data)
-                .expect_err("the durable point waits for the directory sync");
-            wal.log_page(1, &page(3)).unwrap();
-            wal.durable_point(&files.data).unwrap();
-            assert!(!wal.rename_unsynced);
+            wal.log_page(PageId::new(0), &page(2)).unwrap_err();
+            wal.durable_point(&files.data).unwrap_err();
+        }
+        let (_, recovery) = files.open();
+        assert_eq!(recovery.pages_replayed, 0);
+        assert_eq!(files.data_page(0), page(1));
+    }
+
+    #[test]
+    fn a_failed_data_file_sync_in_a_checkpoint_keeps_the_old_log() {
+        let files = Files::new();
+        {
+            let (mut wal, _) = files.open();
+            wal.set_checkpoint_bytes(0);
+            wal.syncs_before_failure = Some(1);
+            wal.log_page(PageId::new(0), &page(1)).unwrap();
+            wal.durable_point(&files.data).unwrap_err();
+            wal.durable_point(&files.data).unwrap_err();
         }
         let (_, recovery) = files.open();
         assert_eq!(
-            recovery.pages_replayed, 2,
-            "the pages logged after the rename"
+            recovery.pages_replayed, 1,
+            "the old log still held the page"
         );
-        assert_eq!(files.data_page(0), page(2));
-        assert_eq!(files.data_page(1), page(3));
+        assert_eq!(files.data_page(0), page(1));
     }
 
     #[test]

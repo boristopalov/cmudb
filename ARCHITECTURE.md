@@ -39,7 +39,9 @@ version they overwrite (under the page latch, before the page can be logged) and
 record when they finish; a transaction without a durable `End` is rolled back on open from its
 undo images. Once the log passes `CHECKPOINT_LOG_BYTES`, a durable point also copies the
 logged pages into the data file and replaces the log with one holding only the records of
-transactions still running. Opening a table whose page links point past the recorded
+transactions still running. After a failed fsync of the log, the data file or the log's
+directory, the log refuses every later page and durable point, since a later fsync can succeed
+without the bytes the failed one covered; reopening recovers from the log. Opening a table whose page links point past the recorded
 allocation fails with `TableHeapError::UnallocatedPageLink`.
 
 `cmudb::Database` (`src/database.rs`) runs the whole pipeline and
