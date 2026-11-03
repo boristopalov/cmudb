@@ -2088,9 +2088,11 @@ fn check_operand_types(
     }
 }
 
-/// In a comparison between a constant and an expression of another numeric type, converts the
-/// constant to that type when it converts exactly, so that `f = 1` on a FLOAT column compares
-/// FLOATs and can use an index on `f`.
+/// In a comparison between a constant and an expression of another type, converts the constant
+/// with [`Value::exactly_as`]: a number to the other side's numeric type when it converts
+/// exactly, so that `f = 1` on a FLOAT column compares FLOATs and can use an index on `f`, and a
+/// string compared with a CHAR to one without trailing spaces, so that `c = 'ab   '` matches
+/// the CHAR value `'ab'` and can use an index on `c`.
 fn match_constant_to_other_side(l: Expression, r: Expression) -> (Expression, Expression) {
     let exactly = |constant: &Expression, target: Option<DataType>| match (constant, target) {
         (Expression::Constant(Some(v)), Some(t)) => v.clone().exactly_as(t),
