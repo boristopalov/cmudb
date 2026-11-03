@@ -4,7 +4,8 @@ use std::fmt;
 use std::num::TryFromIntError;
 
 const MAGIC: [u8; 4] = *b"CMDB";
-const VERSION: u16 = 2;
+/// Version 3 stores B+ tree keys with variable lengths.
+const VERSION: u16 = 3;
 
 pub const KIND_HEADER: u8 = 0;
 pub const KIND_INTERNAL: u8 = 1;
@@ -26,7 +27,7 @@ pub enum PageCodecError {
     UnsupportedVersion(u16),
     WrongPageKind { expected: u8, actual: u8 },
     InvalidPageKind(u8),
-    InvalidKeyLen { expected: usize, actual: usize },
+    KeyTooLong { max: usize, actual: usize },
     InvalidSize,
     Malformed(&'static str),
     BufferError(BufferError),
@@ -62,8 +63,11 @@ impl fmt::Display for PageCodecError {
             PageCodecError::WrongPageKind { expected, actual } => {
                 write!(f, "wrong page kind (expected {expected}, got {actual})")
             }
-            PageCodecError::InvalidKeyLen { expected, actual } => {
-                write!(f, "invalid key length (expected {expected}, got {actual})")
+            PageCodecError::KeyTooLong { max, actual } => {
+                write!(
+                    f,
+                    "key of {actual} bytes is longer than the {max} bytes a page holds"
+                )
             }
             PageCodecError::InvalidSize => write!(f, "invalid page size fields"),
             PageCodecError::BufferError(BufferError::Overflow) => {
@@ -257,8 +261,8 @@ mod tests {
         let cases = [
             (PageCodecError::BadMagic, "bad page magic"),
             (
-                PageCodecError::UnsupportedVersion(3),
-                "unsupported page version 3",
+                PageCodecError::UnsupportedVersion(2),
+                "unsupported page version 2",
             ),
             (
                 PageCodecError::WrongPageKind {
@@ -269,11 +273,8 @@ mod tests {
             ),
             (PageCodecError::InvalidPageKind(7), "invalid page kind: 7"),
             (
-                PageCodecError::InvalidKeyLen {
-                    expected: 8,
-                    actual: 4,
-                },
-                "invalid key length (expected 8, got 4)",
+                PageCodecError::KeyTooLong { max: 4, actual: 8 },
+                "key of 8 bytes is longer than the 4 bytes a page holds",
             ),
             (PageCodecError::InvalidSize, "invalid page size fields"),
             (PageCodecError::Malformed("x"), "malformed page: x"),

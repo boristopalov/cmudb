@@ -208,6 +208,64 @@ fn text_rows_and_varchar_indexes_survive_a_restart() {
 }
 
 #[test]
+fn text_indexes_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = |n: i32| format!("note {n:03} {}", "z".repeat((n as usize * 41) % 900));
+    {
+        let db = open(dir.path());
+        run(
+            &db,
+            "CREATE TABLE notes (id INTEGER, body TEXT); CREATE INDEX by_body ON notes (body);",
+        );
+        for n in 0..200 {
+            run(
+                &db,
+                &format!("INSERT INTO notes VALUES ({n}, '{}');", body(n)),
+            );
+        }
+        db.close().unwrap();
+    }
+
+    let db = open(dir.path());
+    let query = format!("SELECT id FROM notes WHERE body = '{}';", body(150));
+    assert!(uses_index(&db, &query));
+    assert_eq!(ints(&db, &query), vec![vec![150]]);
+    let range = "SELECT id FROM notes WHERE body >= 'note 010' AND body < 'note 013';";
+    assert_eq!(ints(&db, range), vec![vec![10], vec![11], vec![12]]);
+    run(
+        &db,
+        &format!("INSERT INTO notes VALUES (500, '{}');", body(500)),
+    );
+    assert_eq!(
+        ints(
+            &db,
+            &format!("SELECT id FROM notes WHERE body = '{}';", body(500))
+        ),
+        vec![vec![500]]
+    );
+}
+
+#[test]
+fn a_data_file_of_the_previous_format_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    open(dir.path()).close().unwrap();
+    let path = dir.path().join(cmudb::database::DATA_FILE);
+    let mut file = std::fs::read(&path).unwrap();
+    let version_at = 8;
+    file[version_at..version_at + 4].copy_from_slice(&2u32.to_le_bytes());
+    std::fs::write(&path, file).unwrap();
+
+    let Err(err) = Database::open(dir.path(), FRAMES) else {
+        panic!("a version 2 file is refused");
+    };
+    assert!(matches!(err, PersistError::UnsupportedFormat(2)), "{err}");
+    assert_eq!(
+        err.to_string(),
+        "the data file has format version 2, but this cmudb reads version 3"
+    );
+}
+
+#[test]
 fn a_database_can_be_reopened_again_and_again() {
     let dir = tempfile::tempdir().unwrap();
     for round in 0..4 {
