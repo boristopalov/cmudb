@@ -169,12 +169,9 @@ impl ArcReplacer {
         match self.nodes[idx].list {
             ArcList::Mfu | ArcList::Mru => {
                 info!("record_access page_id={page_id} frame_id={frame_id} -> front of MFU");
-                if let Some(previous_frame) = self.nodes[idx].frame_id.replace(frame_id)
-                    && previous_frame != frame_id
-                {
-                    self.frame_indices.remove(&previous_frame);
+                if self.nodes[idx].frame_id != Some(frame_id) {
+                    self.move_to_new_frame(idx, frame_id);
                 }
-                self.frame_indices.insert(frame_id, idx);
                 self.move_to_front(idx, ArcList::Mfu);
             }
             ArcList::GhostMru => {
@@ -217,14 +214,34 @@ impl ArcReplacer {
         self.move_to_front(idx, ArcList::Mfu);
     }
 
-    fn release_frame_for_admission(&mut self, frame_id: FrameId, admission: &str) {
-        match self.frame_indices.get(&frame_id).copied() {
-            Some(previous_holder) => self.give_up_frame(previous_holder),
-            None => assert!(
-                !self.is_full(),
-                "{admission} admits frame {frame_id} into a full replacer; evict a frame first"
-            ),
+    fn move_to_new_frame(&mut self, idx: usize, frame_id: FrameId) {
+        self.take_frame_from_its_holder(frame_id);
+        let node = &mut self.nodes[idx];
+        if let Some(previous_frame) = node.frame_id.replace(frame_id) {
+            self.frame_indices.remove(&previous_frame);
         }
+        if std::mem::replace(&mut node.evictable, false) {
+            self.evictable_count -= 1;
+        }
+        self.frame_indices.insert(frame_id, idx);
+    }
+
+    fn take_frame_from_its_holder(&mut self, frame_id: FrameId) -> bool {
+        match self.frame_indices.get(&frame_id).copied() {
+            Some(previous_holder) => {
+                self.give_up_frame(previous_holder);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn release_frame_for_admission(&mut self, frame_id: FrameId, admission: &str) {
+        let freed_a_tracked_frame = self.take_frame_from_its_holder(frame_id);
+        assert!(
+            freed_a_tracked_frame || !self.is_full(),
+            "{admission} admits frame {frame_id} into a full replacer; evict a frame first"
+        );
     }
 
     fn record_first_access(&mut self, frame_id: FrameId, page_id: PageId) {
@@ -747,6 +764,43 @@ mod tests {
     fn first_access_into_a_full_replacer_with_an_untracked_frame_panics() {
         let mut arc_replacer = replacer_with_evictable_pages_in_frames_0_and_1(2);
         arc_replacer.record_access(f(2), p(NEW_PAGE));
+    }
+
+    #[test]
+    fn repeat_access_into_another_tracked_frame_moves_its_previous_page_to_its_ghost_list() {
+        let mut arc_replacer = replacer_with_evictable_pages_in_frames_0_and_1(3);
+
+        arc_replacer.record_access(f(OTHER_FRAME), p(10));
+
+        let displaced = arc_replacer.page_indices[&p(11)];
+        assert_eq!(arc_replacer.nodes[displaced].list, ArcList::GhostMru);
+        assert_eq!(arc_replacer.nodes[displaced].frame_id, None);
+        let moved = arc_replacer.frame_indices[&f(OTHER_FRAME)];
+        assert_eq!(arc_replacer.nodes[moved].page_id, p(10));
+        assert_eq!(arc_replacer.nodes[moved].list, ArcList::Mfu);
+        assert!(!arc_replacer.frame_indices.contains_key(&f(REUSED_FRAME)));
+        assert_eq!(
+            arc_replacer.size(),
+            0,
+            "the moved page starts non-evictable in its new frame"
+        );
+        assert_eq!(arc_replacer.evict(), None);
+    }
+
+    #[test]
+    fn repeat_access_into_an_untracked_frame_of_a_full_replacer_moves_the_page() {
+        let mut arc_replacer = replacer_with_evictable_pages_in_frames_0_and_1(2);
+
+        arc_replacer.record_access(f(2), p(10));
+
+        assert!(!arc_replacer.frame_indices.contains_key(&f(REUSED_FRAME)));
+        assert_eq!(
+            arc_replacer.nodes[arc_replacer.frame_indices[&f(2)]].page_id,
+            p(10)
+        );
+        assert_eq!(arc_replacer.size(), 1);
+        assert_eq!(arc_replacer.evict(), Some(f(OTHER_FRAME)));
+        assert_eq!(arc_replacer.evict(), None);
     }
 
     #[test]

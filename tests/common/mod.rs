@@ -5,11 +5,12 @@
 pub mod seed;
 
 use cmudb::catalog::Value;
-use cmudb::concurrency::TxnError;
 use cmudb::concurrency::mvcc::MvccError;
+use cmudb::concurrency::{IsolationLevel, TxnError};
 use cmudb::ids::TableOid;
 use cmudb::parser::BinderError;
-use cmudb::processor::executor::ExecutorError;
+use cmudb::processor::executor::{ExecutorContext, ExecutorError, rows_affected};
+use cmudb::processor::executor_factory::create_executor_with_batch_size;
 use cmudb::processor::plan::{
     ColIdx, Expression, HashJoinPlanNode, JoinColumn, JoinPredicate, NestedLoopJoinPlanNode, Op,
     Plan, Side,
@@ -101,6 +102,28 @@ impl Db {
             .map_err(|e| e.to_string())
     }
 
+    /// Runs the DML statement `sql` in a transaction of its own, with executors exchanging
+    /// batches of at most `batch_size` rows, commits it and returns how many rows it changed.
+    pub fn exec_dml_with_batch_size(&self, sql: &str, batch_size: usize) -> u64 {
+        let plan = self.plan_of(sql);
+        let ctx = ExecutorContext::new(
+            self.db.catalog(),
+            self.db.bpm().clone(),
+            self.db.txn_mgr().begin(IsolationLevel::SnapshotIsolation),
+            self.db.txn_mgr().clone(),
+        );
+        let mut exec = create_executor_with_batch_size(&ctx, &plan, batch_size);
+        exec.open().unwrap_or_else(|e| panic!("open {sql}: {e}"));
+        let rows = rows_affected(&plan, exec.as_mut()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        exec.close().unwrap_or_else(|e| panic!("close {sql}: {e}"));
+        drop(exec);
+        self.db
+            .txn_mgr()
+            .commit(&ctx.txn)
+            .unwrap_or_else(|e| panic!("commit {sql}: {e}"));
+        rows
+    }
+
     /// The plan `sql` (a single statement) gets.
     pub fn plan_of(&self, sql: &str) -> Plan {
         let mut plans = self
@@ -117,7 +140,7 @@ impl Db {
 }
 
 /// Whether `wanted` matches `plan` or a node under its filters, projections, aggregations,
-/// sorts and limits.
+/// sorts, limits, updates and deletes.
 pub fn plan_contains(plan: &Plan, wanted: fn(&Plan) -> bool) -> bool {
     wanted(plan)
         || match plan {
@@ -127,6 +150,8 @@ pub fn plan_contains(plan: &Plan, wanted: fn(&Plan) -> bool) -> bool {
             Plan::Sort(p) => plan_contains(&p.child, wanted),
             Plan::ExternalMergeSort(p) => plan_contains(&p.child, wanted),
             Plan::Limit(p) => plan_contains(&p.child, wanted),
+            Plan::Update(p) => plan_contains(&p.child, wanted),
+            Plan::Delete(p) => plan_contains(&p.child, wanted),
             _ => false,
         }
 }

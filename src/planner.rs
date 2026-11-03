@@ -140,13 +140,7 @@ impl<'a> Planner<'a> {
             }
         };
 
-        if let Some(pred) = remaining_filter {
-            plan = Plan::Filter(FilterPlanNode {
-                schema: source_schema.clone(),
-                predicate: pred,
-                child: Box::new(plan),
-            });
-        }
+        plan = filtered(plan, &source_schema, remaining_filter);
 
         if !windows.is_empty() {
             check_window_input_width(&scope, &source_schema)?;
@@ -230,14 +224,8 @@ impl<'a> Planner<'a> {
     fn plan_delete(&self, del: BoundDelete) -> Result<Plan, PlannerError> {
         let ts = only_table(&del.scope, "DELETE")?;
         let filter = conjunction(del.filters);
-        let (mut scan, remaining) = self.build_scan(ts, filter);
-        if let Some(pred) = remaining {
-            scan = Plan::Filter(FilterPlanNode {
-                schema: ts.schema.clone(),
-                predicate: pred,
-                child: Box::new(scan),
-            });
-        }
+        let (scan, remaining) = self.build_scan(ts, filter);
+        let scan = filtered(scan, &ts.schema, remaining);
         Ok(Plan::Delete(DeletePlanNode {
             schema: ts.schema.clone(),
             child: Box::new(scan),
@@ -248,14 +236,8 @@ impl<'a> Planner<'a> {
     fn plan_update(&self, upd: BoundUpdate) -> Result<Plan, PlannerError> {
         let ts = only_table(&upd.scope, "UPDATE")?;
         let filter = conjunction(upd.filters);
-        let (mut scan, remaining) = self.build_scan(ts, filter);
-        if let Some(pred) = remaining {
-            scan = Plan::Filter(FilterPlanNode {
-                schema: ts.schema.clone(),
-                predicate: pred,
-                child: Box::new(scan),
-            });
-        }
+        let (scan, remaining) = self.build_scan(ts, filter);
+        let scan = filtered(scan, &ts.schema, remaining);
 
         let mut assignments = Vec::with_capacity(upd.cols.len());
         for (col, value) in upd.cols.into_iter().zip(upd.new_cols) {
@@ -585,6 +567,19 @@ fn distinct_rows(plan: Plan, schema: &Schema) -> Plan {
         group_bys,
         aggregates: vec![],
     })
+}
+
+/// `plan` under a filter on `predicate`, or `plan` itself when there is no predicate. `schema`
+/// is `plan`'s output layout, which the filter keeps.
+fn filtered(plan: Plan, schema: &Schema, predicate: Option<Expression>) -> Plan {
+    match predicate {
+        Some(predicate) => Plan::Filter(FilterPlanNode {
+            schema: schema.clone(),
+            predicate,
+            child: Box::new(plan),
+        }),
+        None => plan,
+    }
 }
 
 /// The name of the source column a plain column reference reads, else `fallback()`.

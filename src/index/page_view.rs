@@ -13,11 +13,7 @@
 use crate::buf::{get_u32_le, get_u64_le, put_u32_le, put_u64_le};
 use crate::disk::PAGE_SIZE;
 use crate::ids::RecordId;
-use crate::index::b_plus_page::{
-    HEADER_FIXED_HEADER_BYTES, INTERNAL_FIXED_HEADER_BYTES, LEAF_FIXED_HEADER_BYTES, LeafPage,
-    NUM_TOMBSTONES, PAGE_ID_ENCODED_BYTES, PageId, RECORD_ID_ENCODED_BYTES,
-    TOMBSTONE_SLOT_ENCODED_BYTES,
-};
+use crate::index::b_plus_page::{HEADER_FIXED_HEADER_BYTES, Layout, NUM_TOMBSTONES, PageId};
 use crate::index::page_codec::{
     COMMON_HEADER_BYTES, KIND_HEADER, KIND_INTERNAL, KIND_LEAF, PageCodecError,
     decode_child_page_id, decode_page_id, decode_record_id, encode_page_id, expect_common_header,
@@ -30,13 +26,6 @@ fn check_len(buf: &[u8]) -> Result<(), PageCodecError> {
         return Err(PageCodecError::InvalidSize);
     }
     Ok(())
-}
-
-fn check_key_len(key_len: u32) -> Result<usize, PageCodecError> {
-    match usize::try_from(key_len) {
-        Ok(0) | Err(_) => Err(PageCodecError::Malformed("key_len must be > 0")),
-        Ok(k) => Ok(k),
-    }
 }
 
 /// Binary search for the first index in `0..n` where `pred` is false, for a `pred` that is
@@ -78,7 +67,7 @@ impl<B: AsRef<[u8]>> HeaderPageView<B> {
         get_u32_le(self.buf.as_ref(), HDR_KEY_LEN_OFF)
     }
 
-    /// The tree's root page, or `None` for an empty tree.
+    /// The tree's root, or `None` for an empty tree.
     pub fn root_page_id(&self) -> Result<Option<PageId>, PageCodecError> {
         decode_page_id(get_u64_le(self.buf.as_ref(), HDR_ROOT_OFF))
     }
@@ -92,7 +81,7 @@ impl<B: AsRef<[u8]>> HeaderPageView<B> {
 impl<B: AsRef<[u8]> + AsMut<[u8]>> HeaderPageView<B> {
     /// Formats `buf` as a header page for an empty tree.
     pub fn init(mut buf: B, key_len: u32) -> Result<Self, PageCodecError> {
-        check_key_len(key_len)?;
+        Layout::new(key_len)?;
         let b = buf.as_mut();
         check_len(b)?;
         b[..HEADER_FIXED_HEADER_BYTES].fill(0);
@@ -128,10 +117,10 @@ pub enum NodeView<B> {
 }
 
 impl<B: AsRef<[u8]>> NodeView<B> {
-    pub fn new(buf: B, key_len: u32) -> Result<Self, PageCodecError> {
+    pub fn new(buf: B, layout: Layout) -> Result<Self, PageCodecError> {
         match peek_common_header(buf.as_ref())? {
-            KIND_INTERNAL => Ok(Self::Internal(InternalPageView::new(buf, key_len)?)),
-            KIND_LEAF => Ok(Self::Leaf(LeafPageView::new(buf, key_len)?)),
+            KIND_INTERNAL => Ok(Self::Internal(InternalPageView::new(buf, layout)?)),
+            KIND_LEAF => Ok(Self::Leaf(LeafPageView::new(buf, layout)?)),
             k => Err(PageCodecError::InvalidPageKind(k)),
         }
     }
@@ -155,12 +144,11 @@ impl<B: AsRef<[u8]>> NodeView<B> {
 /// `size` keys of `key_len` bytes each.
 pub struct InternalPageView<B> {
     buf: B,
-    key_len: usize,
+    layout: Layout,
 }
 
 impl<B: AsRef<[u8]>> InternalPageView<B> {
-    pub fn new(buf: B, key_len: u32) -> Result<Self, PageCodecError> {
-        let key_len = check_key_len(key_len)?;
+    pub fn new(buf: B, layout: Layout) -> Result<Self, PageCodecError> {
         let b = buf.as_ref();
         check_len(b)?;
         expect_common_header(b, KIND_INTERNAL)?;
@@ -176,15 +164,13 @@ impl<B: AsRef<[u8]>> InternalPageView<B> {
                 "internal invariant violated: child_count != size + 1",
             ));
         }
-        let needed = child_count
-            .checked_mul(PAGE_ID_ENCODED_BYTES)
-            .and_then(|c| size.checked_mul(key_len).and_then(|k| c.checked_add(k)))
-            .and_then(|n| n.checked_add(INTERNAL_FIXED_HEADER_BYTES))
-            .ok_or(PageCodecError::InvalidSize)?;
+        let needed = layout
+            .internal_bytes(child_count, size)
+            .map_err(|_| PageCodecError::InvalidSize)?;
         if needed > PAGE_SIZE {
             return Err(PageCodecError::InvalidSize);
         }
-        Ok(Self { buf, key_len })
+        Ok(Self { buf, layout })
     }
 
     #[inline]
@@ -214,7 +200,7 @@ impl<B: AsRef<[u8]>> InternalPageView<B> {
         if idx >= self.child_count() {
             return Ok(None);
         }
-        let off = INTERNAL_FIXED_HEADER_BYTES + idx * PAGE_ID_ENCODED_BYTES;
+        let off = self.layout.internal_child_offset(idx);
         decode_child_page_id(get_u64_le(self.bytes(), off)).map(Some)
     }
 
@@ -224,9 +210,8 @@ impl<B: AsRef<[u8]>> InternalPageView<B> {
             idx < self.size() as usize,
             "internal key index out of bounds"
         );
-        let keys_off = INTERNAL_FIXED_HEADER_BYTES + self.child_count() * PAGE_ID_ENCODED_BYTES;
-        let off = keys_off + idx * self.key_len;
-        &self.bytes()[off..off + self.key_len]
+        let off = self.layout.internal_key_offset(self.child_count(), idx);
+        &self.bytes()[off..off + self.layout.key_len()]
     }
 
     /// Same contract as `InternalPage::find_child_index`: the number of keys `<= key`.
@@ -261,30 +246,25 @@ pub enum LeafInsertError {
 /// `u32` tombstone count and that many `u32` slot indexes (oldest first).
 pub struct LeafPageView<B> {
     buf: B,
-    key_len: usize,
+    layout: Layout,
 }
 
 impl<B: AsRef<[u8]>> LeafPageView<B> {
-    pub fn new(buf: B, key_len: u32) -> Result<Self, PageCodecError> {
-        let key_len_usize = check_key_len(key_len)?;
-        let view = Self {
-            buf,
-            key_len: key_len_usize,
-        };
+    pub fn new(buf: B, layout: Layout) -> Result<Self, PageCodecError> {
+        let view = Self { buf, layout };
         let b = view.bytes();
         check_len(b)?;
         expect_common_header(b, KIND_LEAF)?;
         let size = view.size() as usize;
-        let live_end = size
-            .checked_mul(view.entry_bytes())
-            .and_then(|n| n.checked_add(LEAF_FIXED_HEADER_BYTES))
-            .ok_or(PageCodecError::InvalidSize)?;
+        let live_end = layout
+            .leaf_live_bytes(size)
+            .map_err(|_| PageCodecError::InvalidSize)?;
         if live_end > PAGE_SIZE {
             return Err(PageCodecError::InvalidSize);
         }
-        if live_end + TOMBSTONE_SLOT_ENCODED_BYTES <= PAGE_SIZE {
+        if view.has_tomb_section() {
             let count = get_u32_le(b, live_end) as usize;
-            if live_end + TOMBSTONE_SLOT_ENCODED_BYTES * (count + 1) > PAGE_SIZE {
+            if !matches!(layout.leaf_bytes(size, count), Ok(n) if n <= PAGE_SIZE) {
                 return Err(PageCodecError::Malformed(
                     "leaf tombstones section exceeds remaining bytes",
                 ));
@@ -324,22 +304,28 @@ impl<B: AsRef<[u8]>> LeafPageView<B> {
 
     #[inline]
     fn entry_bytes(&self) -> usize {
-        self.key_len + RECORD_ID_ENCODED_BYTES
+        self.layout.leaf_entry_bytes()
     }
 
     #[inline]
     fn entry_off(&self, idx: usize) -> usize {
-        LEAF_FIXED_HEADER_BYTES + idx * self.entry_bytes()
+        self.layout.leaf_entry_offset(idx)
     }
 
     /// Offset of the tombstone count (immediately after the live entries).
     #[inline]
     fn tomb_count_off(&self) -> usize {
-        self.entry_off(self.size() as usize)
+        self.layout
+            .leaf_tombstone_count_offset(self.size() as usize)
+    }
+
+    #[inline]
+    fn tomb_off(&self, i: usize) -> usize {
+        self.layout.leaf_tombstone_offset(self.size() as usize, i)
     }
 
     fn has_tomb_section(&self) -> bool {
-        self.tomb_count_off() + TOMBSTONE_SLOT_ENCODED_BYTES <= PAGE_SIZE
+        self.layout.leaf_has_tombstone_section(self.size() as usize)
     }
 
     /// One past the last byte the page's logical contents occupy.
@@ -347,7 +333,7 @@ impl<B: AsRef<[u8]>> LeafPageView<B> {
         if !self.has_tomb_section() {
             return self.tomb_count_off();
         }
-        self.tomb_count_off() + TOMBSTONE_SLOT_ENCODED_BYTES * (1 + self.tombstone_count())
+        self.tomb_off(self.tombstone_count())
     }
 
     pub fn size(&self) -> u32 {
@@ -362,7 +348,6 @@ impl<B: AsRef<[u8]>> LeafPageView<B> {
         self.max_size() / 2
     }
 
-    /// The next leaf to the right, or `None` for the last leaf.
     pub fn next_leaf_id(&self) -> Result<Option<PageId>, PageCodecError> {
         decode_page_id(get_u64_le(self.bytes(), LEAF_NEXT_LEAF_OFF))
     }
@@ -383,14 +368,14 @@ impl<B: AsRef<[u8]>> LeafPageView<B> {
     pub fn key(&self, idx: usize) -> &[u8] {
         assert!(idx < self.size() as usize, "leaf key index out of bounds");
         let off = self.entry_off(idx);
-        &self.bytes()[off..off + self.key_len]
+        &self.bytes()[off..off + self.layout.key_len()]
     }
 
     /// Record id of entry `idx`, or an error if the stored id does not fit in `u32`. Panics if
     /// `idx >= size()`.
     pub fn record_id(&self, idx: usize) -> Result<RecordId, PageCodecError> {
         assert!(idx < self.size() as usize, "leaf entry index out of bounds");
-        let off = self.entry_off(idx) + self.key_len;
+        let off = self.entry_off(idx) + self.layout.key_len();
         decode_record_id(
             get_u64_le(self.bytes(), off),
             get_u64_le(self.bytes(), off + 8),
@@ -398,11 +383,8 @@ impl<B: AsRef<[u8]>> LeafPageView<B> {
     }
 
     pub fn tombstone_capacity(&self) -> usize {
-        LeafPage::tombstone_capacity_for_layout(
-            self.max_size(),
-            self.key_len as u32,
-            NUM_TOMBSTONES,
-        ) as usize
+        self.layout
+            .tombstone_capacity(self.max_size(), NUM_TOMBSTONES) as usize
     }
 
     pub fn tombstone_count(&self) -> usize {
@@ -415,7 +397,7 @@ impl<B: AsRef<[u8]>> LeafPageView<B> {
     /// The `i`-th tombstone (oldest first).
     pub fn tombstone(&self, i: usize) -> u32 {
         assert!(i < self.tombstone_count(), "tombstone index out of bounds");
-        let off = self.tomb_count_off() + TOMBSTONE_SLOT_ENCODED_BYTES * (1 + i);
+        let off = self.tomb_off(i);
         get_u32_le(self.bytes(), off)
     }
 
@@ -474,12 +456,12 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> LeafPageView<B> {
     }
 
     fn set_tombstone(&mut self, i: usize, slot: u32) {
-        let off = self.tomb_count_off() + TOMBSTONE_SLOT_ENCODED_BYTES * (1 + i);
+        let off = self.tomb_off(i);
         put_u32_le(self.bytes_mut(), off, slot);
     }
 
     fn write_entry(&mut self, idx: usize, key: &[u8], rid: RecordId) {
-        let key_len = self.key_len;
+        let key_len = self.layout.key_len();
         let off = self.entry_off(idx);
         let b = self.bytes_mut();
         b[off..off + key_len].copy_from_slice(key);
@@ -508,7 +490,11 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> LeafPageView<B> {
     /// tombstone section) right by one entry with a single memmove. If `key` exists but is
     /// tombstoned, it is revived with the new record id instead, which takes no extra space.
     pub fn insert(&mut self, key: &[u8], rid: RecordId) -> Result<(), LeafInsertError> {
-        assert_eq!(key.len(), self.key_len, "leaf insert key length mismatch");
+        assert_eq!(
+            key.len(),
+            self.layout.key_len(),
+            "leaf insert key length mismatch"
+        );
         match self.search(key) {
             Ok(pos) => {
                 let slot = pos as u32;
@@ -594,7 +580,10 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> LeafPageView<B> {
         }
 
         let count = self.tombstone_count();
-        let tombstone_fits_on_page = self.content_end() + TOMBSTONE_SLOT_ENCODED_BYTES <= PAGE_SIZE;
+        let tombstone_fits_on_page = self
+            .layout
+            .leaf_bytes(self.size() as usize, count + 1)
+            .is_ok_and(|n| n <= PAGE_SIZE);
         if !tombstone_fits_on_page {
             self.physical_remove_at(slot);
             return Ok(());
@@ -609,7 +598,10 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> LeafPageView<B> {
 mod tests {
     use super::*;
     use crate::catalog::index_schema::IndexKey;
-    use crate::index::b_plus_page::{HeaderPage, InternalPage};
+    use crate::index::b_plus_page::{
+        HeaderPage, InternalPage, LEAF_FIXED_HEADER_BYTES, LeafPage, RECORD_ID_ENCODED_BYTES,
+        TOMBSTONE_SLOT_ENCODED_BYTES,
+    };
     use crate::testing::pid;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -621,9 +613,13 @@ mod tests {
         }
     }
 
+    fn layout(key_len: u32) -> Layout {
+        Layout::new(key_len).unwrap()
+    }
+
     fn encode_leaf(leaf: &LeafPage, key_len: u32) -> Box<[u8; PAGE_SIZE]> {
         let mut buf = Box::new([0u8; PAGE_SIZE]);
-        leaf.encode(&mut buf[..], key_len).unwrap();
+        leaf.encode(&mut buf[..], layout(key_len)).unwrap();
         buf
     }
 
@@ -659,7 +655,7 @@ mod tests {
     #[test]
     fn header_view_rejects_wrong_kind_and_bad_magic() {
         let mut buf = [0u8; PAGE_SIZE];
-        LeafPage::new(4, 0).encode(&mut buf, 1).unwrap();
+        LeafPage::new(4, 0).encode(&mut buf, layout(1)).unwrap();
         assert!(matches!(
             HeaderPageView::new(&buf[..]),
             Err(PageCodecError::WrongPageKind { .. })
@@ -672,58 +668,25 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_child_slot_is_a_codec_error_not_a_missing_child() {
-        let key_len = 1u32;
-        let mut internal = InternalPage::new(10);
-        internal.children = vec![pid(11), pid(22)];
-        internal.insert_key(0, IndexKey(vec![5]));
-        let mut buf = [0u8; PAGE_SIZE];
-        internal.encode(&mut buf, key_len).unwrap();
-        let second_child = INTERNAL_FIXED_HEADER_BYTES + PAGE_ID_ENCODED_BYTES;
-
-        put_u64_le(&mut buf, second_child, u64::MAX);
-        let view = InternalPageView::new(&buf[..], key_len).unwrap();
-        assert_eq!(view.child(0), Ok(Some(pid(11))));
-        assert_eq!(
-            view.child_for(&[9]),
-            Err(PageCodecError::Malformed(
-                "an internal page child names no page"
-            ))
-        );
-        assert_eq!(
-            InternalPage::decode(&buf, key_len).err(),
-            view.child_for(&[9]).err()
-        );
-
-        put_u64_le(&mut buf, second_child, u64::from(u32::MAX));
-        let view = InternalPageView::new(&buf[..], key_len).unwrap();
-        assert!(matches!(view.child(1), Err(PageCodecError::BufferError(_))));
-    }
-
-    #[test]
     fn internal_view_matches_owned_page() {
         let key_len = 2u32;
-        let mut internal = InternalPage::new(10);
-        internal.children = vec![pid(11), pid(22), pid(33), pid(44)];
-        internal.keys = vec![
-            IndexKey(vec![1, 2]),
-            IndexKey(vec![3, 4]),
-            IndexKey(vec![3, 9]),
-        ];
+        let mut internal = InternalPage::new_root(10, pid(11), IndexKey(vec![1, 2]), pid(22));
+        internal.append_key_and_child(IndexKey(vec![3, 4]), pid(33));
+        internal.append_key_and_child(IndexKey(vec![3, 9]), pid(44));
         internal.insert_key(0, IndexKey(vec![0, 0]));
         internal.remove_key(0);
         let mut buf = [0u8; PAGE_SIZE];
-        internal.encode(&mut buf, key_len).unwrap();
+        internal.encode(&mut buf, layout(key_len)).unwrap();
 
-        let view = InternalPageView::new(&buf[..], key_len).unwrap();
+        let view = InternalPageView::new(&buf[..], layout(key_len)).unwrap();
         assert_eq!(view.size(), 3);
         assert_eq!(view.max_size(), 10);
         assert_eq!(view.child_count(), 4);
-        for (i, c) in internal.children.iter().enumerate() {
+        for (i, c) in internal.children().iter().enumerate() {
             assert_eq!(view.child(i), Ok(Some(*c)));
         }
         assert_eq!(view.child(4), Ok(None));
-        for (i, k) in internal.keys.iter().enumerate() {
+        for (i, k) in internal.keys().iter().enumerate() {
             assert_eq!(view.key(i), &k.0[..]);
         }
         for probe in [[0u8, 0], [1, 2], [2, 0], [3, 4], [3, 5], [3, 9], [9, 9]] {
@@ -735,11 +698,11 @@ mod tests {
             );
         }
         assert!(matches!(
-            NodeView::new(&buf[..], key_len),
+            NodeView::new(&buf[..], layout(key_len)),
             Ok(NodeView::Internal(_))
         ));
         assert!(matches!(
-            LeafPageView::new(&buf[..], key_len),
+            LeafPageView::new(&buf[..], layout(key_len)),
             Err(PageCodecError::WrongPageKind { .. })
         ));
     }
@@ -751,11 +714,11 @@ mod tests {
         for k in [10u8, 20, 30, 40, 50] {
             leaf.insert(IndexKey(vec![k]), rid(k as u32)).unwrap();
         }
-        leaf.next_leaf_id = Some(pid(77));
+        leaf.set_next_leaf_id(Some(pid(77)));
         leaf.remove_key(&IndexKey(vec![30])).unwrap();
         let buf = encode_leaf(&leaf, key_len);
 
-        let view = LeafPageView::new(&buf[..], key_len).unwrap();
+        let view = LeafPageView::new(&buf[..], layout(key_len)).unwrap();
         assert_eq!(view.size(), 5);
         assert_eq!(view.next_leaf_id(), Ok(Some(pid(77))));
         assert_eq!(view.tombstone_count(), 1);
@@ -765,7 +728,7 @@ mod tests {
             assert_eq!(view.get(&[probe]).unwrap(), leaf.get(&key), "get {probe}");
             assert_eq!(view.lower_bound(&[probe]), leaf.lower_bound(&key));
             assert_eq!(view.upper_bound(&[probe]), leaf.upper_bound(&key));
-            assert_eq!(view.search(&[probe]), leaf.keys.binary_search(&key));
+            assert_eq!(view.search(&[probe]), leaf.search(&key));
         }
     }
 
@@ -803,13 +766,13 @@ mod tests {
         for (what, buf) in &rejected_by_view {
             assert!(
                 matches!(
-                    LeafPageView::new(&buf[..], key_len),
+                    LeafPageView::new(&buf[..], layout(key_len)),
                     Err(PageCodecError::Malformed(_))
                 ),
                 "view rejects {what}"
             );
             assert!(
-                LeafPage::decode(&buf[..], key_len).is_err(),
+                LeafPage::decode(&buf[..], layout(key_len)).is_err(),
                 "decode rejects {what}"
             );
         }
@@ -819,18 +782,18 @@ mod tests {
             corrupted(&|b| put_u64_le(b, first_rid_off + 8, u64::from(u32::MAX) + 1)),
         ];
         for buf in &wide_ids {
-            let view = LeafPageView::new(&buf[..], key_len).unwrap();
+            let view = LeafPageView::new(&buf[..], layout(key_len)).unwrap();
             assert!(
                 view.record_id(0).is_err(),
                 "a wide record id is reported, not truncated"
             );
             assert!(view.get(&[10]).is_err());
-            assert!(LeafPage::decode(&buf[..], key_len).is_err());
+            assert!(LeafPage::decode(&buf[..], layout(key_len)).is_err());
         }
 
         let out_of_order = corrupted(&|b| b[LEAF_FIXED_HEADER_BYTES] = 99);
         assert!(
-            LeafPage::decode(&out_of_order[..], key_len).is_err(),
+            LeafPage::decode(&out_of_order[..], layout(key_len)).is_err(),
             "decode rejects keys out of order instead of asserting"
         );
     }
@@ -841,9 +804,10 @@ mod tests {
     fn differential(key_len: u32, max_size: u32, tombstones: u32, seed: u64, ops: usize) {
         let mut rng = StdRng::seed_from_u64(seed);
         let mut owned = LeafPage::new(max_size, tombstones);
-        owned.next_leaf_id = Some(pid(5));
+        owned.set_next_leaf_id(Some(pid(5)));
         let mut buf = encode_leaf(&owned, key_len);
-        let owned_with_persisted_tombstone_capacity = LeafPage::decode(&buf[..], key_len).unwrap();
+        let owned_with_persisted_tombstone_capacity =
+            LeafPage::decode(&buf[..], layout(key_len)).unwrap();
         owned = owned_with_persisted_tombstone_capacity;
 
         for step in 0..ops {
@@ -851,7 +815,7 @@ mod tests {
             let key = IndexKey(k.clone());
             let r = rid(rng.random_range(0..1000));
             if rng.random_bool(0.6) {
-                let mut view = LeafPageView::new(&mut buf[..], key_len).unwrap();
+                let mut view = LeafPageView::new(&mut buf[..], layout(key_len)).unwrap();
                 match view.insert(&k, r) {
                     Ok(()) => owned.insert(key, r).unwrap(),
                     Err(LeafInsertError::DuplicateKey) => {
@@ -862,7 +826,7 @@ mod tests {
                     }
                 }
             } else {
-                let mut view = LeafPageView::new(&mut buf[..], key_len).unwrap();
+                let mut view = LeafPageView::new(&mut buf[..], layout(key_len)).unwrap();
                 let got = view.remove_key(&k).is_ok();
                 let want = owned.remove_key(&key).is_ok();
                 assert_eq!(got, want, "step {step}: remove result");
@@ -872,7 +836,7 @@ mod tests {
                 buf[..] == expected[..],
                 "step {step}: view bytes diverged from owned encoding"
             );
-            LeafPageView::new(&buf[..], key_len).unwrap();
+            LeafPageView::new(&buf[..], layout(key_len)).unwrap();
         }
     }
 
@@ -888,7 +852,7 @@ mod tests {
         let key_len = 1u32;
         let max_size = 480;
         assert_eq!(
-            LeafPage::tombstone_capacity_for_layout(max_size, key_len, NUM_TOMBSTONES),
+            layout(key_len).tombstone_capacity(max_size, NUM_TOMBSTONES),
             1,
             "480 live entries leave room for the tombstone count and a single tombstone, so every second delete is physical"
         );
@@ -913,7 +877,7 @@ mod tests {
         }
         let mut buf = encode_leaf(&leaf, key_len);
         let before = buf.clone();
-        let mut view = LeafPageView::new(&mut buf[..], key_len).unwrap();
+        let mut view = LeafPageView::new(&mut buf[..], layout(key_len)).unwrap();
         assert_eq!(view.insert(&[9], rid(9)), Err(LeafInsertError::Full));
         assert_eq!(
             view.insert(&[2], rid(9)),
@@ -921,7 +885,7 @@ mod tests {
         );
         assert!(buf[..] == before[..]);
 
-        let mut view = LeafPageView::new(&mut buf[..], key_len).unwrap();
+        let mut view = LeafPageView::new(&mut buf[..], layout(key_len)).unwrap();
         view.remove_key(&[2]).unwrap();
         view.insert(&[2], rid(42)).unwrap();
         assert_eq!(view.get(&[2]).unwrap(), Some(rid(42)));
@@ -935,6 +899,34 @@ mod tests {
         let mut buf = encode_leaf(&leaf, key_len);
         let off = LEAF_FIXED_HEADER_BYTES;
         put_u32_le(&mut buf[..], off, u32::MAX);
-        assert!(LeafPageView::new(&buf[..], key_len).is_err());
+        assert!(LeafPageView::new(&buf[..], layout(key_len)).is_err());
+    }
+
+    #[test]
+    fn a_corrupt_child_slot_is_a_codec_error_not_a_missing_child() {
+        let key_len = 1u32;
+        let lay = layout(key_len);
+        let internal = InternalPage::new_root(10, pid(11), IndexKey(vec![5]), pid(22));
+        let mut buf = [0u8; PAGE_SIZE];
+        internal.encode(&mut buf, lay).unwrap();
+        let second_child = lay.internal_child_offset(1);
+
+        put_u64_le(&mut buf, second_child, u64::MAX);
+        let view = InternalPageView::new(&buf[..], lay).unwrap();
+        assert_eq!(view.child(0), Ok(Some(pid(11))));
+        assert_eq!(
+            view.child_for(&[9]),
+            Err(PageCodecError::Malformed(
+                "an internal page child names no page"
+            ))
+        );
+        assert_eq!(
+            InternalPage::decode(&buf, lay).err(),
+            view.child_for(&[9]).err()
+        );
+
+        put_u64_le(&mut buf, second_child, u64::from(u32::MAX));
+        let view = InternalPageView::new(&buf[..], lay).unwrap();
+        assert!(matches!(view.child(1), Err(PageCodecError::BufferError(_))));
     }
 }

@@ -1,9 +1,9 @@
-use crate::processor::executor::{
-    AggregationExecutor, CreateIndexExecutor, CreateTableExecutor, DEFAULT_BATCH_SIZE,
-    DeleteExecutor, DropIndexExecutor, DropTableExecutor, Executor, ExecutorContext,
-    ExternalMergeSortExecutor, FilterExecutor, HashJoinExecutor, IndexScanExecutor, InsertExecutor,
-    LimitExecutor, NestedIndexJoinExecutor, NestedLoopJoinExecutor, ProjectionExecutor,
-    SeqScanExecutor, SortExecutor, UpdateExecutor, ValuesExecutor, WindowFunctionExecutor,
+use crate::processor::executor::{DEFAULT_BATCH_SIZE, Executor, ExecutorContext};
+use crate::processor::executors::{
+    AggregationExecutor, DdlExecutor, DdlOp, DeleteExecutor, ExternalMergeSortExecutor,
+    FilterExecutor, HashJoinExecutor, IndexScanExecutor, InsertExecutor, LimitExecutor,
+    NestedIndexJoinExecutor, NestedLoopJoinExecutor, ProjectionExecutor, SeqScanExecutor,
+    SortExecutor, UpdateExecutor, ValuesExecutor, WindowFunctionExecutor,
 };
 use crate::processor::plan::Plan;
 
@@ -23,6 +23,8 @@ pub fn create_executor_with_batch_size<'a>(
     let catalog = ctx.catalog;
     let bpm = &ctx.bpm;
     let build = |child: &'a Plan| create_executor_with_batch_size(ctx, child, batch_size);
+    let ddl =
+        |op| -> Box<dyn Executor + 'a> { Box::new(DdlExecutor::new(catalog, bpm.clone(), op)) };
     match plan {
         Plan::SeqScan(p) => Box::new(SeqScanExecutor::new(ctx, p, batch_size)),
         Plan::Insert(p) => {
@@ -93,10 +95,10 @@ pub fn create_executor_with_batch_size<'a>(
             let child = build(&p.child);
             Box::new(ProjectionExecutor::new(p, child))
         }
-        Plan::CreateTable(p) => Box::new(CreateTableExecutor::new(catalog, p)),
-        Plan::DropTable(p) => Box::new(DropTableExecutor::new(catalog, p)),
-        Plan::CreateIndex(p) => Box::new(CreateIndexExecutor::new(catalog, p, bpm.clone())),
-        Plan::DropIndex(p) => Box::new(DropIndexExecutor::new(catalog, p)),
+        Plan::CreateTable(p) => ddl(DdlOp::CreateTable(p)),
+        Plan::DropTable(p) => ddl(DdlOp::DropTable(p)),
+        Plan::CreateIndex(p) => ddl(DdlOp::CreateIndex(p)),
+        Plan::DropIndex(p) => ddl(DdlOp::DropIndex(p)),
     }
 }
 

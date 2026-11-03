@@ -545,7 +545,8 @@ impl TableHeap {
 
     /// Overwrites a tuple and its metadata in place, keeping its record id. The new tuple may be
     /// longer or shorter than the old one; when its page has no room for it, the write fails with
-    /// [`TablePageError::UpdateDoesNotFit`] and changes nothing.
+    /// [`TablePageError::UpdateDoesNotFit`] and changes nothing. Transactional updates then move
+    /// the row to a new record id (see [`crate::concurrency::mvcc::update_tuple`]).
     pub fn update_in_place(
         &self,
         rid: RecordId,
