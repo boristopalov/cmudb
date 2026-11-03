@@ -989,10 +989,9 @@ impl DataType {
         }
     }
 
-    /// Bytes an index key spends on a value of this type, padded with zeros after the value's
-    /// [`Value::encode_order_preserving`] encoding, so that every key of an index has one length.
-    /// A `VARCHAR(n)` or `CHAR(n)` takes the encoding of `n` four-byte characters; TEXT has no
-    /// bound and so no width.
+    /// The most bytes a value of this type's [`Value::encode_order_preserving`] encoding takes
+    /// in an index key. A `VARCHAR(n)` or `CHAR(n)` takes at most the encoding of `n` four-byte
+    /// characters; TEXT has no bound and so no width.
     pub fn key_width(&self) -> Option<usize> {
         match self {
             DataType::TEXT => None,

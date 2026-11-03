@@ -3,12 +3,13 @@ pub mod b_plus_tree;
 pub mod context;
 mod page_codec;
 pub mod page_view;
+mod slotted;
 use std::fmt;
 use std::ops::Bound;
 
 use crate::buffer_pool::BpmError;
+use crate::catalog::CatalogError;
 use crate::catalog::index_schema::{IndexKey, IndexValue};
-use crate::catalog::{CatalogError, DataType};
 use crate::index::page_codec::PageCodecError;
 pub use b_plus_tree::*;
 pub type InsertResult = Result<(), IndexError>;
@@ -26,8 +27,14 @@ pub trait Index {
 pub enum IndexError {
     Insert(InsertError),
     Remove(RemoveError),
-    KeyLength {
+    /// The tree's header page was written for keys of a different maximum length.
+    MaxKeyLength {
         expected: usize,
+        actual: usize,
+    },
+    /// A key is longer than the longest key the index holds.
+    KeyTooLong {
+        max: usize,
         actual: usize,
     },
     UnsupportedKeyLength(u32),
@@ -36,11 +43,6 @@ pub enum IndexError {
     Structure(&'static str),
     /// A key column could not be read from a table tuple.
     Catalog(CatalogError),
-    /// A key column has a type with no fixed key width, such as TEXT.
-    UnindexableColumn {
-        column: String,
-        dtype: DataType,
-    },
 }
 
 #[derive(Debug)]
@@ -82,9 +84,14 @@ impl fmt::Display for IndexError {
         match self {
             IndexError::Insert(e) => write!(f, "insert failed: {e}"),
             IndexError::Remove(e) => write!(f, "remove failed: {e}"),
-            IndexError::KeyLength { expected, actual } => {
-                write!(f, "key is {actual} bytes but the index expects {expected}")
-            }
+            IndexError::MaxKeyLength { expected, actual } => write!(
+                f,
+                "the index holds keys of up to {actual} bytes but was opened for {expected}"
+            ),
+            IndexError::KeyTooLong { max, actual } => write!(
+                f,
+                "an index key of {actual} bytes is longer than the {max} bytes the index holds"
+            ),
             IndexError::UnsupportedKeyLength(len) => {
                 write!(f, "an index key of {len} bytes cannot fit in a page")
             }
@@ -92,10 +99,6 @@ impl fmt::Display for IndexError {
             IndexError::PageError(e) => write!(f, "page decode/encode error: {e}"),
             IndexError::Structure(msg) => write!(f, "b+ tree structure violated: {msg}"),
             IndexError::Catalog(e) => write!(f, "cannot read the key from the tuple: {e}"),
-            IndexError::UnindexableColumn { column, dtype } => write!(
-                f,
-                "column `{column}` is {dtype}, which cannot be an index key; declare it VARCHAR(n) to index it"
-            ),
         }
     }
 }
@@ -139,11 +142,18 @@ mod tests {
                 "insert failed: key already exists",
             ),
             (
-                IndexError::KeyLength {
+                IndexError::MaxKeyLength {
                     expected: 8,
                     actual: 3,
                 },
-                "key is 3 bytes but the index expects 8",
+                "the index holds keys of up to 3 bytes but was opened for 8",
+            ),
+            (
+                IndexError::KeyTooLong {
+                    max: 2007,
+                    actual: 3000,
+                },
+                "an index key of 3000 bytes is longer than the 2007 bytes the index holds",
             ),
             (
                 IndexError::UnsupportedKeyLength(0),

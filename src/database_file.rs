@@ -28,8 +28,9 @@ const HEADER_MAGIC: [u8; 8] = *b"CMUDB\0db";
 
 /// The version of this layout and of the table and index pages the data file holds. A data file
 /// written with another version is refused. Version 2 gave each table page slot a capacity, so
-/// rows can change length.
-pub const FORMAT_VERSION: u32 = 2;
+/// rows can change length. Version 3 stores index keys with variable lengths, so TEXT columns
+/// can be indexed.
+pub const FORMAT_VERSION: u32 = 3;
 
 const HEADER_VERSION_OFF: usize = 8;
 const HEADER_META_PAGE_OFF: usize = 12;
@@ -651,7 +652,7 @@ mod tests {
             ),
             (
                 PersistError::UnsupportedFormat(7),
-                "the data file has format version 7, but this cmudb reads version 2",
+                "the data file has format version 7, but this cmudb reads version 3",
             ),
             (
                 PersistError::CorruptMeta("x"),

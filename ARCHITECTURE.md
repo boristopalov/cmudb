@@ -52,7 +52,9 @@ typed `StatementResult` per statement. The shell (`src/main.rs`) only prints tho
   tail page before it latches the old tail to link it.
 - B+ tree latches go top down: header, root, then each child before its parent is
   released (`step_down`). Pessimistic inserts and removes write-latch the header and the
-  path, releasing ancestors once a child is safe (`TreeContext::descend_into`). Searches,
+  path, releasing ancestors once a child is safe (`TreeContext::descend_into`): for an
+  insert, an entry of the longest key still fits it; for a remove, losing one leaves it at
+  least minimally full by bytes. Searches,
   scans and the optimistic write path read-crab from the header, holding its read latch
   until the root is latched (`get_root_page_from_header`), so a root split or collapse
   cannot swap the root in between; an optimistic write trades the leaf's read latch for a

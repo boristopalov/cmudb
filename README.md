@@ -22,7 +22,8 @@ CONTRIBUTING.md lists the checks CI runs, and ARCHITECTURE.md maps the code.
 - a single data file per database holding the pages, the catalog and the transaction clocks, so
   tables, rows and indexes survive a restart; the file is locked while a process has it open
 - Adaptive replacement cache policy for pages
-- B+ tree indexes with optimistic latch coupling
+- B+ tree indexes with optimistic latch coupling and variable-length keys, on columns of any
+  type, `TEXT` included
 - Most executors described in the CMU course, exchanging batches of rows (pull-based, 1024 rows per batch by default)
 - MVCC with snapshot isolation (`BEGIN`/`COMMIT`/`ROLLBACK` in the shell; see docs/mvcc.md)
 - parser (using sqlparser crate), binder and a rule-based planner, each failing with its own
@@ -52,7 +53,7 @@ SQL the shell runs:
 - `HAVING`, subqueries, `WITH`, `OFFSET`, `IS NULL`, `NOT`, `LIKE`, `IN`, `CAST`, `%`, string
   functions and `||`, joins of more than two tables, window frames (`ROWS`/`RANGE`) and window
   functions in a `SELECT` that also aggregates
-- indexes on plain `TEXT` columns (index a `VARCHAR(n)` column instead)
+- index keys past 2007 bytes (a longer value in an indexed column is refused)
 - a row must fit in one 8 KiB page, and an `UPDATE` that grows a row past its page's free space
   fails instead of moving the row
 - `DROP TABLE` and `DROP INDEX` do not free their pages, and GC does not reclaim deleted rows'

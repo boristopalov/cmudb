@@ -2294,17 +2294,8 @@ fn text_type_errors_are_clear() {
 }
 
 #[test]
-fn varchar_columns_can_be_indexed_but_unbounded_text_cannot() {
+fn varchar_columns_can_be_indexed() {
     let db = people_db();
-    let err = db
-        .try_exec("CREATE INDEX by_team ON people (team)")
-        .expect_err("TEXT has no key width");
-    assert!(
-        err.contains("column `team` is TEXT, which cannot be an index key"),
-        "{err}"
-    );
-    assert!(db.catalog().index_oid("people", "by_team").is_err());
-
     db.exec("CREATE INDEX by_name ON people (name)");
     let lookup = "SELECT id FROM people WHERE name = 'cy'";
     assert!(plan_contains(&db.plan_of(lookup), |p| matches!(
@@ -2332,6 +2323,151 @@ fn varchar_columns_can_be_indexed_but_unbounded_text_cannot() {
             .is_err(),
         "the index keeps names unique"
     );
+}
+
+/// A note body of `len` characters that sorts by `n` first.
+fn note_body(n: i32, len: usize) -> String {
+    let mut body = format!("note {n:04} ");
+    while body.len() < len {
+        body.push(char::from(b'a' + (body.len() % 26) as u8));
+    }
+    body
+}
+
+/// A table of notes whose bodies run from a few to over a thousand characters, indexed on the
+/// body, with `count` rows numbered from 0.
+fn notes_db(count: i32) -> Db {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE notes (id INT, body TEXT)");
+    db.exec("CREATE INDEX by_body ON notes (body)");
+    for n in 0..count {
+        let body = note_body(n, (n as usize * 97) % 1200);
+        db.exec(&format!("INSERT INTO notes VALUES ({n}, '{body}')"));
+    }
+    db
+}
+
+#[test]
+fn text_columns_can_be_indexed_for_lookups_and_ranges() {
+    let db = notes_db(300);
+    let body = note_body(123, 123 * 97 % 1200);
+    let lookup = format!("SELECT id FROM notes WHERE body = '{body}'");
+    assert!(plan_contains(&db.plan_of(&lookup), |p| matches!(
+        p,
+        Plan::IndexScan(_)
+    )));
+    assert_eq!(ints(&db.exec(&lookup)), vec![[123]]);
+    assert!(
+        db.exec("SELECT id FROM notes WHERE body = 'note 0123'")
+            .is_empty(),
+        "a prefix of a body is another key"
+    );
+
+    let range = "SELECT id FROM notes WHERE body >= 'note 0100' AND body < 'note 0105'";
+    assert_eq!(
+        ints(&db.exec(range)),
+        (100..105).map(|n| [n]).collect::<Vec<_>>()
+    );
+
+    db.exec("DELETE FROM notes WHERE id >= 50");
+    db.exec(&format!(
+        "UPDATE notes SET body = '{}' WHERE id = 7",
+        note_body(7000, 900)
+    ));
+    assert!(
+        db.exec("SELECT id FROM notes WHERE body = 'note 7000'")
+            .is_empty()
+    );
+    let moved = format!(
+        "SELECT id FROM notes WHERE body = '{}'",
+        note_body(7000, 900)
+    );
+    assert_eq!(ints(&db.exec(&moved)), vec![[7]]);
+    assert_eq!(db.exec("SELECT id FROM notes").len(), 50);
+    assert!(
+        db.try_exec(&format!(
+            "INSERT INTO notes VALUES (99, '{}')",
+            note_body(3, 3 * 97)
+        ))
+        .is_err(),
+        "the index keeps bodies unique"
+    );
+}
+
+#[test]
+fn creating_a_text_index_over_existing_rows_finds_them() {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE notes (id INT, body TEXT)");
+    for n in 0..40 {
+        db.exec(&format!(
+            "INSERT INTO notes VALUES ({n}, '{}')",
+            note_body(n, 40 * n as usize)
+        ));
+    }
+    db.exec("CREATE INDEX by_body ON notes (body)");
+    let lookup = format!(
+        "SELECT id FROM notes WHERE body = '{}'",
+        note_body(31, 40 * 31)
+    );
+    assert!(plan_contains(&db.plan_of(&lookup), |p| matches!(
+        p,
+        Plan::IndexScan(_)
+    )));
+    assert_eq!(ints(&db.exec(&lookup)), vec![[31]]);
+}
+
+#[test]
+fn a_text_value_too_long_for_the_index_is_refused_and_not_stored() {
+    let db = notes_db(5);
+    let too_long = "x".repeat(3000);
+    let err = db
+        .try_exec(&format!("INSERT INTO notes VALUES (9, '{too_long}')"))
+        .expect_err("a 3000-byte key does not fit the index");
+    assert!(err.contains("longer than the"), "{err}");
+    assert_eq!(db.exec("SELECT id FROM notes").len(), 5);
+    assert!(
+        db.exec("SELECT id FROM notes WHERE id = 9").is_empty(),
+        "the refused row is not stored"
+    );
+    assert!(
+        db.exec(&format!("SELECT id FROM notes WHERE body = '{too_long}'"))
+            .is_empty(),
+        "looking up a value too long for the index finds nothing"
+    );
+
+    db.exec("CREATE TABLE long_notes (body TEXT)");
+    db.exec(&format!("INSERT INTO long_notes VALUES ('{too_long}')"));
+    let err = db
+        .try_exec("CREATE INDEX by_long_body ON long_notes (body)")
+        .expect_err("an existing value too long for the index");
+    assert!(err.contains("longer than the"), "{err}");
+    assert!(
+        db.catalog()
+            .index_oid("long_notes", "by_long_body")
+            .is_err()
+    );
+}
+
+#[test]
+fn a_wide_varchar_column_can_be_indexed_up_to_the_longest_key() {
+    let db = Db::new(64);
+    db.exec("CREATE TABLE docs (id INT, title VARCHAR(5000))");
+    db.exec("CREATE INDEX by_title ON docs (title)");
+    let title = note_body(1, 1500);
+    db.exec(&format!("INSERT INTO docs VALUES (1, '{title}')"));
+    assert_eq!(
+        ints(&db.exec(&format!("SELECT id FROM docs WHERE title = '{title}'"))),
+        vec![[1]]
+    );
+    assert!(
+        db.try_exec(&format!(
+            "INSERT INTO docs VALUES (2, '{}')",
+            "y".repeat(4000)
+        ))
+        .is_err(),
+        "a title that fits the column but not the index is refused"
+    );
+    assert_eq!(db.exec("SELECT id FROM docs").len(), 1);
 }
 
 #[test]
