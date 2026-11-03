@@ -303,3 +303,183 @@ mod tests {
         assert_eq!(AREA.check(&too_short, 2), Err(ENTRY_OUT_OF_BOUNDS));
     }
 }
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    const AREA: EntryArea = EntryArea::new(16, 2);
+    const MAX_ENTRIES: usize = 3;
+    const KEY_LENS: usize = 3;
+
+    /// Key lengths of `n` entries, one per base-`KEY_LENS` digit of `shape`. Harnesses loop over
+    /// every shape with concrete lengths and leave the key and payload bytes symbolic: symbolic
+    /// lengths make CBMC run out of memory on an 8 KiB page.
+    fn key_lens(n: usize, shape: usize) -> [usize; MAX_ENTRIES] {
+        core::array::from_fn(|i| {
+            if i < n {
+                shape / KEY_LENS.pow(i as u32) % KEY_LENS
+            } else {
+                0
+            }
+        })
+    }
+
+    fn shapes(n: usize) -> usize {
+        KEY_LENS.pow(n as u32)
+    }
+
+    #[derive(Clone, Copy)]
+    struct Entry {
+        key: [u8; KEY_LENS - 1],
+        key_len: usize,
+        payload: [u8; 2],
+    }
+
+    impl Entry {
+        fn any_with_key_len(key_len: usize) -> Self {
+            Entry {
+                key: kani::any(),
+                key_len,
+                payload: kani::any(),
+            }
+        }
+
+        fn key(&self) -> &[u8] {
+            &self.key[..self.key_len]
+        }
+    }
+
+    /// A zeroed page with `entries` laid out by [`EntryArea::put_entry`], the way the page
+    /// encoders in `b_plus_page` write them.
+    fn encode(entries: &[Entry]) -> [u8; PAGE_SIZE] {
+        let mut buf = [0u8; PAGE_SIZE];
+        let total: usize = entries
+            .iter()
+            .map(|e| AREA.entry_cost(e.key_len) - SLOT_ENCODED_BYTES)
+            .sum();
+        let mut at = PAGE_SIZE - total;
+        for (i, e) in entries.iter().enumerate() {
+            at = AREA.put_entry(&mut buf, i, at, e.key(), &e.payload);
+        }
+        assert_eq!(at, PAGE_SIZE);
+        buf
+    }
+
+    fn any_entries(n: usize, shape: usize) -> [Entry; MAX_ENTRIES] {
+        let lens = key_lens(n, shape);
+        core::array::from_fn(|i| Entry::any_with_key_len(lens[i]))
+    }
+
+    fn assert_entry(buf: &[u8], n: usize, i: usize, expected: &Entry) {
+        assert_eq!(AREA.key(buf, n, i), expected.key());
+        assert_eq!(AREA.payload(buf, n, i), &expected.payload);
+    }
+
+    /// Reads of an area that passed `check` stay inside the page without panicking, and its
+    /// used bytes fit within its capacity, so `free` cannot underflow. The page bytes are
+    /// unconstrained apart from passing `check`.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn reads_of_a_checked_area_stay_in_bounds() {
+        let buf: [u8; PAGE_SIZE] = kani::any();
+        let n: usize = kani::any();
+        kani::assume(n <= MAX_ENTRIES);
+        kani::assume(AREA.check(&buf, n).is_ok());
+        assert!(AREA.used(&buf, n) <= AREA.capacity());
+        let i: usize = kani::any();
+        kani::assume(i < n);
+        let key = AREA.key(&buf, n, i);
+        let payload = AREA.payload(&buf, n, i);
+        assert_eq!(payload.len(), AREA.payload_len());
+        assert!(key.len() + payload.len() <= AREA.capacity());
+    }
+
+    /// Up to `MAX_ENTRIES` entries written in order with `put_entry` form an area that passes
+    /// `check` and reads back as the same entries.
+    #[kani::proof]
+    #[kani::unwind(30)]
+    fn encoded_entries_pass_check_and_read_back() {
+        for n in 0..=MAX_ENTRIES {
+            for shape in 0..shapes(n) {
+                let entries = any_entries(n, shape);
+                let buf = encode(&entries[..n]);
+                assert_eq!(AREA.check(&buf, n), Ok(()));
+                for (i, e) in entries[..n].iter().enumerate() {
+                    assert_entry(&buf, n, i, e);
+                }
+            }
+        }
+    }
+
+    /// Inserting at any position of an encoded area leaves an area that passes `check`, holds
+    /// the new entry at `pos` with every old entry unchanged in order around it, has exactly
+    /// `entry_cost` fewer free bytes, and equals encoding the new list of entries.
+    #[kani::proof]
+    #[kani::unwind(30)]
+    fn insert_matches_encoding_the_new_list() {
+        for n in 0..MAX_ENTRIES {
+            for shape in 0..shapes(n) {
+                for new_len in 0..KEY_LENS {
+                    for pos in 0..=n {
+                        let before = any_entries(n, shape);
+                        let new = Entry::any_with_key_len(new_len);
+                        let mut buf = encode(&before[..n]);
+                        let free_before = AREA.free(&buf, n);
+
+                        AREA.insert(&mut buf, n, pos, new.key(), &new.payload);
+
+                        assert_eq!(AREA.check(&buf, n + 1), Ok(()));
+                        assert_eq!(
+                            AREA.free(&buf, n + 1),
+                            free_before - AREA.entry_cost(new_len)
+                        );
+                        assert_entry(&buf, n + 1, pos, &new);
+                        let mut after = before;
+                        after.copy_within(pos..n, pos + 1);
+                        after[pos] = new;
+                        for (i, e) in after[..=n].iter().enumerate() {
+                            assert_entry(&buf, n + 1, i, e);
+                        }
+                        let byte: usize = kani::any();
+                        kani::assume(byte < PAGE_SIZE);
+                        assert_eq!(buf[byte], encode(&after[..=n])[byte]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Removing any entry of an encoded area leaves an area that passes `check`, gives the
+    /// entry's bytes back as free space, and equals encoding the remaining entries, so the
+    /// bytes it frees are zeroed.
+    #[kani::proof]
+    #[kani::unwind(30)]
+    fn remove_matches_encoding_the_remaining_entries() {
+        for n in 1..=MAX_ENTRIES {
+            for shape in 0..shapes(n) {
+                for pos in 0..n {
+                    let before = any_entries(n, shape);
+                    let mut buf = encode(&before[..n]);
+                    let free_before = AREA.free(&buf, n);
+
+                    AREA.remove(&mut buf, n, pos);
+
+                    assert_eq!(AREA.check(&buf, n - 1), Ok(()));
+                    assert_eq!(
+                        AREA.free(&buf, n - 1),
+                        free_before + AREA.entry_cost(before[pos].key_len)
+                    );
+                    let mut after = before;
+                    after.copy_within(pos + 1..n, pos);
+                    for (i, e) in after[..n - 1].iter().enumerate() {
+                        assert_entry(&buf, n - 1, i, e);
+                    }
+                    let byte: usize = kani::any();
+                    kani::assume(byte < PAGE_SIZE);
+                    assert_eq!(buf[byte], encode(&after[..n - 1])[byte]);
+                }
+            }
+        }
+    }
+}

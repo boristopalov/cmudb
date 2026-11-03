@@ -35,3 +35,6 @@ required-features = ["bench"]
 name = "query"
 harness = false
 required-features = ["bench"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
