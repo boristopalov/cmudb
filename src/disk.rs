@@ -15,13 +15,15 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+use crate::ids::PageId;
+
 pub const PAGE_SIZE: usize = 8192;
 
 pub type PageData = Box<[u8; PAGE_SIZE]>;
 
 #[derive(Debug)]
 pub struct DiskRequest {
-    pub page_id: usize,
+    pub page_id: PageId,
     pub is_write: bool,
     pub data: PageData,
     pub promise: mpsc::Sender<Result<PageData, std::io::Error>>,
@@ -132,16 +134,16 @@ impl Drop for DiskScheduler {
 struct PageStore {
     db_file: File,
     /// Pages written and not deallocated since. Page `id` lives at [`offset_of`]`(id)`.
-    live: HashSet<usize>,
+    live: HashSet<PageId>,
 }
 
 /// The byte offset in the data file where page `id` is stored.
-fn offset_of(id: usize) -> u64 {
-    (id as u64) * PAGE_SIZE as u64
+fn offset_of(id: PageId) -> u64 {
+    u64::from(id.get()) * PAGE_SIZE as u64
 }
 
 impl PageStore {
-    fn live_offset(&self, id: usize) -> io::Result<u64> {
+    fn live_offset(&self, id: PageId) -> io::Result<u64> {
         if self.live.contains(&id) {
             return Ok(offset_of(id));
         }
@@ -186,7 +188,10 @@ impl DiskManager {
             .open(db_path)?;
         create_log_file_if_missing(log_path.as_ref())?;
         let pages_in_file = db_file.metadata()?.len() / PAGE_SIZE as u64;
-        let live = (0..pages_in_file as usize).collect();
+        let live = (0..pages_in_file)
+            .map(PageId::try_from)
+            .collect::<Result<_, _>>()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         Ok(Self {
             num_writes: AtomicU32::new(0),
@@ -221,7 +226,7 @@ impl DiskManager {
         Ok(())
     }
 
-    pub fn read_page(&self, id: usize, mut buf: PageData) -> io::Result<PageData> {
+    pub fn read_page(&self, id: PageId, mut buf: PageData) -> io::Result<PageData> {
         let store = self.store.lock();
         let offset = store.live_offset(id)?;
         info!("read_page: page_id={id} offset={offset}");
@@ -232,7 +237,7 @@ impl DiskManager {
         Ok(buf)
     }
 
-    pub fn write_page(&self, id: usize, data: PageData) -> io::Result<PageData> {
+    pub fn write_page(&self, id: PageId, data: PageData) -> io::Result<PageData> {
         self.take_injected_write_failure()?;
         let mut store = self.store.lock();
         let offset = offset_of(id);
@@ -248,7 +253,7 @@ impl DiskManager {
 
     /// Forgets page `id`, so reading it fails until a page with that id is written again.
     /// Returns whether the page had been written; an unwritten page has nothing to free.
-    pub(crate) fn deallocate_page(&self, id: usize) -> bool {
+    pub(crate) fn deallocate_page(&self, id: PageId) -> bool {
         let freed = self.store.lock().live.remove(&id);
         if freed {
             info!("deallocate_page: freed page_id={id}");
@@ -265,6 +270,7 @@ impl DiskManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::pid;
 
     fn page(fill: u8) -> PageData {
         Box::new([fill; PAGE_SIZE])
@@ -278,19 +284,19 @@ mod tests {
     fn write_then_read_round_trips_and_overwrites_in_place() {
         let dir = tempfile::tempdir().unwrap();
         let dm = manager(&dir);
-        dm.write_page(7, page(0xAB)).unwrap();
-        dm.write_page(3, page(0x01)).unwrap();
-        assert_eq!(*dm.read_page(7, page(0)).unwrap(), [0xAB; PAGE_SIZE]);
-        assert_eq!(*dm.read_page(3, page(0)).unwrap(), [0x01; PAGE_SIZE]);
+        dm.write_page(pid(7), page(0xAB)).unwrap();
+        dm.write_page(pid(3), page(0x01)).unwrap();
+        assert_eq!(*dm.read_page(pid(7), page(0)).unwrap(), [0xAB; PAGE_SIZE]);
+        assert_eq!(*dm.read_page(pid(3), page(0)).unwrap(), [0x01; PAGE_SIZE]);
 
         let len = std::fs::metadata(dir.path().join("db")).unwrap().len();
-        dm.write_page(7, page(0xCD)).unwrap();
+        dm.write_page(pid(7), page(0xCD)).unwrap();
         assert_eq!(
             std::fs::metadata(dir.path().join("db")).unwrap().len(),
             len,
             "rewriting a page reuses its offset instead of growing the file"
         );
-        assert_eq!(*dm.read_page(7, page(0)).unwrap(), [0xCD; PAGE_SIZE]);
+        assert_eq!(*dm.read_page(pid(7), page(0)).unwrap(), [0xCD; PAGE_SIZE]);
         assert_eq!(dm.num_writes.load(Ordering::Acquire), 3);
     }
 
@@ -298,23 +304,23 @@ mod tests {
     fn an_injected_write_failure_writes_nothing_and_fails_only_the_requested_writes() {
         let dir = tempfile::tempdir().unwrap();
         let dm = manager(&dir);
-        dm.write_page(1, page(1)).unwrap();
+        dm.write_page(pid(1), page(1)).unwrap();
         dm.fail_next_writes(1);
 
-        let err = dm.write_page(1, page(2)).unwrap_err();
+        let err = dm.write_page(pid(1), page(2)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert_eq!(err.to_string(), INJECTED_WRITE_FAILURE);
-        assert_eq!(*dm.read_page(1, page(0)).unwrap(), [1; PAGE_SIZE]);
+        assert_eq!(*dm.read_page(pid(1), page(0)).unwrap(), [1; PAGE_SIZE]);
         assert_eq!(dm.num_writes.load(Ordering::Acquire), 1);
 
-        dm.write_page(1, page(3)).unwrap();
-        assert_eq!(*dm.read_page(1, page(0)).unwrap(), [3; PAGE_SIZE]);
+        dm.write_page(pid(1), page(3)).unwrap();
+        assert_eq!(*dm.read_page(pid(1), page(0)).unwrap(), [3; PAGE_SIZE]);
     }
 
     #[test]
     fn reading_an_unwritten_page_is_not_found() {
         let dir = tempfile::tempdir().unwrap();
-        let err = manager(&dir).read_page(42, page(0)).unwrap_err();
+        let err = manager(&dir).read_page(pid(42), page(0)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
@@ -322,16 +328,16 @@ mod tests {
     fn each_page_id_has_its_own_slot_in_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let dm = manager(&dir);
-        dm.write_page(2, page(2)).unwrap();
+        dm.write_page(pid(2), page(2)).unwrap();
         assert_eq!(
             std::fs::metadata(dir.path().join("db")).unwrap().len(),
             3 * PAGE_SIZE as u64,
             "page 2 is the third slot of the file"
         );
-        dm.write_page(0, page(9)).unwrap();
-        assert_eq!(*dm.read_page(0, page(0)).unwrap(), [9; PAGE_SIZE]);
+        dm.write_page(pid(0), page(9)).unwrap();
+        assert_eq!(*dm.read_page(pid(0), page(0)).unwrap(), [9; PAGE_SIZE]);
         assert_eq!(
-            dm.read_page(1, page(0)).unwrap_err().kind(),
+            dm.read_page(pid(1), page(0)).unwrap_err().kind(),
             io::ErrorKind::NotFound,
             "the gap before page 2 was never written"
         );
@@ -342,16 +348,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let dm = manager(&dir);
-            dm.write_page(0, page(1)).unwrap();
-            dm.write_page(1, page(2)).unwrap();
+            dm.write_page(pid(0), page(1)).unwrap();
+            dm.write_page(pid(1), page(2)).unwrap();
             dm.sync().unwrap();
         }
         let dm = manager(&dir);
-        assert_eq!(*dm.read_page(0, page(0)).unwrap(), [1; PAGE_SIZE]);
-        assert_eq!(*dm.read_page(1, page(0)).unwrap(), [2; PAGE_SIZE]);
-        assert!(dm.deallocate_page(1), "a reopened page can be freed");
+        assert_eq!(*dm.read_page(pid(0), page(0)).unwrap(), [1; PAGE_SIZE]);
+        assert_eq!(*dm.read_page(pid(1), page(0)).unwrap(), [2; PAGE_SIZE]);
+        assert!(dm.deallocate_page(pid(1)), "a reopened page can be freed");
         assert_eq!(
-            dm.read_page(2, page(0)).unwrap_err().kind(),
+            dm.read_page(pid(2), page(0)).unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
     }
@@ -360,26 +366,26 @@ mod tests {
     fn a_deallocated_page_is_gone_until_its_id_is_written_again() {
         let dir = tempfile::tempdir().unwrap();
         let dm = manager(&dir);
-        dm.write_page(1, page(1)).unwrap();
-        dm.write_page(2, page(2)).unwrap();
+        dm.write_page(pid(1), page(1)).unwrap();
+        dm.write_page(pid(2), page(2)).unwrap();
         let len = std::fs::metadata(dir.path().join("db")).unwrap().len();
 
-        assert!(dm.deallocate_page(1), "page 1 had been written");
-        assert!(!dm.deallocate_page(1), "page 1 was already freed");
-        assert!(!dm.deallocate_page(9), "page 9 was never written");
+        assert!(dm.deallocate_page(pid(1)), "page 1 had been written");
+        assert!(!dm.deallocate_page(pid(1)), "page 1 was already freed");
+        assert!(!dm.deallocate_page(pid(9)), "page 9 was never written");
         assert_eq!(
-            dm.read_page(1, page(0)).unwrap_err().kind(),
+            dm.read_page(pid(1), page(0)).unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
 
-        dm.write_page(1, page(3)).unwrap();
+        dm.write_page(pid(1), page(3)).unwrap();
         assert_eq!(
             std::fs::metadata(dir.path().join("db")).unwrap().len(),
             len,
             "the reused id took its old slot instead of growing the file"
         );
-        assert_eq!(*dm.read_page(1, page(0)).unwrap(), [3; PAGE_SIZE]);
-        assert_eq!(*dm.read_page(2, page(0)).unwrap(), [2; PAGE_SIZE]);
+        assert_eq!(*dm.read_page(pid(1), page(0)).unwrap(), [3; PAGE_SIZE]);
+        assert_eq!(*dm.read_page(pid(2), page(0)).unwrap(), [2; PAGE_SIZE]);
     }
 
     #[test]
@@ -387,19 +393,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let dm = manager(&dir);
-        dm.write_page(1, page(1)).unwrap();
-        assert!(dm.deallocate_page(1));
+        dm.write_page(pid(1), page(1)).unwrap();
+        assert!(dm.deallocate_page(pid(1)));
         let writable = std::mem::replace(
             &mut dm.store.lock().db_file,
             File::open(&path).expect("read-only handle"),
         );
 
-        dm.write_page(1, page(3)).unwrap_err();
+        dm.write_page(pid(1), page(3)).unwrap_err();
 
-        assert!(!dm.store.lock().live.contains(&1));
+        assert!(!dm.store.lock().live.contains(&pid(1)));
         dm.store.lock().db_file = writable;
-        dm.write_page(1, page(3)).unwrap();
-        assert_eq!(*dm.read_page(1, page(0)).unwrap(), [3; PAGE_SIZE]);
+        dm.write_page(pid(1), page(3)).unwrap();
+        assert_eq!(*dm.read_page(pid(1), page(0)).unwrap(), [3; PAGE_SIZE]);
     }
 
     fn finishes_within(limit: std::time::Duration, work: impl FnOnce() + Send + 'static) -> bool {
@@ -415,7 +421,7 @@ mod tests {
     fn read_error_is_returned_instead_of_deadlocking() {
         let dir = tempfile::tempdir().unwrap();
         let dm = manager(&dir);
-        dm.write_page(1, page(1)).unwrap();
+        dm.write_page(pid(1), page(1)).unwrap();
         std::fs::OpenOptions::new()
             .write(true)
             .open(dir.path().join("db"))
@@ -424,7 +430,7 @@ mod tests {
             .unwrap();
         let (result_tx, result_rx) = mpsc::channel();
         let finished = finishes_within(std::time::Duration::from_secs(5), move || {
-            let _ = result_tx.send(dm.read_page(1, page(0)).map(|_| ()));
+            let _ = result_tx.send(dm.read_page(pid(1), page(0)).map(|_| ()));
         });
         assert!(finished, "read_page hung while reporting an I/O error");
         let err = result_rx.recv().unwrap().unwrap_err();
@@ -436,7 +442,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dm = Arc::new(manager(&dir));
         for id in 0..8 {
-            dm.write_page(id, page(id as u8)).unwrap();
+            dm.write_page(pid(id), page(id as u8)).unwrap();
         }
         let finished = finishes_within(std::time::Duration::from_secs(20), move || {
             let workers: Vec<_> = (0..8)
@@ -446,9 +452,9 @@ mod tests {
                         for round in 0..2_000 {
                             let id = (worker + round) % 8;
                             if worker % 2 == 0 {
-                                dm.write_page(id, page(id as u8)).unwrap();
+                                dm.write_page(pid(id), page(id as u8)).unwrap();
                             } else {
-                                let data = dm.read_page(id, page(0)).unwrap();
+                                let data = dm.read_page(pid(id), page(0)).unwrap();
                                 assert_eq!(*data, [id as u8; PAGE_SIZE], "page {id} was torn");
                             }
                         }
@@ -471,13 +477,13 @@ mod tests {
         scheduler
             .schedule(vec![
                 DiskRequest {
-                    page_id: 5,
+                    page_id: pid(5),
                     is_write: true,
                     data: page(9),
                     promise: wtx,
                 },
                 DiskRequest {
-                    page_id: 5,
+                    page_id: pid(5),
                     is_write: false,
                     data: page(0),
                     promise: rtx,
@@ -497,7 +503,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let requests = (0..32)
             .map(|page_id| DiskRequest {
-                page_id,
+                page_id: pid(page_id),
                 is_write: true,
                 data: page(page_id as u8),
                 promise: tx.clone(),
@@ -517,7 +523,7 @@ mod tests {
         drop(rx);
         scheduler
             .schedule(vec![DiskRequest {
-                page_id: 1,
+                page_id: pid(1),
                 is_write: true,
                 data: page(1),
                 promise: tx,
@@ -526,7 +532,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         scheduler
             .schedule(vec![DiskRequest {
-                page_id: 1,
+                page_id: pid(1),
                 is_write: false,
                 data: page(0),
                 promise: tx,
@@ -539,7 +545,7 @@ mod tests {
     fn scheduler_errors_display() {
         let (tx, _rx) = mpsc::channel();
         let req = DiskRequest {
-            page_id: 3,
+            page_id: pid(3),
             is_write: false,
             data: page(0),
             promise: tx,

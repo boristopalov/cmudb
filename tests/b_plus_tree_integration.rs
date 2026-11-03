@@ -8,6 +8,7 @@ use cmudb::catalog::index_schema::{IndexKey, IndexValue};
 use cmudb::index::BPlusTree;
 use cmudb::index::Index;
 use cmudb::table_heap::RecordId;
+use cmudb::testing::pid;
 use common::seed::{Stream, stream_rng, with_seed};
 use rand::Rng;
 
@@ -23,11 +24,11 @@ fn make_key(k: u8, key_len: usize) -> IndexKey {
 
 fn allocated_page_ids(bpm: &Arc<BufferPoolManager>, max_pages: usize) -> Vec<usize> {
     let mut out = Vec::new();
-    for pid in 0..max_pages {
-        match bpm.read_page(pid) {
-            Ok(_guard) => out.push(pid),
+    for page in 0..max_pages {
+        match bpm.read_page(pid(page)) {
+            Ok(_guard) => out.push(page),
             Err(BpmError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => break,
-            Err(e) => panic!("read_page({pid}) failed: {e}"),
+            Err(e) => panic!("read_page({page}) failed: {e}"),
         }
     }
     out
@@ -49,7 +50,7 @@ fn b_plus_tree_single_thread() {
         let _ = tree.insert(
             key,
             IndexValue::IndexValue(RecordId {
-                page_id: i,
+                page_id: pid(i),
                 slot_id: 0,
             }),
         );
@@ -77,7 +78,7 @@ fn run_b_plus_tree_soak(seed: u64) {
 
     let (bpm, _tmp) = make_bpm(num_frames);
     let tree = Arc::new(BPlusTree::new("idx".to_string(), key_len as u32, bpm.clone()).unwrap());
-    assert_eq!(tree.header_page_id, 0);
+    assert_eq!(tree.header_page_id, pid(0));
 
     let barrier = Arc::new(Barrier::new(threads));
     let mut handles = Vec::with_capacity(threads);
@@ -98,7 +99,7 @@ fn run_b_plus_tree_soak(seed: u64) {
                         let _ = tree.insert(
                             key,
                             IndexValue::IndexValue(RecordId {
-                                page_id: (t | op_i) as u32,
+                                page_id: pid(t | op_i),
                                 slot_id: op_i as u32,
                             }),
                         );

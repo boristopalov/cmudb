@@ -1,7 +1,7 @@
 use crate::buffer_pool::{BpmError, BufferPoolManager};
-use crate::table_page::{
-    NO_NEXT_PAGE, TablePage, TablePageError, TablePageMut, TablePageRef, TupleMeta,
-};
+use crate::ids::PageId;
+pub use crate::ids::RecordId;
+use crate::table_page::{TablePage, TablePageError, TablePageMut, TablePageRef, TupleMeta};
 use parking_lot::{Mutex, MutexGuard};
 use std::fmt;
 use std::sync::Arc;
@@ -18,17 +18,13 @@ pub enum TableHeapError {
     Bpm(BpmError),
     /// A table page rejected a read or write.
     Page {
-        page_id: u32,
+        page_id: PageId,
         source: TablePageError,
     },
-    /// The buffer pool returned a new page without a page id.
-    NewPageWithoutId,
-    /// The page id does not fit in the `u32` that record ids and page links store.
-    PageIdOutOfRange { page_id: usize },
     /// Following the heap's page links from its first page came back to `page_id`.
-    PageChainCycle { page_id: u32 },
+    PageChainCycle { page_id: PageId },
     /// Page `from` links to page `to`, which the buffer pool has not handed out.
-    UnallocatedPageLink { from: u32, to: u32 },
+    UnallocatedPageLink { from: PageId, to: PageId },
 }
 
 impl fmt::Display for TableHeapError {
@@ -48,10 +44,6 @@ impl fmt::Display for TableHeapError {
             }
             TableHeapError::Bpm(e) => write!(f, "buffer pool error: {e}"),
             TableHeapError::Page { page_id, source } => write!(f, "page {page_id}: {source}"),
-            TableHeapError::NewPageWithoutId => write!(f, "new page has no page_id"),
-            TableHeapError::PageIdOutOfRange { page_id } => {
-                write!(f, "page id {page_id} exceeds RID capacity")
-            }
             TableHeapError::PageChainCycle { page_id } => {
                 write!(f, "the table's page links loop back to page {page_id}")
             }
@@ -70,30 +62,11 @@ impl From<BpmError> for TableHeapError {
 }
 
 impl TablePageError {
-    fn on_page(self, page_id: u32) -> TableHeapError {
+    fn on_page(self, page_id: PageId) -> TableHeapError {
         TableHeapError::Page {
             page_id,
             source: self,
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RecordId {
-    pub page_id: u32,
-    pub slot_id: u32,
-}
-
-impl RecordId {
-    pub const RESERVED: RecordId = RecordId {
-        page_id: u32::MAX,
-        slot_id: u32::MAX,
-    };
-}
-
-impl fmt::Display for RecordId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "page_id: {}, slot_id: {}", self.page_id, self.slot_id)
     }
 }
 
@@ -120,7 +93,7 @@ impl fmt::Debug for FreeError {
 pub struct TableHeap {
     bpm: Arc<BufferPoolManager>,
     /// The page where the table starts.
-    pub first_page_id: usize,
+    pub first_page_id: PageId,
     tail: Mutex<Tail>,
     /// Free bytes an insert leaves on a page that already holds rows, so that rows there can
     /// grow (see [`TablePage::update_in_place`]).
@@ -128,7 +101,7 @@ pub struct TableHeap {
 }
 
 struct Tail {
-    page_id: usize,
+    page_id: PageId,
     num_tuples: u32,
 }
 
@@ -137,9 +110,9 @@ struct Tail {
 /// same heap) are not yielded. It holds its own buffer pool handle, so it does not borrow the heap.
 pub struct TableHeapIterator {
     bpm: Arc<BufferPoolManager>,
-    current_page_id: u32,
+    current_page_id: PageId,
     current_slot_id: u32,
-    last_page_id: u32,
+    last_page_id: PageId,
     last_page_slots: u32,
     finished: bool,
 }
@@ -162,7 +135,7 @@ impl TableHeapIterator {
                 self.finished = true;
                 return None;
             }
-            let page_guard = match self.bpm.read_page(self.current_page_id as usize) {
+            let page_guard = match self.bpm.read_page(self.current_page_id) {
                 Ok(g) => g,
                 Err(e) => {
                     self.finished = true;
@@ -249,9 +222,9 @@ impl TableHeap {
     pub fn new(bpm: Arc<BufferPoolManager>) -> Result<Self, TableHeapError> {
         let page_id = {
             let mut page_guard = bpm.new_page()?;
-            let page_id = record_page_id(page_guard.page_id())?;
+            let page_id = page_guard.page_id();
             TablePageMut::init(page_guard.data_mut());
-            page_id as usize
+            page_id
         };
         Ok(Self {
             bpm,
@@ -275,17 +248,20 @@ impl TableHeap {
 
     /// The heap whose pages start at `first_page_id`, as an earlier [`TableHeap::new`] over
     /// the same data file left it. Follows the page links to find where inserts go next.
-    pub fn open(bpm: Arc<BufferPoolManager>, first_page_id: usize) -> Result<Self, TableHeapError> {
-        let mut page_id = record_page_id(Some(first_page_id))?;
+    pub fn open(
+        bpm: Arc<BufferPoolManager>,
+        first_page_id: PageId,
+    ) -> Result<Self, TableHeapError> {
+        let mut page_id = first_page_id;
         let mut seen = std::collections::HashSet::new();
         let num_tuples = loop {
             if !seen.insert(page_id) {
                 return Err(TableHeapError::PageChainCycle { page_id });
             }
-            let guard = bpm.read_page(page_id as usize)?;
+            let guard = bpm.read_page(page_id)?;
             let page = TablePageRef::new(guard.data()).map_err(|e| e.on_page(page_id))?;
             match page.next_page_id() {
-                Some(next) if !bpm.page_is_allocated(next as usize) => {
+                Some(next) if !bpm.page_is_allocated(next) => {
                     return Err(TableHeapError::UnallocatedPageLink {
                         from: page_id,
                         to: next,
@@ -299,7 +275,7 @@ impl TableHeap {
             bpm,
             first_page_id,
             tail: Mutex::new(Tail {
-                page_id: page_id as usize,
+                page_id,
                 num_tuples,
             }),
             update_reserve: 0,
@@ -310,9 +286,9 @@ impl TableHeap {
         let tail = self.tail.lock();
         TableHeapIterator {
             bpm: self.bpm.clone(),
-            current_page_id: self.first_page_id as u32,
+            current_page_id: self.first_page_id,
             current_slot_id: 0,
-            last_page_id: tail.page_id as u32,
+            last_page_id: tail.page_id,
             last_page_slots: tail.num_tuples,
             finished: false,
         }
@@ -336,7 +312,7 @@ impl TableHeap {
     pub(crate) fn free(mut self) -> Result<(), FreeError> {
         loop {
             match self.free_first_page() {
-                Ok(Some(next)) => self.first_page_id = next as usize,
+                Ok(Some(next)) => self.first_page_id = next,
                 Ok(None) => return Ok(()),
                 Err(error) => return Err(FreeError { error, rest: self }),
             }
@@ -344,19 +320,19 @@ impl TableHeap {
     }
 
     /// Deletes the heap's first page and returns the id of the page after it.
-    fn free_first_page(&self) -> Result<Option<u32>, TableHeapError> {
-        let page_id = record_page_id(Some(self.first_page_id))?;
+    fn free_first_page(&self) -> Result<Option<PageId>, TableHeapError> {
+        let page_id = self.first_page_id;
         let next = {
-            let guard = self.bpm.read_page(page_id as usize)?;
+            let guard = self.bpm.read_page(page_id)?;
             TablePageRef::new(guard.data())
                 .map_err(|e| e.on_page(page_id))?
                 .next_page_id()
         };
-        self.bpm.delete_page(page_id as usize)?;
+        self.bpm.delete_page(page_id)?;
         Ok(next)
     }
 
-    pub fn last_page_id(&self) -> usize {
+    pub fn last_page_id(&self) -> PageId {
         self.tail.lock().page_id
     }
 
@@ -372,7 +348,7 @@ impl TableHeap {
                 max: TablePageRef::MAX_TUPLE_SIZE,
             });
         }
-        let tail_page_id = tail.page_id as u32;
+        let tail_page_id = tail.page_id;
         let slot_id = {
             let mut guard = self.bpm.write_page(tail.page_id)?;
             let mut page =
@@ -396,7 +372,7 @@ impl TableHeap {
             None => {
                 let (new_id, slot_id) = {
                     let mut guard = self.bpm.new_page()?;
-                    let page_id = record_page_id(guard.page_id())?;
+                    let page_id = guard.page_id();
                     let slot_id = TablePage::init(guard.data_mut())
                         .insert_with_meta(meta, &t.data)
                         .map_err(|e| e.on_page(page_id))?;
@@ -412,7 +388,7 @@ impl TableHeap {
             }
         };
         **tail = Tail {
-            page_id: page_id as usize,
+            page_id,
             num_tuples: slot_id + 1,
         };
         Ok(RecordId { page_id, slot_id })
@@ -486,7 +462,7 @@ impl TableHeap {
         rid: RecordId,
         f: impl FnOnce(TupleMeta, &[u8]) -> R,
     ) -> Result<R, TableHeapError> {
-        let page_guard = bpm.read_page(rid.page_id as usize)?;
+        let page_guard = bpm.read_page(rid.page_id)?;
         let table_page =
             TablePageRef::new(page_guard.data()).map_err(|e| e.on_page(rid.page_id))?;
         let slot = table_page
@@ -526,9 +502,7 @@ impl TableHeap {
     where
         E: From<TableHeapError>,
     {
-        let mut page_guard = bpm
-            .write_page(rid.page_id as usize)
-            .map_err(TableHeapError::from)?;
+        let mut page_guard = bpm.write_page(rid.page_id).map_err(TableHeapError::from)?;
         let mut table_page =
             TablePageMut::new(page_guard.data_mut()).map_err(|e| e.on_page(rid.page_id))?;
         let slot = table_page
@@ -588,18 +562,10 @@ impl TableHeap {
     }
 }
 
-/// Converts a buffer pool page id into the `u32` stored in record ids and page links.
-fn record_page_id(page_id: Option<usize>) -> Result<u32, TableHeapError> {
-    let page_id = page_id.ok_or(TableHeapError::NewPageWithoutId)?;
-    u32::try_from(page_id)
-        .ok()
-        .filter(|&id| id != NO_NEXT_PAGE)
-        .ok_or(TableHeapError::PageIdOutOfRange { page_id })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::pid;
 
     fn make_heap() -> (TableHeap, tempfile::TempDir) {
         let (bpm, dir) = crate::testing::bpm(8);
@@ -828,7 +794,7 @@ mod tests {
             })
             .unwrap();
         {
-            let mut guard = heap.bpm.write_page(rid.page_id as usize).unwrap();
+            let mut guard = heap.bpm.write_page(rid.page_id).unwrap();
             guard.data_mut().fill(u8::MAX);
         }
         let is_corrupt_header = |r: Result<_, TableHeapError>| {
@@ -848,7 +814,7 @@ mod tests {
     #[test]
     fn errors_display_the_record_and_page_they_concern() {
         let rid = RecordId {
-            page_id: 3,
+            page_id: pid(3),
             slot_id: 4,
         };
         assert_eq!(
@@ -857,7 +823,7 @@ mod tests {
         );
         assert_eq!(
             TableHeapError::Page {
-                page_id: 3,
+                page_id: pid(3),
                 source: TablePageError::AlreadyDeleted { slot: 4 },
             }
             .to_string(),
@@ -897,7 +863,7 @@ mod tests {
     fn open_rejects_a_page_chain_that_loops() {
         let (bpm, _dir) = crate::testing::bpm(8);
         let heap = TableHeap::new(bpm.clone()).unwrap();
-        let first = heap.first_page_id as u32;
+        let first = heap.first_page_id;
         {
             let mut guard = bpm.write_page(heap.first_page_id).unwrap();
             TablePageMut::new(guard.data_mut())
@@ -916,8 +882,8 @@ mod tests {
     fn open_rejects_a_link_to_a_page_that_is_not_allocated() {
         let (bpm, _dir) = crate::testing::bpm(8);
         let heap = TableHeap::new(bpm.clone()).unwrap();
-        let first = heap.first_page_id as u32;
-        let past_the_end = bpm.allocation().next_page_id as u32;
+        let first = heap.first_page_id;
+        let past_the_end = pid(bpm.allocation().next_page_id);
         {
             let mut guard = bpm.write_page(heap.first_page_id).unwrap();
             TablePageMut::new(guard.data_mut())
@@ -938,22 +904,9 @@ mod tests {
     }
 
     #[test]
-    fn record_page_id_rejects_ids_that_do_not_fit_a_record_id() {
-        assert!(matches!(
-            record_page_id(None),
-            Err(TableHeapError::NewPageWithoutId)
-        ));
-        assert!(matches!(
-            record_page_id(Some(NO_NEXT_PAGE as usize)),
-            Err(TableHeapError::PageIdOutOfRange { page_id }) if page_id == NO_NEXT_PAGE as usize
-        ));
-        assert_eq!(record_page_id(Some(7)).unwrap(), 7);
-    }
-
-    #[test]
     fn last_page_has_no_next_page_even_when_the_table_starts_at_page_zero() {
         let (heap, _dir) = make_heap();
-        assert_eq!(heap.first_page_id, 0);
+        assert_eq!(heap.first_page_id, pid(0));
         let guard = heap.bpm.read_page(heap.first_page_id).unwrap();
         assert!(
             TablePageRef::new(guard.data())
@@ -972,7 +925,7 @@ mod tests {
         let first = heap.insert(&big).unwrap();
         let second = heap.insert(&big).unwrap();
         assert_ne!(first.page_id, second.page_id);
-        let guard = heap.bpm.read_page(first.page_id as usize).unwrap();
+        let guard = heap.bpm.read_page(first.page_id).unwrap();
         assert_eq!(
             TablePageRef::new(guard.data()).unwrap().next_page_id(),
             Some(second.page_id)
@@ -997,7 +950,7 @@ mod tests {
         assert_eq!(bpm.live_page_count(), 0);
         for rid in rids {
             assert!(
-                bpm.read_page(rid.page_id as usize).is_err(),
+                bpm.read_page(pid(rid.page_id)).is_err(),
                 "page {} survived",
                 rid.page_id
             );

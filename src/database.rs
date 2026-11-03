@@ -10,6 +10,7 @@ use crate::database_file::{
     write_chain, write_header,
 };
 use crate::disk::{DiskManager, DiskScheduler};
+use crate::ids::PageId;
 use crate::index::IndexError;
 use crate::parser::{Binder, BinderError};
 use crate::planner::{Planner, PlannerError};
@@ -267,7 +268,7 @@ pub struct Database {
 
 /// The metadata chain of a database from [`Database::open`], and what was last written to it.
 struct Persisted {
-    chain: Vec<usize>,
+    chain: Vec<PageId>,
     written: Vec<u8>,
 }
 
@@ -765,10 +766,8 @@ impl Drop for Database {
 }
 
 /// Allocates a new page and returns its id, without keeping it pinned.
-fn allocate_page(bpm: &Arc<BufferPoolManager>) -> Result<usize, PersistError> {
-    let page = bpm.new_page()?;
-    page.page_id()
-        .ok_or(PersistError::CorruptMeta("a new page came without an id"))
+fn allocate_page(bpm: &Arc<BufferPoolManager>) -> Result<PageId, PersistError> {
+    Ok(bpm.new_page()?.page_id())
 }
 
 fn parse(sql: &str) -> Result<Vec<Statement>, QueryError> {
@@ -791,8 +790,8 @@ mod tests {
     #[test]
     fn storage_errors_convert_into_execute_errors() {
         assert!(matches!(
-            QueryError::from(TableHeapError::NewPageWithoutId),
-            QueryError::Execute(ExecutorError::TableHeap(TableHeapError::NewPageWithoutId))
+            QueryError::from(TableHeapError::TooLarge { size: 2, max: 1 }),
+            QueryError::Execute(ExecutorError::TableHeap(TableHeapError::TooLarge { .. }))
         ));
         assert!(matches!(
             QueryError::from(CatalogError::TableDoesNotExist),

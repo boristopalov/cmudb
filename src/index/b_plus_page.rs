@@ -1,21 +1,20 @@
 use crate::buf::{BufReader, BufWriter, BufferError};
 use crate::catalog::index_schema::IndexKey;
 use crate::disk::PAGE_SIZE;
+use crate::ids::RecordId;
 use crate::index::page_codec::{
     COMMON_HEADER_BYTES, KIND_HEADER, KIND_INTERNAL, KIND_LEAF, OVERFLOW, PageCodecError,
-    U32_BYTES, U64_BYTES, decode_page_id, decode_record_id, encode_page_id, encode_record_id,
-    peek_common_header, read_common_header_of_kind, write_common_header,
+    U32_BYTES, U64_BYTES, decode_child_page_id, decode_page_id, decode_record_id, encode_page_id,
+    encode_record_id, peek_common_header, read_common_header_of_kind, write_common_header,
 };
 use crate::index::{InsertError, RemoveError};
-use crate::table_heap::RecordId;
 use log::{error, info};
 use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::num::NonZeroUsize;
 
-pub type PageId = usize;
+pub use crate::ids::PageId;
 
-pub const INVALID_PAGE_ID: PageId = usize::MAX;
 pub const NUM_TOMBSTONES: u32 = 256;
 
 pub(crate) const PAGE_ID_ENCODED_BYTES: usize = U64_BYTES;
@@ -373,7 +372,7 @@ impl InternalPage {
         w.write_u32_le(0)?;
 
         for &child in self.children.iter() {
-            w.write_u64_le(encode_page_id(child)?)?;
+            w.write_u64_le(encode_page_id(Some(child)))?;
         }
         for k in self.keys.iter() {
             w.write_bytes(&k.0)?;
@@ -408,7 +407,7 @@ impl InternalPage {
 
         let mut children = Vec::with_capacity(child_count);
         for _ in 0..child_count {
-            children.push(decode_page_id(r.read_u64_le()?)?);
+            children.push(decode_child_page_id(r.read_u64_le()?)?);
         }
         let mut keys = Vec::with_capacity(size);
         for _ in 0..size {
@@ -499,8 +498,8 @@ impl InternalPage {
 pub struct LeafPage {
     max_size: u32,
     entries: Vec<(IndexKey, RecordId)>,
-    /// Page id of the next leaf to the right, or `INVALID_PAGE_ID` for the last leaf.
-    next_leaf_id: PageId,
+    /// Page id of the next leaf to the right, or `None` for the last leaf.
+    next_leaf_id: Option<PageId>,
     /// Slots of deleted keys still stored in the page, oldest deletion first.
     tombstones: VecDeque<u32>,
     tombstone_capacity: usize,
@@ -512,7 +511,7 @@ impl LeafPage {
         Self {
             max_size,
             entries: Vec::new(),
-            next_leaf_id: INVALID_PAGE_ID,
+            next_leaf_id: None,
             tombstones: VecDeque::with_capacity(tombstone_capacity),
             tombstone_capacity,
         }
@@ -527,12 +526,12 @@ impl LeafPage {
         self.entries.is_empty()
     }
 
-    pub fn next_leaf_id(&self) -> PageId {
+    pub fn next_leaf_id(&self) -> Option<PageId> {
         self.next_leaf_id
     }
 
     #[cfg(test)]
-    pub(crate) fn set_next_leaf_id(&mut self, next_leaf_id: PageId) {
+    pub(crate) fn set_next_leaf_id(&mut self, next_leaf_id: Option<PageId>) {
         self.next_leaf_id = next_leaf_id;
     }
 
@@ -661,7 +660,7 @@ impl LeafPage {
         write_common_header(&mut w, KIND_LEAF)?;
         w.write_u32_le(u32::try_from(self.entries.len())?)?;
         w.write_u32_le(self.max_size)?;
-        w.write_u64_le(encode_page_id(self.next_leaf_id)?)?;
+        w.write_u64_le(encode_page_id(self.next_leaf_id))?;
 
         for (k, rid) in self.entries.iter() {
             w.write_bytes(&k.0)?;
@@ -686,7 +685,7 @@ impl LeafPage {
         let max_size = r.read_u32_le()?;
         let next_leaf_id = decode_page_id(r.read_u64_le()?)?;
         info!(
-            "bptree/page_decode kind=leaf size={} max_size={} next_leaf_id={}",
+            "bptree/page_decode kind=leaf size={} max_size={} next_leaf_id={:?}",
             size, max_size, next_leaf_id
         );
         ensure_fits_page(layout.leaf_live_bytes(size)?)?;
@@ -787,7 +786,7 @@ impl LeafPage {
         right.tombstones = right_tombstones;
 
         right.next_leaf_id = self.next_leaf_id;
-        self.next_leaf_id = right_page_id;
+        self.next_leaf_id = Some(right_page_id);
 
         self.debug_check();
         right.debug_check();
@@ -941,8 +940,8 @@ impl LeafPage {
 /// HeaderPage is a special page which is kept separate and not in the tree itself.
 #[derive(Debug)]
 pub struct HeaderPage {
-    pub root_page_id: PageId,
-    pub first_leaf_id: PageId,
+    pub root_page_id: Option<PageId>,
+    pub first_leaf_id: Option<PageId>,
     pub key_len: u32,
 }
 
@@ -950,7 +949,7 @@ impl HeaderPage {
     pub fn encode(&self, buf: &mut [u8]) -> Result<(), PageCodecError> {
         Layout::new(self.key_len)?;
         info!(
-            "bptree/page_encode kind=header root={} first_leaf={} key_len={}",
+            "bptree/page_encode kind=header root={:?} first_leaf={:?} key_len={}",
             self.root_page_id, self.first_leaf_id, self.key_len
         );
         buf.fill(0);
@@ -958,8 +957,8 @@ impl HeaderPage {
         write_common_header(&mut w, KIND_HEADER)?;
         w.write_u32_le(self.key_len)?;
         w.write_u32_le(0)?;
-        w.write_u64_le(encode_page_id(self.root_page_id)?)?;
-        w.write_u64_le(encode_page_id(self.first_leaf_id)?)?;
+        w.write_u64_le(encode_page_id(self.root_page_id))?;
+        w.write_u64_le(encode_page_id(self.first_leaf_id))?;
         debug_assert_eq!(w.pos(), HEADER_FIXED_HEADER_BYTES);
         Ok(())
     }
@@ -972,7 +971,7 @@ impl HeaderPage {
         let root_page_id = decode_page_id(r.read_u64_le()?)?;
         let first_leaf_id = decode_page_id(r.read_u64_le()?)?;
         info!(
-            "bptree/page_decode kind=header root={} first_leaf={} key_len={}",
+            "bptree/page_decode kind=header root={:?} first_leaf={:?} key_len={}",
             root_page_id, first_leaf_id, key_len
         );
         if key_len == 0 {
@@ -992,16 +991,17 @@ mod tests {
     use crate::buf::BufferError;
     use crate::catalog::index_schema::IndexKey;
     use crate::disk::PAGE_SIZE;
+    use crate::ids::RecordId;
     use crate::index::InsertError;
     use crate::index::b_plus_page::{
-        HEADER_FIXED_HEADER_BYTES, HeaderPage, INTERNAL_FIXED_HEADER_BYTES, INVALID_PAGE_ID,
-        InternalPage, LEAF_FIXED_HEADER_BYTES, Layout, LeafPage, MAX_SIZE_FIELD_BYTES,
-        NUM_TOMBSTONES, PAGE_ID_ENCODED_BYTES, Page, RECORD_ID_ENCODED_BYTES, SIZE_FIELD_BYTES,
+        HEADER_FIXED_HEADER_BYTES, HeaderPage, INTERNAL_FIXED_HEADER_BYTES, InternalPage,
+        LEAF_FIXED_HEADER_BYTES, Layout, LeafPage, MAX_SIZE_FIELD_BYTES, NUM_TOMBSTONES,
+        PAGE_ID_ENCODED_BYTES, Page, RECORD_ID_ENCODED_BYTES, SIZE_FIELD_BYTES,
         TOMBSTONE_COUNT_ENCODED_BYTES, TOMBSTONE_SLOT_ENCODED_BYTES,
     };
     use crate::index::page_codec::KIND_HEADER;
     use crate::index::page_codec::PageCodecError;
-    use crate::table_heap::RecordId;
+    use crate::testing::pid;
     use std::collections::VecDeque;
 
     fn layout(key_len: u32) -> Layout {
@@ -1015,7 +1015,7 @@ mod tests {
     #[test]
     fn test_internal_page_split() {
         let mut left = InternalPage::new(10);
-        left.children = vec![1, 2, 3, 4, 5, 6];
+        left.children = vec![pid(1), pid(2), pid(3), pid(4), pid(5), pid(6)];
         left.keys = vec![
             IndexKey(vec![10]),
             IndexKey(vec![20]),
@@ -1030,9 +1030,9 @@ mod tests {
 
         assert_eq!(sep, IndexKey(vec![30]));
         assert_eq!(left.keys, vec![IndexKey(vec![10]), IndexKey(vec![20])]);
-        assert_eq!(left.children, vec![1, 2, 3]);
+        assert_eq!(left.children, vec![pid(1), pid(2), pid(3)]);
         assert_eq!(right.keys, vec![IndexKey(vec![40]), IndexKey(vec![50])]);
-        assert_eq!(right.children, vec![4, 5, 6]);
+        assert_eq!(right.children, vec![pid(4), pid(5), pid(6)]);
     }
 
     #[test]
@@ -1047,29 +1047,29 @@ mod tests {
         .into_iter()
         .zip(vec![
             RecordId {
-                page_id: 1,
+                page_id: pid(1),
                 slot_id: 0,
             },
             RecordId {
-                page_id: 1,
+                page_id: pid(1),
                 slot_id: 1,
             },
             RecordId {
-                page_id: 1,
+                page_id: pid(1),
                 slot_id: 2,
             },
             RecordId {
-                page_id: 1,
+                page_id: pid(1),
                 slot_id: 3,
             },
         ])
         .collect();
-        left.next_leaf_id = 999;
+        left.next_leaf_id = Some(pid(999));
         left.tombstones = VecDeque::from([1u32, 3u32]);
         left.check().unwrap();
 
         let mut right = LeafPage::new(10, NUM_TOMBSTONES);
-        let sep = left.split_into(&mut right, 123);
+        let sep = left.split_into(&mut right, pid(123));
 
         assert_eq!(sep, IndexKey(vec![30]));
         assert_eq!(keys_of(&left), vec![IndexKey(vec![10]), IndexKey(vec![20])]);
@@ -1079,8 +1079,8 @@ mod tests {
         );
         assert_eq!(left.tombstones, VecDeque::from([1u32]));
         assert_eq!(right.tombstones, VecDeque::from([1u32]));
-        assert_eq!(left.next_leaf_id, 123);
-        assert_eq!(right.next_leaf_id, 999);
+        assert_eq!(left.next_leaf_id, Some(pid(123)));
+        assert_eq!(right.next_leaf_id, Some(pid(999)));
 
         left.absorb_right(&mut right);
         assert_eq!(
@@ -1093,7 +1093,7 @@ mod tests {
             ]
         );
         assert_eq!(left.tombstones, VecDeque::from([1u32, 3u32]));
-        assert_eq!(left.next_leaf_id, 999);
+        assert_eq!(left.next_leaf_id, Some(pid(999)));
     }
 
     #[test]
@@ -1103,11 +1103,11 @@ mod tests {
             .into_iter()
             .zip(vec![
                 RecordId {
-                    page_id: 1,
+                    page_id: pid(1),
                     slot_id: 0,
                 },
                 RecordId {
-                    page_id: 1,
+                    page_id: pid(1),
                     slot_id: 1,
                 },
             ])
@@ -1120,11 +1120,11 @@ mod tests {
             .into_iter()
             .zip(vec![
                 RecordId {
-                    page_id: 2,
+                    page_id: pid(2),
                     slot_id: 0,
                 },
                 RecordId {
-                    page_id: 2,
+                    page_id: pid(2),
                     slot_id: 1,
                 },
             ])
@@ -1152,11 +1152,11 @@ mod tests {
     #[test]
     fn test_internal_page_merge() {
         let mut left = InternalPage::new(10);
-        left.children = vec![1, 2, 3];
+        left.children = vec![pid(1), pid(2), pid(3)];
         left.keys = vec![IndexKey(vec![10]), IndexKey(vec![20])];
 
         let mut right = InternalPage::new(10);
-        right.children = vec![5, 6, 7];
+        right.children = vec![pid(5), pid(6), pid(7)];
         right.keys = vec![IndexKey(vec![90]), IndexKey(vec![100])];
 
         left.absorb_right(IndexKey(vec![50]), &mut right);
@@ -1171,7 +1171,10 @@ mod tests {
             ],
             left.keys
         );
-        assert_eq!(vec![1, 2, 3, 5, 6, 7], left.children);
+        assert_eq!(
+            vec![pid(1), pid(2), pid(3), pid(5), pid(6), pid(7)],
+            left.children
+        );
         assert_eq!(0, right.keys.len());
         assert_eq!(0, right.children.len());
     }
@@ -1180,14 +1183,14 @@ mod tests {
     fn test_header_page_encode_decode_roundtrip() {
         let mut buf = [0u8; PAGE_SIZE];
         let hdr = HeaderPage {
-            root_page_id: 42,
-            first_leaf_id: INVALID_PAGE_ID,
+            root_page_id: Some(pid(42)),
+            first_leaf_id: None,
             key_len: 8,
         };
         hdr.encode(&mut buf).unwrap();
         let decoded = HeaderPage::decode(&buf).unwrap();
-        assert_eq!(decoded.root_page_id, 42);
-        assert_eq!(decoded.first_leaf_id, INVALID_PAGE_ID);
+        assert_eq!(decoded.root_page_id, Some(pid(42)));
+        assert_eq!(decoded.first_leaf_id, None);
         assert_eq!(decoded.key_len, 8);
     }
 
@@ -1204,26 +1207,26 @@ mod tests {
         .into_iter()
         .zip(vec![
             RecordId {
-                page_id: 1,
+                page_id: pid(1),
                 slot_id: 7,
             },
             RecordId {
-                page_id: 2,
+                page_id: pid(2),
                 slot_id: 8,
             },
             RecordId {
-                page_id: 3,
+                page_id: pid(3),
                 slot_id: 9,
             },
         ])
         .collect();
-        leaf.next_leaf_id = 123;
+        leaf.next_leaf_id = Some(pid(123));
         leaf.encode(&mut buf, layout(key_len)).unwrap();
 
         let decoded = LeafPage::decode(&buf, layout(key_len)).unwrap();
         assert_eq!(decoded.len() as u32, 3);
         assert_eq!(decoded.max_size, 10);
-        assert_eq!(decoded.next_leaf_id, 123);
+        assert_eq!(decoded.next_leaf_id, Some(pid(123)));
         assert_eq!(keys_of(&decoded), keys_of(&leaf));
         assert_eq!(decoded.entries, leaf.entries);
     }
@@ -1234,7 +1237,7 @@ mod tests {
         leaf.insert(
             IndexKey(vec![10]),
             RecordId {
-                page_id: 1,
+                page_id: pid(1),
                 slot_id: 1,
             },
         )
@@ -1242,7 +1245,7 @@ mod tests {
         leaf.insert(
             IndexKey(vec![20]),
             RecordId {
-                page_id: 1,
+                page_id: pid(1),
                 slot_id: 2,
             },
         )
@@ -1250,7 +1253,7 @@ mod tests {
         leaf.insert(
             IndexKey(vec![30]),
             RecordId {
-                page_id: 1,
+                page_id: pid(1),
                 slot_id: 3,
             },
         )
@@ -1321,7 +1324,7 @@ mod tests {
         let mut buf = [0u8; PAGE_SIZE];
         let key_len = 2u32;
         let mut internal = InternalPage::new(10);
-        internal.children = vec![11, 22, 33];
+        internal.children = vec![pid(11), pid(22), pid(33)];
         internal.keys = vec![IndexKey(vec![1, 2]), IndexKey(vec![3, 4])];
         internal.encode(&mut buf, layout(key_len)).unwrap();
 
@@ -1336,8 +1339,8 @@ mod tests {
     fn test_decode_rejects_bad_magic() {
         let mut buf = [0u8; PAGE_SIZE];
         let hdr = HeaderPage {
-            root_page_id: 1,
-            first_leaf_id: 2,
+            root_page_id: Some(pid(1)),
+            first_leaf_id: Some(pid(2)),
             key_len: 4,
         };
         hdr.encode(&mut buf).unwrap();
@@ -1350,7 +1353,7 @@ mod tests {
 
     fn rid(n: u32) -> RecordId {
         RecordId {
-            page_id: n,
+            page_id: pid(n),
             slot_id: 0,
         }
     }
@@ -1370,7 +1373,7 @@ mod tests {
             let page_with = |n: usize| {
                 let mut page = InternalPage::new(max as u32);
                 page.keys = vec![IndexKey(vec![0; key_len as usize]); n];
-                page.children = (0..=n).collect();
+                page.children = (0..=n).map(pid).collect();
                 page
             };
             let mut buf = [0u8; PAGE_SIZE];
@@ -1424,7 +1427,7 @@ mod tests {
     #[test]
     fn find_child_index_counts_keys_less_than_or_equal_to_the_search_key() {
         let mut page = InternalPage::new(10);
-        page.children = vec![1, 2, 3];
+        page.children = vec![pid(1), pid(2), pid(3)];
         page.keys = vec![IndexKey(vec![10]), IndexKey(vec![20])];
         assert_eq!(page.find_child_index(&IndexKey(vec![5])), 0);
         assert_eq!(page.find_child_index(&IndexKey(vec![10])), 1);
@@ -1443,7 +1446,7 @@ mod tests {
         ));
         leaf.remove_key(&IndexKey(vec![1])).unwrap();
         leaf.insert(IndexKey(vec![1]), rid(3)).unwrap();
-        assert_eq!(leaf.get(&IndexKey(vec![1])).unwrap().page_id, 3);
+        assert_eq!(leaf.get(&IndexKey(vec![1])).unwrap().page_id, pid(3));
         assert!(leaf.tombstones.is_empty());
     }
 
@@ -1477,9 +1480,14 @@ mod tests {
     }
 
     fn encoded_internal(key_len: u32, keys: &[u8]) -> [u8; PAGE_SIZE] {
-        let mut page = InternalPage::new_root(10, 0, IndexKey(vec![keys[0]; key_len as usize]), 1);
-        for (child, &k) in (2..).zip(&keys[1..]) {
-            page.append_key_and_child(IndexKey(vec![k; key_len as usize]), child);
+        let mut page = InternalPage::new_root(
+            10,
+            pid(0),
+            IndexKey(vec![keys[0]; key_len as usize]),
+            pid(1),
+        );
+        for (child, &k) in (2u32..).zip(&keys[1..]) {
+            page.append_key_and_child(IndexKey(vec![k; key_len as usize]), pid(child));
         }
         let mut buf = [0u8; PAGE_SIZE];
         page.encode(&mut buf, layout(key_len)).unwrap();
@@ -1579,8 +1587,8 @@ mod tests {
         assert!(Page::kind(&[]).is_err());
         let mut header = [0u8; PAGE_SIZE];
         HeaderPage {
-            root_page_id: 1,
-            first_leaf_id: 1,
+            root_page_id: Some(pid(1)),
+            first_leaf_id: Some(pid(1)),
             key_len: 1,
         }
         .encode(&mut header)
@@ -1614,7 +1622,7 @@ mod tests {
             ))
         );
 
-        let wrong_width = InternalPage::new_root(10, 0, IndexKey(vec![1, 2]), 1);
+        let wrong_width = InternalPage::new_root(10, pid(0), IndexKey(vec![1, 2]), pid(1));
         assert_eq!(
             wrong_width.encode(&mut buf, lay),
             Err(PageCodecError::InvalidKeyLen {

@@ -7,6 +7,7 @@ pub mod seed;
 use cmudb::catalog::Value;
 use cmudb::concurrency::mvcc::MvccError;
 use cmudb::concurrency::{IsolationLevel, TxnError};
+use cmudb::ids::TableOid;
 use cmudb::parser::BinderError;
 use cmudb::processor::executor::{ExecutorContext, ExecutorError, rows_affected};
 use cmudb::processor::executor_factory::create_executor_with_batch_size;
@@ -133,7 +134,7 @@ impl Db {
         plans.remove(0)
     }
 
-    pub fn table_oid(&self, name: &str) -> u32 {
+    pub fn table_oid(&self, name: &str) -> TableOid {
         self.db.catalog().table_oid(name).expect("table")
     }
 }

@@ -3,6 +3,7 @@ use crate::catalog::{Catalog, CatalogError, DataType, Schema, Value};
 use crate::concurrency::mvcc::MvccError;
 use crate::concurrency::{Transaction, TransactionManager};
 use crate::disk::PAGE_SIZE;
+use crate::ids::{IndexOid, TableOid};
 use crate::index::IndexError;
 use crate::processor::plan::{Arithmetic, Plan};
 use crate::table_heap::{RecordId, TableHeapError, Tuple};
@@ -57,10 +58,10 @@ pub enum ExecutorError {
     NoSortRuns,
     /// DROP TABLE without IF EXISTS named a table that does not exist, by oid when the plan
     /// had one.
-    TableNotFound { oid: Option<u32> },
+    TableNotFound { oid: Option<TableOid> },
     /// DROP INDEX without IF EXISTS named an index that does not exist, by oid when the plan
     /// had one.
-    IndexNotFound { oid: Option<u32> },
+    IndexNotFound { oid: Option<IndexOid> },
 }
 
 impl fmt::Display for ExecutorError {
@@ -330,7 +331,11 @@ pub fn rows_affected(plan: &Plan, exec: &mut dyn Executor) -> Result<u64, Execut
 }
 
 /// Writes the message for a DROP whose `kind` of object (table or index) does not exist.
-fn missing_drop_target(f: &mut fmt::Formatter<'_>, kind: &str, oid: Option<u32>) -> fmt::Result {
+fn missing_drop_target(
+    f: &mut fmt::Formatter<'_>,
+    kind: &str,
+    oid: Option<impl fmt::Display>,
+) -> fmt::Result {
     match oid {
         Some(oid) => write!(f, "{kind} with oid {oid} does not exist"),
         None => write!(f, "{kind} does not exist"),
@@ -350,8 +355,8 @@ mod tests {
                 "index error: insert failed: key already exists",
             ),
             (
-                ExecutorError::from(TableHeapError::NewPageWithoutId),
-                "table heap error: new page has no page_id",
+                ExecutorError::from(TableHeapError::TooLarge { size: 2, max: 1 }),
+                "table heap error: a row of 2 bytes does not fit in a page, which holds at most 1",
             ),
             (
                 ExecutorError::from(CatalogError::ColumnOutOfBounds),
@@ -400,11 +405,15 @@ mod tests {
             ),
             (ExecutorError::NoSortRuns, "external sort produced no runs"),
             (
-                ExecutorError::TableNotFound { oid: Some(7) },
+                ExecutorError::TableNotFound {
+                    oid: Some(TableOid(7)),
+                },
                 "table with oid 7 does not exist",
             ),
             (
-                ExecutorError::IndexNotFound { oid: Some(8) },
+                ExecutorError::IndexNotFound {
+                    oid: Some(IndexOid(8)),
+                },
                 "index with oid 8 does not exist",
             ),
             (

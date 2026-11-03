@@ -14,13 +14,14 @@ use crate::buffer_pool::{BpmError, BufferPoolManager, PageAllocation};
 use crate::catalog::{CatalogError, CatalogSnapshot, DataType, IndexEntry, IndexType, TableEntry};
 use crate::concurrency::{Timestamp, TxnId};
 use crate::disk::PAGE_SIZE;
+use crate::ids::{IndexOid, PageId, TableOid};
 use std::collections::HashSet;
 use std::fmt;
 use std::io;
 use std::sync::Arc;
 
 /// The page that holds the [`DatabaseHeader`]. It is the first page a new database allocates.
-pub const HEADER_PAGE_ID: usize = 0;
+pub const HEADER_PAGE_ID: PageId = PageId::new(0);
 
 /// The first bytes of the header page of every cmudb data file.
 const HEADER_MAGIC: [u8; 8] = *b"CMUDB\0db";
@@ -41,9 +42,6 @@ const CHAIN_PAYLOAD_OFF: usize = 16;
 
 /// Payload bytes one metadata chain page holds.
 pub const CHAIN_PAGE_CAPACITY: usize = PAGE_SIZE - CHAIN_PAYLOAD_OFF;
-
-/// The `next` link of the last page of the metadata chain.
-const NO_NEXT_CHAIN_PAGE: u64 = u64::MAX;
 
 const TYPE_TAG_BOOLEAN: u8 = 0;
 const TYPE_TAG_INT: u8 = 1;
@@ -140,7 +138,7 @@ impl DatabaseMeta {
         w.u64(self.allocation.next_page_id as u64);
         w.u64(self.allocation.free_page_ids.len() as u64);
         for &id in &self.allocation.free_page_ids {
-            w.u64(id as u64);
+            w.u64(u64::from(id.get()));
         }
         w.u64(self.last_commit_ts);
         w.u64(self.next_txn_id);
@@ -149,9 +147,9 @@ impl DatabaseMeta {
         w.u32(c.next_index_oid);
         w.u32(c.tables.len() as u32);
         for t in &c.tables {
-            w.u32(t.oid);
+            w.u32(t.oid.0);
             w.str(&t.name);
-            w.u64(t.first_page_id as u64);
+            w.u64(u64::from(t.first_page_id.get()));
             w.u32(t.columns.len() as u32);
             for (dtype, name) in &t.columns {
                 w.str(name);
@@ -160,9 +158,9 @@ impl DatabaseMeta {
         }
         w.u32(c.indexes.len() as u32);
         for i in &c.indexes {
-            w.u32(i.oid);
+            w.u32(i.oid.0);
             w.str(&i.name);
-            w.u32(i.table_oid);
+            w.u32(i.table_oid.0);
             w.u32(i.key_columns.len() as u32);
             for &col in &i.key_columns {
                 w.u32(col as u32);
@@ -170,7 +168,7 @@ impl DatabaseMeta {
             w.u8(match i.index_type {
                 IndexType::BPlusTree => INDEX_TAG_BPLUS_TREE,
             });
-            w.u64(i.header_page_id as u64);
+            w.u64(u64::from(i.header_page_id.get()));
         }
         w.0
     }
@@ -180,7 +178,7 @@ impl DatabaseMeta {
         let next_page_id = r.usize()?;
         let free_count = r.u64()?;
         let free_page_ids = (0..free_count)
-            .map(|_| r.usize())
+            .map(|_| r.page_id())
             .collect::<Result<_, _>>()?;
         let last_commit_ts = r.u64()?;
         let next_txn_id = r.u64()?;
@@ -189,9 +187,9 @@ impl DatabaseMeta {
         let tables = (0..r.u32()?)
             .map(|_| {
                 Ok(TableEntry {
-                    oid: r.u32()?,
+                    oid: TableOid(r.u32()?),
                     name: r.str()?,
-                    first_page_id: r.usize()?,
+                    first_page_id: r.page_id()?,
                     columns: (0..r.u32()?)
                         .map(|_| {
                             let name = r.str()?;
@@ -204,9 +202,9 @@ impl DatabaseMeta {
         let indexes = (0..r.u32()?)
             .map(|_| {
                 Ok(IndexEntry {
-                    oid: r.u32()?,
+                    oid: IndexOid(r.u32()?),
                     name: r.str()?,
-                    table_oid: r.u32()?,
+                    table_oid: TableOid(r.u32()?),
                     key_columns: (0..r.u32()?)
                         .map(|_| r.u32().map(|c| c as usize))
                         .collect::<Result<_, _>>()?,
@@ -214,7 +212,7 @@ impl DatabaseMeta {
                         INDEX_TAG_BPLUS_TREE => IndexType::BPlusTree,
                         tag => return Err(PersistError::UnknownIndexType(tag)),
                     },
-                    header_page_id: r.usize()?,
+                    header_page_id: r.page_id()?,
                 })
             })
             .collect::<Result<_, PersistError>>()?;
@@ -318,7 +316,12 @@ impl Reader<'_> {
 
     fn usize(&mut self) -> Result<usize, PersistError> {
         usize::try_from(self.u64()?)
-            .map_err(|_| PersistError::CorruptMeta("a page id does not fit in usize"))
+            .map_err(|_| PersistError::CorruptMeta("a page count does not fit in usize"))
+    }
+
+    fn page_id(&mut self) -> Result<PageId, PersistError> {
+        PageId::try_from(self.u64()?)
+            .map_err(|_| PersistError::CorruptMeta("a page id is past the largest page id"))
     }
 
     fn str(&mut self) -> Result<String, PersistError> {
@@ -337,7 +340,7 @@ pub fn chain_pages_for(len: usize) -> usize {
 /// `first_chain_page`.
 pub fn write_header(
     bpm: &Arc<BufferPoolManager>,
-    first_chain_page: usize,
+    first_chain_page: PageId,
 ) -> Result<(), PersistError> {
     let mut page = bpm.write_page(HEADER_PAGE_ID)?;
     let buf = page.data_mut();
@@ -345,14 +348,14 @@ pub fn write_header(
     buf[..HEADER_MAGIC.len()].copy_from_slice(&HEADER_MAGIC);
     buf[HEADER_VERSION_OFF..HEADER_VERSION_OFF + 4].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
     buf[HEADER_META_PAGE_OFF..HEADER_META_PAGE_OFF + 8]
-        .copy_from_slice(&(first_chain_page as u64).to_le_bytes());
+        .copy_from_slice(&u64::from(first_chain_page.get()).to_le_bytes());
     Ok(())
 }
 
 /// The first page of the metadata chain, read from the header page. Fails with
 /// [`PersistError::NotADatabase`] or [`PersistError::UnsupportedFormat`] for a data file this
 /// version cannot read.
-pub fn read_header(bpm: &Arc<BufferPoolManager>) -> Result<usize, PersistError> {
+pub fn read_header(bpm: &Arc<BufferPoolManager>) -> Result<PageId, PersistError> {
     let page = bpm.read_page(HEADER_PAGE_ID)?;
     let buf = page.data();
     if buf[..HEADER_MAGIC.len()] != HEADER_MAGIC {
@@ -371,7 +374,7 @@ pub fn read_header(bpm: &Arc<BufferPoolManager>) -> Result<usize, PersistError> 
             .try_into()
             .unwrap(),
     );
-    usize::try_from(first).map_err(|_| PersistError::CorruptMeta("bad first chain page"))
+    PageId::try_from(first).map_err(|_| PersistError::CorruptMeta("bad first chain page"))
 }
 
 /// Writes `payload` across the metadata chain `chain`, in order. Pages past the end of the
@@ -380,7 +383,7 @@ pub fn read_header(bpm: &Arc<BufferPoolManager>) -> Result<usize, PersistError> 
 /// Panics if `chain` holds fewer than [`chain_pages_for`]`(payload.len())` pages.
 pub fn write_chain(
     bpm: &Arc<BufferPoolManager>,
-    chain: &[usize],
+    chain: &[PageId],
     payload: &[u8],
 ) -> Result<(), PersistError> {
     assert!(
@@ -392,7 +395,7 @@ pub fn write_chain(
     let mut parts = payload.chunks(CHAIN_PAGE_CAPACITY);
     for (i, &page_id) in chain.iter().enumerate() {
         let part = parts.next().unwrap_or(&[]);
-        let next = chain.get(i + 1).map_or(NO_NEXT_CHAIN_PAGE, |&id| id as u64);
+        let next = PageId::encode_u64(chain.get(i + 1).copied());
         let mut page = bpm.write_page(page_id)?;
         let buf = page.data_mut();
         buf[..CHAIN_MAGIC.len()].copy_from_slice(&CHAIN_MAGIC);
@@ -406,15 +409,13 @@ pub fn write_chain(
 /// Reads the metadata chain that starts at `first`: its page ids, in order, and its payload.
 pub fn read_chain(
     bpm: &Arc<BufferPoolManager>,
-    first: usize,
-) -> Result<(Vec<usize>, Vec<u8>), PersistError> {
+    first: PageId,
+) -> Result<(Vec<PageId>, Vec<u8>), PersistError> {
     let mut chain = Vec::new();
     let mut seen = HashSet::new();
     let mut payload = Vec::new();
-    let mut next = first as u64;
-    while next != NO_NEXT_CHAIN_PAGE {
-        let page_id = usize::try_from(next)
-            .map_err(|_| PersistError::CorruptMeta("a chain link does not fit in usize"))?;
+    let mut next = Some(first);
+    while let Some(page_id) = next {
         if !seen.insert(page_id) {
             return Err(PersistError::CorruptMeta("the metadata chain loops"));
         }
@@ -433,7 +434,10 @@ pub fn read_chain(
             ));
         }
         payload.extend_from_slice(&buf[CHAIN_PAYLOAD_OFF..CHAIN_PAYLOAD_OFF + len]);
-        next = u64::from_le_bytes(buf[CHAIN_NEXT_OFF..CHAIN_NEXT_OFF + 8].try_into().unwrap());
+        next = PageId::decode_u64(u64::from_le_bytes(
+            buf[CHAIN_NEXT_OFF..CHAIN_NEXT_OFF + 8].try_into().unwrap(),
+        ))
+        .map_err(|_| PersistError::CorruptMeta("a chain link is past the largest page id"))?;
         chain.push(page_id);
     }
     Ok((chain, payload))
@@ -443,12 +447,13 @@ pub fn read_chain(
 mod tests {
     use super::*;
     use crate::testing;
+    use crate::testing::pid;
 
     fn sample() -> DatabaseMeta {
         DatabaseMeta {
             allocation: PageAllocation {
                 next_page_id: 40,
-                free_page_ids: vec![3, 17, 39],
+                free_page_ids: vec![pid(3), pid(17), pid(39)],
             },
             last_commit_ts: 12,
             next_txn_id: (1 << 62) + 7,
@@ -457,7 +462,7 @@ mod tests {
                 next_index_oid: 2,
                 tables: vec![
                     TableEntry {
-                        oid: 0,
+                        oid: TableOid(0),
                         name: "t".into(),
                         columns: vec![
                             (DataType::INT, "id".into()),
@@ -468,22 +473,22 @@ mod tests {
                             (DataType::VARCHAR(20), "name".into()),
                             (DataType::CHAR(2), "code".into()),
                         ],
-                        first_page_id: 2,
+                        first_page_id: pid(2),
                     },
                     TableEntry {
-                        oid: 2,
+                        oid: TableOid(2),
                         name: "naïve".into(),
                         columns: vec![],
-                        first_page_id: 9,
+                        first_page_id: pid(9),
                     },
                 ],
                 indexes: vec![IndexEntry {
-                    oid: 1,
+                    oid: IndexOid(1),
                     name: "t_id".into(),
-                    table_oid: 0,
+                    table_oid: TableOid(0),
                     key_columns: vec![0, 3],
                     index_type: IndexType::BPlusTree,
-                    header_page_id: 5,
+                    header_page_id: pid(5),
                 }],
             },
         }
@@ -573,9 +578,7 @@ mod tests {
     #[test]
     fn a_chain_round_trips_payloads_of_any_length() {
         let (bpm, _dir) = testing::bpm(8);
-        let pages: Vec<usize> = (0..4)
-            .map(|_| bpm.new_page().unwrap().page_id().unwrap())
-            .collect();
+        let pages: Vec<PageId> = (0..4).map(|_| bpm.new_page().unwrap().page_id()).collect();
         for len in [
             0,
             1,
@@ -595,16 +598,16 @@ mod tests {
     #[test]
     fn a_damaged_chain_is_reported() {
         let (bpm, _dir) = testing::bpm(8);
-        let a = bpm.new_page().unwrap().page_id().unwrap();
-        let b = bpm.new_page().unwrap().page_id().unwrap();
+        let a = bpm.new_page().unwrap().page_id();
+        let b = bpm.new_page().unwrap().page_id();
         write_chain(&bpm, &[a, b], b"x").unwrap();
-        bpm.write_page(b).unwrap().data_mut()[CHAIN_NEXT_OFF..CHAIN_NEXT_OFF + 8]
-            .copy_from_slice(&(a as u64).to_le_bytes());
+        bpm.write_page(pid(b)).unwrap().data_mut()[CHAIN_NEXT_OFF..CHAIN_NEXT_OFF + 8]
+            .copy_from_slice(&u64::from(a.get()).to_le_bytes());
         assert!(matches!(
             read_chain(&bpm, a),
             Err(PersistError::CorruptMeta("the metadata chain loops"))
         ));
-        bpm.write_page(b).unwrap().data_mut()[0] = 0;
+        bpm.write_page(pid(b)).unwrap().data_mut()[0] = 0;
         assert!(matches!(
             read_chain(&bpm, a),
             Err(PersistError::CorruptMeta(_))
@@ -615,8 +618,8 @@ mod tests {
     fn a_header_round_trips_and_a_foreign_one_is_refused() {
         let (bpm, _dir) = testing::bpm(8);
         drop(bpm.new_page().unwrap());
-        write_header(&bpm, 7).unwrap();
-        assert_eq!(read_header(&bpm).unwrap(), 7);
+        write_header(&bpm, pid(7)).unwrap();
+        assert_eq!(read_header(&bpm).unwrap(), pid(7));
 
         bpm.write_page(HEADER_PAGE_ID).unwrap().data_mut()[HEADER_VERSION_OFF] = 99;
         assert!(matches!(
@@ -631,7 +634,7 @@ mod tests {
     #[should_panic(expected = "needs more than 1 chain pages")]
     fn writing_a_payload_into_too_short_a_chain_panics() {
         let (bpm, _dir) = testing::bpm(8);
-        let a = bpm.new_page().unwrap().page_id().unwrap();
+        let a = bpm.new_page().unwrap().page_id();
         write_chain(&bpm, &[a], &vec![0; CHAIN_PAGE_CAPACITY + 1]).unwrap();
     }
 
@@ -679,5 +682,21 @@ mod tests {
         for (err, expected) in cases {
             assert_eq!(err.to_string(), expected);
         }
+    }
+
+    #[test]
+    fn a_chain_link_past_the_largest_page_id_is_corrupt() {
+        let (bpm, _dir) = testing::bpm(8);
+        let a = bpm.new_page().unwrap().page_id();
+        let b = bpm.new_page().unwrap().page_id();
+        write_chain(&bpm, &[a, b], b"x").unwrap();
+        bpm.write_page(a).unwrap().data_mut()[CHAIN_NEXT_OFF..CHAIN_NEXT_OFF + 8]
+            .copy_from_slice(&u64::from(u32::MAX).to_le_bytes());
+        assert!(matches!(
+            read_chain(&bpm, a),
+            Err(PersistError::CorruptMeta(
+                "a chain link is past the largest page id"
+            ))
+        ));
     }
 }

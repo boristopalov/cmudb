@@ -141,6 +141,7 @@ impl<'a> Executor for DdlExecutor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::IndexOid;
     use crate::processor::executor::collect_rows;
     use crate::processor::executors::test_support::*;
     use crate::processor::plan::ColIdx;
@@ -232,12 +233,17 @@ mod tests {
         );
 
         let drop_index = DropIndexPlanNode {
-            index_oid: Some(42),
+            index_oid: Some(IndexOid(42)),
             if_exists: false,
         };
         let err = status(&catalog, &bpm, DdlOp::DropIndex(&drop_index)).unwrap_err();
         assert!(
-            matches!(err, ExecutorError::IndexNotFound { oid: Some(42) }),
+            matches!(
+                err,
+                ExecutorError::IndexNotFound {
+                    oid: Some(IndexOid(42))
+                }
+            ),
             "{err:?}"
         );
     }

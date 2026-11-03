@@ -3,7 +3,7 @@
 //! Layout (all integers little-endian):
 //!
 //! ```text
-//! offset 0   next_page_id       u32   (NO_NEXT_PAGE on the last page)
+//! offset 0   next_page_id       u32   (PageId::encode_u32(None) on the last page)
 //! offset 4   num_tuples         u16
 //! offset 6   num_deleted_tuples u16
 //! offset 8   free_space_offset  u32   (tuple data grows backwards from PAGE_SIZE)
@@ -29,6 +29,7 @@
 
 use crate::buf::{get_u16_le, get_u32_le, get_u64_le, put_u16_le, put_u32_le, put_u64_le};
 use crate::disk::PAGE_SIZE;
+use crate::ids::PageId;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,9 +152,6 @@ impl Slot {
     }
 }
 
-/// `next_page_id` of the last page of a table. Page 0 is a valid page, so it cannot mark the end.
-pub const NO_NEXT_PAGE: u32 = u32::MAX;
-
 const NEXT_PAGE_ID_OFF: usize = 0;
 const NUM_TUPLES_OFF: usize = 4;
 const NUM_DELETED_OFF: usize = 6;
@@ -202,8 +200,8 @@ impl<B: AsRef<[u8]>> TablePage<B> {
     }
 
     /// The page that continues this table, or `None` on the last page.
-    pub fn next_page_id(&self) -> Option<u32> {
-        Some(get_u32_le(self.bytes(), NEXT_PAGE_ID_OFF)).filter(|&id| id != NO_NEXT_PAGE)
+    pub fn next_page_id(&self) -> Option<PageId> {
+        PageId::decode_u32(get_u32_le(self.bytes(), NEXT_PAGE_ID_OFF))
     }
 
     pub fn num_tuples(&self) -> u16 {
@@ -286,7 +284,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> TablePage<B> {
     /// buffer is left untouched; it is unreachable until slots point into it.
     pub fn init(mut buf: B) -> Self {
         let b = buf.as_mut();
-        put_u32_le(b, NEXT_PAGE_ID_OFF, NO_NEXT_PAGE);
+        put_u32_le(b, NEXT_PAGE_ID_OFF, PageId::encode_u32(None));
         put_u16_le(b, NUM_TUPLES_OFF, 0);
         put_u16_le(b, NUM_DELETED_OFF, 0);
         put_u32_le(b, FREE_SPACE_OFF, PAGE_SIZE as u32);
@@ -298,8 +296,12 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> TablePage<B> {
         self.buf.as_mut()
     }
 
-    pub fn set_next_page_id(&mut self, page_id: u32) {
-        put_u32_le(self.bytes_mut(), NEXT_PAGE_ID_OFF, page_id);
+    pub fn set_next_page_id(&mut self, page_id: PageId) {
+        put_u32_le(
+            self.bytes_mut(),
+            NEXT_PAGE_ID_OFF,
+            PageId::encode_u32(Some(page_id)),
+        );
     }
 
     /// Appends `data` as a new live tuple stamped with timestamp 0 (visible to everyone).
@@ -529,11 +531,11 @@ mod tests {
         let mut page = TablePage::init(&mut buf[..]);
         assert_eq!(page.insert(b"alpha").unwrap(), 0);
         assert_eq!(page.insert(b"beta!").unwrap(), 1);
-        page.set_next_page_id(7);
+        page.set_next_page_id(PageId::new(7));
 
         let page = TablePageRef::new(&buf[..]).unwrap();
         assert_eq!(page.num_tuples(), 2);
-        assert_eq!(page.next_page_id(), Some(7));
+        assert_eq!(page.next_page_id(), Some(PageId::new(7)));
         let m0 = page.slot(0).unwrap();
         let m1 = page.slot(1).unwrap();
         assert_eq!(page.tuple_bytes(&m0).unwrap(), b"alpha");

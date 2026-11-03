@@ -1,6 +1,5 @@
 use crate::buf::{BufReader, BufWriter, BufferError};
-use crate::index::b_plus_page::{INVALID_PAGE_ID, PageId};
-use crate::table_heap::RecordId;
+use crate::ids::{PageId, RecordId};
 use std::fmt;
 use std::num::TryFromIntError;
 
@@ -77,27 +76,30 @@ impl fmt::Display for PageCodecError {
 
 impl std::error::Error for PageCodecError {}
 
-pub fn encode_page_id(page_id: PageId) -> Result<u64, PageCodecError> {
-    if page_id == INVALID_PAGE_ID {
-        return Ok(u64::MAX);
-    }
-    Ok(u64::try_from(page_id)?)
+pub fn encode_page_id(page_id: Option<PageId>) -> u64 {
+    PageId::encode_u64(page_id)
 }
 
-pub fn decode_page_id(raw: u64) -> Result<PageId, PageCodecError> {
-    if raw == u64::MAX {
-        return Ok(INVALID_PAGE_ID);
-    }
-    Ok(usize::try_from(raw)?)
+pub fn decode_page_id(raw: u64) -> Result<Option<PageId>, PageCodecError> {
+    PageId::decode_u64(raw).map_err(|_| PageCodecError::BufferError(BufferError::Overflow))
+}
+
+/// Decodes the id of an internal page's child, which names a page. Fails with
+/// [`PageCodecError::Malformed`] for the "no page" value.
+pub fn decode_child_page_id(raw: u64) -> Result<PageId, PageCodecError> {
+    decode_page_id(raw)?.ok_or(PageCodecError::Malformed(
+        "an internal page child names no page",
+    ))
 }
 
 pub fn encode_record_id(rid: &RecordId) -> Result<(u64, u64), PageCodecError> {
-    Ok((u64::from(rid.page_id), u64::from(rid.slot_id)))
+    Ok((u64::from(rid.page_id.get()), u64::from(rid.slot_id)))
 }
 
 pub fn decode_record_id(page_id: u64, slot_id: u64) -> Result<RecordId, PageCodecError> {
     Ok(RecordId {
-        page_id: u32::try_from(page_id)?,
+        page_id: PageId::try_from(page_id)
+            .map_err(|_| PageCodecError::BufferError(BufferError::Overflow))?,
         slot_id: u32::try_from(slot_id)?,
     })
 }
@@ -230,12 +232,18 @@ mod tests {
 
     #[test]
     fn page_and_record_ids_round_trip() {
-        assert_eq!(encode_page_id(INVALID_PAGE_ID).unwrap(), u64::MAX);
-        assert_eq!(decode_page_id(u64::MAX).unwrap(), INVALID_PAGE_ID);
-        assert_eq!(decode_page_id(encode_page_id(17).unwrap()).unwrap(), 17);
+        assert_eq!(encode_page_id(None), u64::MAX);
+        assert_eq!(decode_page_id(u64::MAX).unwrap(), None);
+        let page = Some(PageId::new(17));
+        assert_eq!(decode_page_id(encode_page_id(page)).unwrap(), page);
+        assert_eq!(decode_child_page_id(17).unwrap(), PageId::new(17));
+        assert!(matches!(
+            decode_child_page_id(u64::MAX),
+            Err(PageCodecError::Malformed(_))
+        ));
 
         let rid = RecordId {
-            page_id: 4,
+            page_id: PageId::new(4),
             slot_id: 9,
         };
         let (p, s) = encode_record_id(&rid).unwrap();
@@ -285,5 +293,23 @@ mod tests {
         for (err, msg) in cases {
             assert_eq!(err.to_string(), msg);
         }
+    }
+
+    #[test]
+    fn page_ids_decode_to_a_page_or_none_and_reject_the_rest() {
+        let page = PageId::new(9);
+        assert_eq!(decode_page_id(encode_page_id(Some(page))), Ok(Some(page)));
+        assert_eq!(decode_page_id(encode_page_id(None)), Ok(None));
+        assert_eq!(
+            decode_page_id(u64::from(u32::MAX)),
+            Err(PageCodecError::BufferError(BufferError::Overflow))
+        );
+        assert_eq!(decode_child_page_id(u64::from(page.get())), Ok(page));
+        assert_eq!(
+            decode_child_page_id(encode_page_id(None)),
+            Err(PageCodecError::Malformed(
+                "an internal page child names no page"
+            ))
+        );
     }
 }

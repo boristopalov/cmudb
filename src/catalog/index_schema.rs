@@ -23,14 +23,14 @@ const RID_SUFFIX_LEN: usize = 8;
 
 fn rid_suffix(rid: RecordId) -> [u8; RID_SUFFIX_LEN] {
     let mut out = [0u8; RID_SUFFIX_LEN];
-    out[..4].copy_from_slice(&rid.page_id.to_be_bytes());
+    out[..4].copy_from_slice(&rid.page_id.get().to_be_bytes());
     out[4..].copy_from_slice(&rid.slot_id.to_be_bytes());
     out
 }
 
 /// Smallest and largest record ids, used to bracket all entries of one user key.
 const RID_MIN: RecordId = RecordId {
-    page_id: 0,
+    page_id: PageId::new(0),
     slot_id: 0,
 };
 const RID_MAX: RecordId = RecordId::RESERVED;
@@ -308,10 +308,11 @@ mod tests {
     use crate::index::IndexError;
 
     use crate::table_heap::RecordId;
+    use crate::testing::pid;
 
     fn rid(slot_id: u32) -> RecordId {
         RecordId {
-            page_id: 0,
+            page_id: pid(0),
             slot_id,
         }
     }
@@ -454,8 +455,8 @@ mod tests {
         )
         .unwrap();
         let t = |v| schema.encode_tuple(&[Some(Value::INT(v))]).unwrap();
-        let rid = |p, s| RecordId {
-            page_id: p,
+        let rid = |p: u32, s| RecordId {
+            page_id: pid(p),
             slot_id: s,
         };
         index.insert(&t(5), rid(3, 1)).unwrap();

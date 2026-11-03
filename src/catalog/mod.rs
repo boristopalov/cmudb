@@ -1,5 +1,6 @@
 pub mod index_schema;
 pub mod timestamp;
+use crate::ids::{IndexOid, PageId, TableOid};
 use crate::{buffer_pool::BufferPoolManager, table_heap::TableHeap};
 use crate::{catalog::index_schema::TableIndex, table_heap::Tuple};
 use ordered_float::OrderedFloat;
@@ -105,9 +106,9 @@ pub struct TableInfo {
 }
 
 pub struct IndexInfo {
-    pub oid: u32,
+    pub oid: IndexOid,
     pub name: String,
-    pub table_oid: u32,
+    pub table_oid: TableOid,
     pub index: TableIndex,
 }
 
@@ -129,24 +130,24 @@ pub struct CatalogSnapshot {
 /// One table of a [`CatalogSnapshot`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableEntry {
-    pub oid: u32,
+    pub oid: TableOid,
     pub name: String,
     pub columns: Vec<(DataType, String)>,
     /// The first page of the table's heap.
-    pub first_page_id: usize,
+    pub first_page_id: PageId,
 }
 
 /// One index of a [`CatalogSnapshot`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexEntry {
-    pub oid: u32,
+    pub oid: IndexOid,
     pub name: String,
-    pub table_oid: u32,
+    pub table_oid: TableOid,
     /// Position of each key column in the table's columns.
     pub key_columns: Vec<usize>,
     pub index_type: IndexType,
     /// The header page of the index's tree.
-    pub header_page_id: usize,
+    pub header_page_id: PageId,
 }
 
 /// Registry of tables and indexes, shared by reference-counted handles. Executors look tables and
@@ -160,10 +161,10 @@ pub struct Catalog {
 
 #[derive(Default)]
 struct CatalogEntries {
-    tables: HashMap<u32, Arc<TableInfo>>,
-    table_oids_by_name: HashMap<String, u32>,
-    indexes: HashMap<u32, Arc<IndexInfo>>,
-    index_oids_by_table_name: HashMap<String, HashMap<String, u32>>,
+    tables: HashMap<TableOid, Arc<TableInfo>>,
+    table_oids_by_name: HashMap<String, TableOid>,
+    indexes: HashMap<IndexOid, Arc<IndexInfo>>,
+    index_oids_by_table_name: HashMap<String, HashMap<String, IndexOid>>,
 }
 
 impl Catalog {
@@ -283,15 +284,15 @@ impl Catalog {
         }
     }
 
-    fn next_table_oid(&self) -> u32 {
-        self.next_table_oid.fetch_add(1, AcqRel)
+    fn next_table_oid(&self) -> TableOid {
+        TableOid(self.next_table_oid.fetch_add(1, AcqRel))
     }
 
-    fn next_index_oid(&self) -> u32 {
-        self.next_index_oid.fetch_add(1, AcqRel)
+    fn next_index_oid(&self) -> IndexOid {
+        IndexOid(self.next_index_oid.fetch_add(1, AcqRel))
     }
 
-    pub fn create_table(&self, name: String, schema: Schema) -> Result<u32, CatalogError> {
+    pub fn create_table(&self, name: String, schema: Schema) -> Result<TableOid, CatalogError> {
         let mut entries = self.entries.write().unwrap();
         if entries.table_oids_by_name.contains_key(&name) {
             return Err(CatalogError::TableExists);
@@ -314,7 +315,7 @@ impl Catalog {
 
     /// Drops a table by oid, along with any indexes associated with it.
     /// Returns `Ok(true)` if the table existed and was dropped, `Ok(false)` otherwise.
-    pub fn drop_table(&self, oid: u32) -> Result<bool, CatalogError> {
+    pub fn drop_table(&self, oid: TableOid) -> Result<bool, CatalogError> {
         let mut entries = self.entries.write().unwrap();
         let Some(tinfo) = entries.tables.remove(&oid) else {
             return Ok(false);
@@ -328,7 +329,7 @@ impl Catalog {
         Ok(true)
     }
 
-    pub fn table_oid(&self, name: &str) -> Result<u32, CatalogError> {
+    pub fn table_oid(&self, name: &str) -> Result<TableOid, CatalogError> {
         let entries = self.entries.read().unwrap();
         entries
             .table_oids_by_name
@@ -337,7 +338,7 @@ impl Catalog {
             .ok_or(CatalogError::TableDoesNotExist)
     }
 
-    pub fn get_table(&self, oid: u32) -> Result<Arc<TableInfo>, CatalogError> {
+    pub fn get_table(&self, oid: TableOid) -> Result<Arc<TableInfo>, CatalogError> {
         let entries = self.entries.read().unwrap();
         entries
             .tables
@@ -350,11 +351,11 @@ impl Catalog {
     pub fn create_index(
         &self,
         bpm: Arc<BufferPoolManager>,
-        table_oid: u32,
+        table_oid: TableOid,
         index_name: String,
         col_names: &[&str],
         index_type: IndexType,
-    ) -> Result<u32, CatalogError> {
+    ) -> Result<IndexOid, CatalogError> {
         let mut entries = self.entries.write().unwrap();
         let table = entries
             .tables
@@ -426,7 +427,7 @@ impl Catalog {
     }
 
     /// Drops an index by oid. Returns `Ok(true)` if the index existed and was dropped.
-    pub fn drop_index(&self, oid: u32) -> Result<bool, CatalogError> {
+    pub fn drop_index(&self, oid: IndexOid) -> Result<bool, CatalogError> {
         let mut entries = self.entries.write().unwrap();
         let Some(info) = entries.indexes.remove(&oid) else {
             return Ok(false);
@@ -443,7 +444,7 @@ impl Catalog {
         Ok(true)
     }
 
-    pub fn index_oid(&self, table_name: &str, index_name: &str) -> Result<u32, CatalogError> {
+    pub fn index_oid(&self, table_name: &str, index_name: &str) -> Result<IndexOid, CatalogError> {
         let entries = self.entries.read().unwrap();
         let indexes = entries
             .index_oids_by_table_name
@@ -457,9 +458,9 @@ impl Catalog {
     }
 
     /// The oids of every index called `index_name`, across all tables, in ascending order.
-    pub fn index_oids_named(&self, index_name: &str) -> Vec<u32> {
+    pub fn index_oids_named(&self, index_name: &str) -> Vec<IndexOid> {
         let entries = self.entries.read().unwrap();
-        let mut oids: Vec<u32> = entries
+        let mut oids: Vec<IndexOid> = entries
             .index_oids_by_table_name
             .values()
             .filter_map(|table_indexes| table_indexes.get(index_name).copied())
@@ -468,7 +469,7 @@ impl Catalog {
         oids
     }
 
-    pub fn get_index(&self, oid: u32) -> Result<Arc<IndexInfo>, CatalogError> {
+    pub fn get_index(&self, oid: IndexOid) -> Result<Arc<IndexInfo>, CatalogError> {
         let entries = self.entries.read().unwrap();
         entries
             .indexes
@@ -477,7 +478,10 @@ impl Catalog {
             .ok_or(CatalogError::IndexDoesNotExist)
     }
 
-    pub fn get_table_indexes(&self, table_oid: u32) -> Result<Vec<Arc<IndexInfo>>, CatalogError> {
+    pub fn get_table_indexes(
+        &self,
+        table_oid: TableOid,
+    ) -> Result<Vec<Arc<IndexInfo>>, CatalogError> {
         let entries = self.entries.read().unwrap();
         if !entries.tables.contains_key(&table_oid) {
             return Err(CatalogError::TableDoesNotExist);
@@ -1519,7 +1523,10 @@ mod tests {
                 .unwrap(),
             vec![rid]
         );
-        assert_eq!(restored.create_table("u".into(), schema).unwrap(), oid + 1);
+        assert_eq!(
+            restored.create_table("u".into(), schema).unwrap(),
+            TableOid(oid.0 + 1)
+        );
     }
 
     #[test]
@@ -1539,7 +1546,7 @@ mod tests {
         let good = catalog.snapshot();
 
         let mut no_table = good.clone();
-        no_table.indexes[0].table_oid = 9;
+        no_table.indexes[0].table_oid = TableOid(9);
         let mut bad_column = good.clone();
         bad_column.indexes[0].key_columns = vec![3];
         let mut not_a_tree = good.clone();

@@ -1,5 +1,6 @@
 use crate::{
     catalog::{DataType, Schema, Value},
+    ids::{IndexOid, TableOid},
     processor::executor::ExecutorError,
     table_heap::Tuple,
 };
@@ -31,14 +32,14 @@ pub enum Plan {
 }
 
 pub struct SeqScanPlanNode {
-    pub table_oid: u32,
+    pub table_oid: TableOid,
     pub schema: Schema,
 }
 
 pub struct InsertPlanNode {
     pub schema: Schema,
     pub child: Box<Plan>,
-    pub table_oid: u32,
+    pub table_oid: TableOid,
 }
 
 pub struct ValuesPlanNode {
@@ -50,7 +51,7 @@ pub struct UpdatePlanNode {
     pub schema: Schema,
     pub assignments: Vec<ColumnAssignment>,
     pub child: Box<Plan>,
-    pub table_oid: u32,
+    pub table_oid: TableOid,
 }
 
 /// `SET <column> = <value>` for one column of an UPDATE.
@@ -62,14 +63,14 @@ pub struct ColumnAssignment {
 pub struct DeletePlanNode {
     pub schema: Schema,
     pub child: Box<Plan>,
-    pub table_oid: u32,
+    pub table_oid: TableOid,
 }
 
 pub struct IndexScanPlanNode {
     pub schema: Schema,
     pub start: Bound<Vec<Value>>,
     pub end: Bound<Vec<Value>>,
-    pub index_oid: u32,
+    pub index_oid: IndexOid,
 }
 
 pub struct FilterPlanNode {
@@ -139,10 +140,10 @@ pub struct NestedIndexJoinPlanNode {
     pub schema: Schema,
     pub child: Box<Plan>,
     pub key_predicate: Expression,
-    pub table_oid: u32,
+    pub table_oid: TableOid,
     /// Schema of the inner table that is probed through the index.
     pub table_schema: Schema,
-    pub index_oid: u32,
+    pub index_oid: IndexOid,
     pub join_type: JoinType,
 }
 
@@ -257,20 +258,20 @@ pub struct CreateTablePlanNode {
 /// Drops a table and its indexes. `table_oid` is `None` when the table did not exist when the
 /// statement was bound; the drop then succeeds only under `if_exists`.
 pub struct DropTablePlanNode {
-    pub table_oid: Option<u32>,
+    pub table_oid: Option<TableOid>,
     pub if_exists: bool,
 }
 
 pub struct CreateIndexPlanNode {
     pub index_name: String,
-    pub table_oid: u32,
+    pub table_oid: TableOid,
     pub key_columns: Vec<ColIdx>,
 }
 
 /// Drops an index. `index_oid` is `None` when the index did not exist when the statement was
 /// bound; the drop then succeeds only under `if_exists`.
 pub struct DropIndexPlanNode {
-    pub index_oid: Option<u32>,
+    pub index_oid: Option<IndexOid>,
     pub if_exists: bool,
 }
 

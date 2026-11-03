@@ -2,8 +2,10 @@
 
 use cmudb::buffer_pool::BufferPoolManager;
 use cmudb::catalog::index_schema::{IndexKey, IndexValue};
+use cmudb::ids::PageId;
 use cmudb::index::{BPlusTree, Index};
 use cmudb::table_heap::RecordId;
+use cmudb::testing::pid;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use rand::seq::SliceRandom;
 use std::hint::black_box;
@@ -30,7 +32,7 @@ fn key(k: u64) -> IndexKey {
 
 fn rid(k: u64) -> RecordId {
     RecordId {
-        page_id: (k / 32) as u32,
+        page_id: PageId::new((k / 32) as u32),
         slot_id: (k % 32) as u32,
     }
 }
@@ -121,7 +123,7 @@ fn lookup_and_scan(c: &mut Criterion) {
     assert_tree_holds(&tree, LOOKUP_KEYS);
     let tree_pages = bpm.allocated_page_count();
     assert!(
-        tree_pages < POOL_FRAMES && (0..tree_pages).all(|p| bpm.is_resident(p)),
+        tree_pages < POOL_FRAMES && (0..tree_pages).all(|p| bpm.is_resident(pid(p))),
         "the 100k-key tree ({tree_pages} pages) fits in the {POOL_FRAMES}-frame pool, so lookups and scans never read from disk"
     );
     assert_eq!(
