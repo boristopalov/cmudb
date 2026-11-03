@@ -146,6 +146,33 @@ fn bigint_and_float_values_keep_their_full_width_across_a_restart() {
 }
 
 #[test]
+fn char_columns_keep_their_length_and_index_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open(dir.path());
+        run(
+            &db,
+            "CREATE TABLE c (code CHAR(3), n INT); CREATE INDEX c_code ON c (code);\
+             INSERT INTO c VALUES ('us', 1), ('fra', 2);",
+        );
+        db.close().unwrap();
+    }
+
+    let db = open(dir.path());
+    let query = "SELECT n FROM c WHERE code = 'us ';";
+    assert!(uses_index(&db, query));
+    assert_eq!(rows(&db, query), vec![vec![Some(Value::INT(1))]]);
+    assert_eq!(
+        rows(&db, "SELECT code FROM c WHERE n = 1;"),
+        vec![vec![Some(Value::text("us "))]]
+    );
+    let err = db
+        .execute("INSERT INTO c VALUES ('deu1', 3);")
+        .expect_err("the CHAR(3) length is kept on disk");
+    assert!(err.to_string().contains("CHAR(3)"), "{err}");
+}
+
+#[test]
 fn text_rows_and_varchar_indexes_survive_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     {

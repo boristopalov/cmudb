@@ -27,11 +27,11 @@ pub enum CatalogError {
         expected: DataType,
         value: Value,
     },
-    /// A string of `len` characters was stored in column `column`, which holds at most
-    /// `max_chars`.
+    /// A string of `len` characters was stored in column `column` of type `expected`, a
+    /// `VARCHAR(n)` or `CHAR(n)` that holds fewer.
     ColumnTooLong {
         column: String,
-        max_chars: u32,
+        expected: DataType,
         len: usize,
     },
     ColumnOutOfBounds,
@@ -73,11 +73,11 @@ impl fmt::Display for CatalogError {
             ),
             CatalogError::ColumnTooLong {
                 column,
-                max_chars,
+                expected,
                 len,
             } => write!(
                 f,
-                "value of {len} characters is too long for VARCHAR({max_chars}) column `{column}`"
+                "value of {len} characters is too long for {expected} column `{column}`"
             ),
             CatalogError::ColumnOutOfBounds => {
                 write!(f, "the column index is past the schema's last column")
@@ -655,9 +655,9 @@ impl Column {
                 expected: self.dtype,
                 value,
             },
-            CoercionError::TooLong { max_chars, len } => CatalogError::ColumnTooLong {
+            CoercionError::TooLong { len } => CatalogError::ColumnTooLong {
                 column: self.name.clone(),
-                max_chars,
+                expected: self.dtype,
                 len,
             },
         })
@@ -680,7 +680,9 @@ pub enum Value {
     FLOAT(OrderedFloat<f64>),
     /// Microseconds since 1970-01-01 00:00:00 UTC.
     TIMESTAMP(i64),
-    /// A string, in a TEXT or VARCHAR column.
+    /// A string, in a TEXT, VARCHAR or CHAR column. A CHAR column's values hold no trailing
+    /// spaces, since CHAR comparisons ignore them; [`Value::padded_for`] adds them back to a
+    /// query's result.
     TEXT(Arc<str>),
 }
 
@@ -691,8 +693,9 @@ pub enum CoercionError {
     WrongType,
     /// The conversion exists but the value does not fit the target type.
     OutOfRange,
-    /// A string of `len` characters stored as a `VARCHAR(max_chars)`.
-    TooLong { max_chars: u32, len: usize },
+    /// A string of `len` characters, more than the `VARCHAR(n)` or `CHAR(n)` it is stored as
+    /// holds. A CHAR counts no trailing spaces.
+    TooLong { len: usize },
 }
 
 impl Value {
@@ -745,20 +748,15 @@ impl Value {
     /// Converts the value to `to` the way an INSERT or UPDATE stores it in a column of that type:
     /// INT widens to BIGINT and FLOAT, BIGINT widens to FLOAT and narrows to INT when it fits.
     /// FLOAT does not convert to an integer type, BOOLEAN and TIMESTAMP convert to nothing but
-    /// themselves, and TEXT converts to a VARCHAR that holds as many characters.
+    /// themselves, and TEXT converts to a VARCHAR that holds as many characters. TEXT converts to
+    /// a `CHAR(n)` without its trailing spaces, when at most `n` characters are left.
     pub fn coerce_to(self, to: DataType) -> Result<Value, CoercionError> {
         if self.data_type() == to {
             return Ok(self);
         }
         match (self, to) {
-            (Value::TEXT(s), DataType::VARCHAR(max_chars)) => {
-                let len = s.chars().count();
-                if len <= max_chars as usize {
-                    Ok(Value::TEXT(s))
-                } else {
-                    Err(CoercionError::TooLong { max_chars, len })
-                }
-            }
+            (Value::TEXT(s), DataType::VARCHAR(max_chars)) => fit_chars(s, max_chars),
+            (Value::TEXT(s), DataType::CHAR(n)) => fit_chars(without_char_padding(s), n),
             (Value::INT(i), DataType::BIGINT) => Ok(Value::BIGINT(i64::from(i))),
             (Value::BIGINT(i), DataType::INT) => i32::try_from(i)
                 .map(Value::INT)
@@ -770,13 +768,17 @@ impl Value {
     }
 
     /// The value converted to `to` without losing anything: an integer to a wider integer type or
-    /// to a FLOAT that holds it exactly, or a whole FLOAT to an integer type that holds it.
-    /// `None` when no such conversion exists.
+    /// to a FLOAT that holds it exactly, a whole FLOAT to an integer type that holds it, or a
+    /// string to a CHAR without the trailing spaces CHAR comparisons ignore. `None` when no such
+    /// conversion exists.
     pub fn exactly_as(self, to: DataType) -> Option<Value> {
         if self.data_type() == to {
             return Some(self);
         }
         match (&self, to) {
+            (Value::TEXT(s), DataType::CHAR(_)) => {
+                Some(Value::TEXT(without_char_padding(s.clone())))
+            }
             (Value::INT(_) | Value::BIGINT(_), DataType::INT | DataType::BIGINT) => {
                 self.clone().coerce_to(to).ok()
             }
@@ -792,6 +794,19 @@ impl Value {
                 Value::BIGINT(f.0 as i64).coerce_to(to).ok()
             }
             _ => None,
+        }
+    }
+
+    /// The value as a query's result shows it in a column of type `dtype`: a string in a
+    /// `CHAR(n)` column padded with spaces to `n` characters, any other value as it is.
+    pub fn padded_for(self, dtype: DataType) -> Value {
+        match (self, dtype) {
+            (Value::TEXT(s), DataType::CHAR(n)) => {
+                let pad = (n as usize).saturating_sub(s.chars().count());
+                let padding: String = std::iter::repeat_n(CHAR_PAD, pad).collect();
+                Value::TEXT(Arc::from(format!("{s}{padding}")))
+            }
+            (other, _) => other,
         }
     }
 
@@ -828,10 +843,35 @@ impl Value {
             DataType::BIGINT => Value::BIGINT(i64::from_le_bytes(bytes.try_into().unwrap())),
             DataType::FLOAT => Value::float(f64::from_le_bytes(bytes.try_into().unwrap())),
             DataType::TIMESTAMP => Value::TIMESTAMP(i64::from_le_bytes(bytes.try_into().unwrap())),
-            DataType::TEXT | DataType::VARCHAR(_) => return text_at(tuple, bytes),
+            DataType::TEXT | DataType::VARCHAR(_) | DataType::CHAR(_) => {
+                return text_at(tuple, bytes);
+            }
         })
     }
 }
+
+/// `s` without its trailing spaces, the padding a CHAR value ignores.
+fn without_char_padding(s: Arc<str>) -> Arc<str> {
+    let trimmed = s.trim_end_matches(CHAR_PAD);
+    if trimmed.len() == s.len() {
+        s
+    } else {
+        Arc::from(trimmed)
+    }
+}
+
+/// `s` when it has at most `max_chars` characters.
+fn fit_chars(s: Arc<str>, max_chars: u32) -> Result<Value, CoercionError> {
+    let len = s.chars().count();
+    if len <= max_chars as usize {
+        Ok(Value::TEXT(s))
+    } else {
+        Err(CoercionError::TooLong { len })
+    }
+}
+
+/// The character a CHAR value is padded with.
+const CHAR_PAD: char = ' ';
 
 /// Integers below this magnitude (2^53) convert to `f64` and back without rounding.
 const I64_EXACT_FLOAT_BOUND: f64 = 9_007_199_254_740_992.0;
@@ -910,7 +950,7 @@ fn order_preserving_f64_bits(f: f64) -> u64 {
     }
 }
 
-/// The type of a column. Every type but TEXT and VARCHAR has a fixed width; a text value's characters follow the fixed-width part of its
+/// The type of a column. Every type but TEXT, VARCHAR and CHAR has a fixed width; a text value's characters follow the fixed-width part of its
 /// tuple, so tuples of a table with a text column differ in length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
@@ -927,6 +967,9 @@ pub enum DataType {
     TEXT,
     /// A string of at most this many characters (`VARCHAR(n)`).
     VARCHAR(u32),
+    /// A string of this many characters, padded with spaces (`CHAR(n)`, `CHARACTER(n)`).
+    /// Comparisons ignore the padding, as do conversions to TEXT and VARCHAR.
+    CHAR(u32),
 }
 
 impl DataType {
@@ -938,34 +981,37 @@ impl DataType {
             DataType::BIGINT => 8,
             DataType::FLOAT => 8,
             DataType::TIMESTAMP => 8,
-            DataType::TEXT | DataType::VARCHAR(_) => TEXT_DESCRIPTOR_LEN,
+            DataType::TEXT | DataType::VARCHAR(_) | DataType::CHAR(_) => TEXT_DESCRIPTOR_LEN,
         }
     }
 
     /// Bytes an index key spends on a value of this type, padded with zeros after the value's
     /// [`Value::encode_order_preserving`] encoding, so that every key of an index has one length.
-    /// A `VARCHAR(n)` takes the encoding of `n` four-byte characters; TEXT has no bound and so
-    /// no width.
+    /// A `VARCHAR(n)` or `CHAR(n)` takes the encoding of `n` four-byte characters; TEXT has no
+    /// bound and so no width.
     pub fn key_width(&self) -> Option<usize> {
         match self {
             DataType::TEXT => None,
-            DataType::VARCHAR(n) => (*n as usize)
+            DataType::VARCHAR(n) | DataType::CHAR(n) => (*n as usize)
                 .checked_mul(MAX_UTF8_CHAR_LEN)
                 .and_then(|bytes| bytes.checked_add(TEXT_KEY_TERMINATOR_LEN)),
             fixed => Some(fixed.fixed_width()),
         }
     }
 
-    /// True for TEXT and VARCHAR.
+    /// True for TEXT, VARCHAR and CHAR.
     pub fn is_text(&self) -> bool {
-        matches!(self, DataType::TEXT | DataType::VARCHAR(_))
+        matches!(
+            self,
+            DataType::TEXT | DataType::VARCHAR(_) | DataType::CHAR(_)
+        )
     }
 
-    /// The type of the values a column of this type holds: TEXT for a VARCHAR, the type itself
-    /// otherwise.
+    /// The type of the values a column of this type holds: TEXT for a VARCHAR or CHAR, the type
+    /// itself otherwise.
     pub fn value_type(self) -> DataType {
         match self {
-            DataType::VARCHAR(_) => DataType::TEXT,
+            DataType::VARCHAR(_) | DataType::CHAR(_) => DataType::TEXT,
             other => other,
         }
     }
@@ -1016,6 +1062,7 @@ impl fmt::Display for DataType {
             DataType::TIMESTAMP => f.write_str("TIMESTAMP"),
             DataType::TEXT => f.write_str("TEXT"),
             DataType::VARCHAR(n) => write!(f, "VARCHAR({n})"),
+            DataType::CHAR(n) => write!(f, "CHAR({n})"),
         }
     }
 }
@@ -1139,6 +1186,77 @@ mod tests {
     }
 
     #[test]
+    fn char_values_drop_trailing_spaces_when_stored_and_get_them_back_in_results() {
+        let char4 = DataType::CHAR(4);
+        let stored = |s: &str| Value::text(s).coerce_to(char4);
+        assert_eq!(stored("ab"), Ok(Value::text("ab")));
+        assert_eq!(
+            stored(" ab   "),
+            Ok(Value::text(" ab")),
+            "only trailing spaces go"
+        );
+        assert_eq!(stored("abcd    "), Ok(Value::text("abcd")));
+        assert_eq!(stored("    "), Ok(Value::text("")));
+        assert_eq!(
+            stored("ab\t"),
+            Ok(Value::text("ab\t")),
+            "a tab is not padding"
+        );
+        assert_eq!(stored("ééééé"), Err(CoercionError::TooLong { len: 5 }));
+        assert_eq!(stored("abc  d"), Err(CoercionError::TooLong { len: 6 }));
+        assert_eq!(
+            Value::INT(1).coerce_to(char4),
+            Err(CoercionError::WrongType)
+        );
+
+        assert_eq!(Value::text("ab").padded_for(char4), Value::text("ab  "));
+        assert_eq!(Value::text("éé").padded_for(char4), Value::text("éé  "));
+        assert_eq!(Value::text("").padded_for(char4), Value::text("    "));
+        assert_eq!(Value::text("abcd").padded_for(char4), Value::text("abcd"));
+        assert_eq!(
+            Value::text("ab").padded_for(DataType::VARCHAR(4)),
+            Value::text("ab")
+        );
+        assert_eq!(Value::INT(1).padded_for(char4), Value::INT(1));
+
+        let schema = Schema::new(vec![(char4, "c".to_string())]);
+        let tuple = schema.encode_tuple(&[Some(Value::text("hé  "))]).unwrap();
+        assert_eq!(
+            schema.get_value(&tuple, 0).unwrap(),
+            Some(Value::text("hé"))
+        );
+        assert!(matches!(
+            schema.encode_tuple(&[Some(Value::text("hello"))]),
+            Err(CatalogError::ColumnTooLong {
+                expected: DataType::CHAR(4),
+                len: 5,
+                ..
+            })
+        ));
+        assert_eq!(
+            CatalogError::ColumnTooLong {
+                column: "c".into(),
+                expected: char4,
+                len: 5
+            }
+            .to_string(),
+            "value of 5 characters is too long for CHAR(4) column `c`"
+        );
+    }
+
+    #[test]
+    fn char_is_a_text_type_with_a_key_width() {
+        let char3 = DataType::CHAR(3);
+        assert!(char3.is_text());
+        assert_eq!(char3.value_type(), DataType::TEXT);
+        assert_eq!(char3.key_width(), DataType::VARCHAR(3).key_width());
+        assert!(char3.compares_with(DataType::TEXT));
+        assert!(DataType::TEXT.coerces_to(char3));
+        assert!(char3.coerces_to(DataType::VARCHAR(1)));
+        assert_eq!(char3.to_string(), "CHAR(3)");
+    }
+
+    #[test]
     fn test_schema_col_idx() {
         let schema = Schema::new(vec![
             (DataType::INT, "id".to_string()),
@@ -1227,6 +1345,12 @@ mod tests {
             None
         );
         assert_eq!(Value::BOOLEAN(true).exactly_as(DataType::INT), None);
+        assert_eq!(
+            Value::text("abcdef  ").exactly_as(DataType::CHAR(2)),
+            Some(Value::text("abcdef")),
+            "a CHAR comparison ignores trailing spaces, whatever the length"
+        );
+        assert_eq!(Value::text("ab ").exactly_as(DataType::VARCHAR(5)), None);
     }
 
     #[test]
