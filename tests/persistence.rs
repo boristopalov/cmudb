@@ -250,7 +250,17 @@ fn a_data_file_of_the_previous_format_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     open(dir.path()).close().unwrap();
     let path = dir.path().join(cmudb::database::DATA_FILE);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        0,
+        "a new database's pages wait in the log until a checkpoint"
+    );
+    open(dir.path()).close().unwrap();
     let mut file = std::fs::read(&path).unwrap();
+    assert!(
+        !file.is_empty(),
+        "opening replays the log into the data file"
+    );
     let version_at = 8;
     file[version_at..version_at + 4].copy_from_slice(&2u32.to_le_bytes());
     std::fs::write(&path, file).unwrap();
