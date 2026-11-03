@@ -279,6 +279,10 @@ impl Wal {
     /// Makes everything logged so far the state recovery returns to, then checkpoints into
     /// `data` if the log has outgrown its limit. Does nothing when nothing was logged since
     /// the last durable point.
+    ///
+    /// Once the log is synced the durable point has succeeded, so a checkpoint that fails
+    /// after it is only logged as a warning. The next durable point tries the checkpoint again,
+    /// and a failed fsync in it breaks the log, which that durable point reports.
     pub fn durable_point(&mut self, data: &File) -> io::Result<()> {
         self.refuse_if_broken()?;
         if !self.dirty {
@@ -287,8 +291,10 @@ impl Wal {
         self.write_out_with(KIND_DURABLE, &[])?;
         self.sync(|wal| wal.file.sync_data())?;
         self.dirty = false;
-        if self.end > self.checkpoint_bytes {
-            self.checkpoint(data)?;
+        if self.end > self.checkpoint_bytes
+            && let Err(e) = self.checkpoint(data)
+        {
+            log::warn!("write-ahead log checkpoint failed, retrying at the next commit: {e}");
         }
         Ok(())
     }
@@ -799,7 +805,7 @@ mod tests {
             wal.syncs_before_failure = Some(3);
             wal.log_page(PageId::new(0), &page(1)).unwrap();
             wal.durable_point(&files.data)
-                .expect_err("the log, data file and new log synced; the directory failed");
+                .expect("the log itself was synced before the checkpoint");
             assert_eq!(
                 files.data_page(0),
                 page(1),
@@ -814,6 +820,28 @@ mod tests {
     }
 
     #[test]
+    fn a_checkpoint_that_fails_after_the_log_sync_leaves_the_durable_point_standing() {
+        let files = Files::new();
+        let aside = files.log_path().with_extension("log-new");
+        let (mut wal, _) = files.open();
+        wal.set_checkpoint_bytes(0);
+        std::fs::create_dir(&aside).unwrap();
+        wal.log_page(PageId::new(0), &page(1)).unwrap();
+        wal.durable_point(&files.data)
+            .expect("the log was synced before the checkpoint failed");
+        assert!(wal.len() > PAGE_SIZE as u64, "the checkpoint did not run");
+        std::fs::remove_dir(&aside).unwrap();
+        wal.log_page(PageId::new(1), &page(2)).unwrap();
+        wal.durable_point(&files.data).unwrap();
+        assert!(
+            wal.len() < PAGE_SIZE as u64,
+            "the next durable point checkpointed"
+        );
+        assert_eq!(files.data_page(0), page(1));
+        assert_eq!(files.data_page(1), page(2));
+    }
+
+    #[test]
     fn a_failed_data_file_sync_in_a_checkpoint_keeps_the_old_log() {
         let files = Files::new();
         {
@@ -821,7 +849,10 @@ mod tests {
             wal.set_checkpoint_bytes(0);
             wal.syncs_before_failure = Some(1);
             wal.log_page(PageId::new(0), &page(1)).unwrap();
-            wal.durable_point(&files.data).unwrap_err();
+            wal.durable_point(&files.data)
+                .expect("the log itself was synced before the checkpoint");
+            wal.log_page(PageId::new(1), &page(2))
+                .expect_err("the failed data file sync broke the log");
             wal.durable_point(&files.data).unwrap_err();
         }
         let (_, recovery) = files.open();
