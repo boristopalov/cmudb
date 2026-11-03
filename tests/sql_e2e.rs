@@ -2423,7 +2423,10 @@ fn a_text_value_too_long_for_the_index_is_refused_and_not_stored() {
     let err = db
         .try_exec(&format!("INSERT INTO notes VALUES (9, '{too_long}')"))
         .expect_err("a 3000-byte key does not fit the index");
-    assert!(err.contains("longer than the"), "{err}");
+    assert!(
+        err.contains("an index key of 3002 bytes is longer than the 1999 bytes the index holds"),
+        "{err}"
+    );
     assert_eq!(db.exec("SELECT id FROM notes").len(), 5);
     assert!(
         db.exec("SELECT id FROM notes WHERE id = 9").is_empty(),
@@ -2440,7 +2443,10 @@ fn a_text_value_too_long_for_the_index_is_refused_and_not_stored() {
     let err = db
         .try_exec("CREATE INDEX by_long_body ON long_notes (body)")
         .expect_err("an existing value too long for the index");
-    assert!(err.contains("longer than the"), "{err}");
+    assert!(
+        err.contains("an index key of 3002 bytes is longer than the 1999 bytes the index holds"),
+        "{err}"
+    );
     assert!(
         db.catalog()
             .index_oid("long_notes", "by_long_body")

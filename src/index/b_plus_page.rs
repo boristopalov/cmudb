@@ -42,8 +42,8 @@ pub(crate) const HEADER_FIXED_HEADER_BYTES: usize = COMMON_HEADER_BYTES
     + PAGE_ID_ENCODED_BYTES
     + PAGE_ID_ENCODED_BYTES;
 
-/// The fewest entries of the longest key a leaf and an internal page each hold. Splits and
-/// merges by bytes keep every page at least half as full as this allows.
+/// The fewest entries of the longest key a leaf and an internal page each hold. With this
+/// many, both halves of a split and the page a merge makes fit in one page.
 const MIN_ENTRIES_PER_PAGE: usize = 4;
 
 const fn leaf_slots_start(tombstone_capacity: usize) -> usize {

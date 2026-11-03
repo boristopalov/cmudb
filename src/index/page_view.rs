@@ -139,8 +139,9 @@ impl<B: AsRef<[u8]>> NodeView<B> {
         }
     }
 
-    /// Whether losing one entry of the longest key might leave this page underfull, so a
-    /// remove below may rebalance it.
+    /// Whether shrinking this page by up to one entry of the longest key might leave it
+    /// underfull, so a remove below may rebalance it. That covers losing an entry and, for an
+    /// internal page, a borrow below replacing a separator with a shorter one.
     pub fn may_underflow_on_remove(&self) -> bool {
         match self {
             Self::Internal(n) => n.may_underflow_on_remove(),
@@ -916,5 +917,34 @@ mod tests {
         put_u64_le(&mut buf, NODE_PAGE_ID_OFFSET, u64::from(u32::MAX));
         let view = InternalPageView::new(&buf[..], l).unwrap();
         assert!(matches!(view.child(0), Err(PageCodecError::BufferError(_))));
+    }
+
+    #[test]
+    fn an_internal_page_safe_for_removes_stays_full_enough_when_a_separator_shrinks() {
+        let l = layout(u32::try_from(MAX_KEY_LEN).unwrap());
+        let longest = key(&[1; MAX_KEY_LEN]);
+        let mut internal = InternalPage::new_root(l, pid(0), longest, pid(1));
+        let mut buf = [0u8; PAGE_SIZE];
+        for next in 2u32.. {
+            internal.encode(&mut buf).unwrap();
+            if !NodeView::new(&buf[..], l)
+                .unwrap()
+                .may_underflow_on_remove()
+            {
+                break;
+            }
+            let separator = [&[2u8][..], &next.to_be_bytes(), &[0; 40]].concat();
+            internal.append_key_and_child(IndexKey(separator), pid(next));
+        }
+        assert!(
+            internal.used_bytes() - l.internal_max_entry_bytes() < l.internal_min_used() + 64,
+            "the page is barely safe, so the check is tight"
+        );
+
+        internal.replace_key(0, key(&[]));
+        assert!(
+            !internal.is_underfull(),
+            "a borrow that empties the longest separator keeps a safe page full enough"
+        );
     }
 }

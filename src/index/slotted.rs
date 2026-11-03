@@ -13,6 +13,15 @@ use crate::index::page_codec::PageCodecError;
 
 pub(crate) const SLOT_ENCODED_BYTES: usize = size_of::<u16>();
 
+const _: () = assert!(
+    PAGE_SIZE <= u16::MAX as usize,
+    "a slot's u16 offset reaches every byte of a page"
+);
+
+fn page_offset(at: usize) -> u16 {
+    u16::try_from(at).expect("a page offset fits in u16")
+}
+
 const SLOTS_PAST_PAGE: PageCodecError = PageCodecError::Malformed("slot array runs past the page");
 const ENTRY_OUT_OF_BOUNDS: PageCodecError =
     PageCodecError::Malformed("entry offsets are out of order or outside the page");
@@ -143,11 +152,7 @@ impl EntryArea {
     ) -> usize {
         assert_eq!(payload.len(), self.payload_len, "entry payload length");
         let slot = self.slot_offset(i);
-        put_u16_le(
-            buf,
-            slot,
-            u16::try_from(at).expect("a page offset fits in u16"),
-        );
+        put_u16_le(buf, slot, page_offset(at));
         let key_end = at + key.len();
         buf[at..key_end].copy_from_slice(key);
         buf[key_end..key_end + payload.len()].copy_from_slice(payload);
@@ -179,7 +184,7 @@ impl EntryArea {
         buf.copy_within(data_start..at, data_start - len);
         for i in 0..pos {
             let moved = self.start(buf, i) - len;
-            put_u16_le(buf, self.slot_offset(i), moved as u16);
+            put_u16_le(buf, self.slot_offset(i), page_offset(moved));
         }
         let slot = self.slot_offset(pos);
         buf.copy_within(slot..self.slot_offset(n), slot + SLOT_ENCODED_BYTES);
@@ -197,7 +202,7 @@ impl EntryArea {
         buf[data_start..data_start + len].fill(0);
         for i in 0..pos {
             let moved = self.start(buf, i) + len;
-            put_u16_le(buf, self.slot_offset(i), moved as u16);
+            put_u16_le(buf, self.slot_offset(i), page_offset(moved));
         }
         let slot = self.slot_offset(pos);
         let slots_end = self.slot_offset(n);

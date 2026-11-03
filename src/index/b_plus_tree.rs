@@ -2168,6 +2168,7 @@ mod tests {
             use std::thread;
 
             const KEY_LEN: usize = 2000;
+            const SHAPES: [Keys; 2] = [Keys::Fixed(KEY_LEN), Keys::Varied];
             const KEYS: u32 = 300;
             const ROUNDS: u64 = 60;
             const WRITERS: usize = 2;
@@ -2181,30 +2182,31 @@ mod tests {
                 Remove(u32),
             }
 
-            fn apply(tree: &BPlusTree, present: &[AtomicBool], op: Op) {
+            fn apply(tree: &BPlusTree, keys: Keys, present: &[AtomicBool], op: Op) {
                 match op {
                     Op::Insert(n) => {
-                        tree.insert(key_for(n, KEY_LEN), IndexValue::IndexValue(rid_for(n)))
+                        tree.insert(keys.key(n), IndexValue::IndexValue(rid_for(n)))
                             .unwrap_or_else(|e| panic!("insert {n} failed: {e}"));
                         present[n as usize].store(true, Ordering::Release);
                     }
                     Op::Remove(n) => {
                         present[n as usize].store(false, Ordering::Release);
-                        tree.remove(key_for(n, KEY_LEN))
+                        tree.remove(keys.key(n))
                             .unwrap_or_else(|e| panic!("remove {n} failed: {e}"));
                     }
                 }
             }
 
-            fn finds(tree: &BPlusTree, n: u32) -> bool {
+            fn finds(tree: &BPlusTree, keys: Keys, n: u32) -> bool {
                 matches!(
-                    tree.search(&key_for(n, KEY_LEN)),
+                    tree.search(&keys.key(n)),
                     Ok(Some(IndexValue::IndexValue(rid))) if rid == rid_for(n)
                 )
             }
 
             fn keys_a_reader_missed(
                 tree: &BPlusTree,
+                keys: Keys,
                 present: &[AtomicBool],
                 writers_done: &AtomicBool,
                 seed: u64,
@@ -2214,7 +2216,7 @@ mod tests {
                 while !writers_done.load(Ordering::Acquire) {
                     let n = rand::Rng::random_range(&mut rng, 0..KEYS);
                     let is_present = || present[n as usize].load(Ordering::Acquire);
-                    if is_present() && !finds(tree, n) && is_present() {
+                    if is_present() && !finds(tree, keys, n) && is_present() {
                         missed.push(n);
                     }
                 }
@@ -2226,6 +2228,7 @@ mod tests {
             /// them before the search started and had not started removing them when it ended.
             fn keys_missed_during(
                 tree: &BPlusTree,
+                keys: Keys,
                 present: &[AtomicBool],
                 writer_ops: Vec<Vec<Op>>,
                 seed: u64,
@@ -2236,7 +2239,13 @@ mod tests {
                     let readers: Vec<_> = (0..READERS)
                         .map(|r| {
                             s.spawn(move || {
-                                keys_a_reader_missed(tree, present, writers_done, seed * 31 + r)
+                                keys_a_reader_missed(
+                                    tree,
+                                    keys,
+                                    present,
+                                    writers_done,
+                                    seed * 31 + r,
+                                )
                             })
                         })
                         .collect();
@@ -2245,7 +2254,7 @@ mod tests {
                         .map(|ops| {
                             s.spawn(move || {
                                 for op in ops {
-                                    apply(tree, present, op);
+                                    apply(tree, keys, present, op);
                                 }
                             })
                         })
@@ -2273,11 +2282,16 @@ mod tests {
                 per_writer
             }
 
-            fn assert_tree_holds_exactly(tree: &BPlusTree, present: &[AtomicBool], round: u64) {
-                assert_tree_is_well_formed(tree, Keys::Fixed(KEY_LEN));
+            fn assert_tree_holds_exactly(
+                tree: &BPlusTree,
+                keys: Keys,
+                present: &[AtomicBool],
+                round: u64,
+            ) {
+                assert_tree_is_well_formed(tree, keys);
                 let expected: Vec<IndexKey> = (0..KEYS)
                     .filter(|&n| present[n as usize].load(Ordering::Acquire))
-                    .map(|n| key_for(n, KEY_LEN))
+                    .map(|n| keys.key(n))
                     .collect();
                 let scanned: Vec<IndexKey> = tree
                     .scan((Bound::Unbounded, Bound::Unbounded))
@@ -2292,9 +2306,10 @@ mod tests {
                 );
             }
 
-            fn fresh_tree() -> (BPlusTree, Vec<AtomicBool>, tempfile::TempDir) {
+            fn fresh_tree(keys: Keys) -> (BPlusTree, Vec<AtomicBool>, tempfile::TempDir) {
                 let (bpm, tmp) = crate::testing::bpm(FRAMES);
-                let tree = BPlusTree::new("idx".to_string(), KEY_LEN as u32, bpm).unwrap();
+                let tree =
+                    BPlusTree::new("idx".to_string(), keys.max_key_len() as u32, bpm).unwrap();
                 assert_eq!(
                     longest_entries_per_page(&tree),
                     (4, 4),
@@ -2306,35 +2321,43 @@ mod tests {
 
             #[test]
             fn readers_and_writers_see_every_key_while_the_root_splits() {
-                for round in 0..ROUNDS {
-                    let (tree, present, _tmp) = fresh_tree();
-                    let mut keys: Vec<u32> = (0..KEYS).collect();
-                    keys.shuffle(&mut StdRng::seed_from_u64(round));
+                for (keys, round) in SHAPES
+                    .into_iter()
+                    .flat_map(|k| (0..ROUNDS).map(move |r| (k, r)))
+                {
+                    let (tree, present, _tmp) = fresh_tree(keys);
+                    let mut order: Vec<u32> = (0..KEYS).collect();
+                    order.shuffle(&mut StdRng::seed_from_u64(round));
                     let missed = keys_missed_during(
                         &tree,
+                        keys,
                         &present,
-                        deal_round_robin(&keys, Op::Insert),
+                        deal_round_robin(&order, Op::Insert),
                         round,
                     );
                     assert!(
                         missed.is_empty(),
                         "round {round}: readers missed inserted keys {missed:?}"
                     );
-                    assert_tree_holds_exactly(&tree, &present, round);
+                    assert_tree_holds_exactly(&tree, keys, &present, round);
                 }
             }
 
             #[test]
             fn readers_see_every_kept_key_while_the_root_collapses() {
-                for round in 0..ROUNDS {
-                    let (tree, present, _tmp) = fresh_tree();
+                for (keys, round) in SHAPES
+                    .into_iter()
+                    .flat_map(|k| (0..ROUNDS).map(move |r| (k, r)))
+                {
+                    let (tree, present, _tmp) = fresh_tree(keys);
                     for n in 0..KEYS {
-                        apply(&tree, &present, Op::Insert(n));
+                        apply(&tree, keys, &present, Op::Insert(n));
                     }
                     let mut doomed: Vec<u32> = (0..KEYS).filter(|n| n % KEEP_EVERY != 0).collect();
                     doomed.shuffle(&mut StdRng::seed_from_u64(1000 + round));
                     let missed = keys_missed_during(
                         &tree,
+                        keys,
                         &present,
                         deal_round_robin(&doomed, Op::Remove),
                         round,
@@ -2343,7 +2366,7 @@ mod tests {
                         missed.is_empty(),
                         "round {round}: readers missed kept keys {missed:?}"
                     );
-                    assert_tree_holds_exactly(&tree, &present, round);
+                    assert_tree_holds_exactly(&tree, keys, &present, round);
                 }
             }
         }
