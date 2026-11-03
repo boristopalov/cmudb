@@ -395,91 +395,100 @@ mod verification {
         assert!(key.len() + payload.len() <= AREA.capacity());
     }
 
-    /// Up to `MAX_ENTRIES` entries written in order with `put_entry` form an area that passes
-    /// `check` and reads back as the same entries.
-    #[kani::proof]
-    #[kani::unwind(30)]
-    fn encoded_entries_pass_check_and_read_back() {
-        for n in 0..=MAX_ENTRIES {
-            for shape in 0..shapes(n) {
-                let entries = any_entries(n, shape);
-                let buf = encode(&entries[..n]);
-                assert_eq!(AREA.check(&buf, n), Ok(()));
-                for (i, e) in entries[..n].iter().enumerate() {
-                    assert_entry(&buf, n, i, e);
-                }
+    /// `n` entries written in order with `put_entry`, for every key-length shape, form an
+    /// area that passes `check` and reads back as the same entries.
+    fn encoded_entries_pass_check_and_read_back(n: usize) {
+        for shape in 0..shapes(n) {
+            let entries = any_entries(n, shape);
+            let buf = encode(&entries[..n]);
+            assert_eq!(AREA.check(&buf, n), Ok(()));
+            for (i, e) in entries[..n].iter().enumerate() {
+                assert_entry(&buf, n, i, e);
             }
         }
     }
 
-    /// Inserting at any position of an encoded area leaves an area that passes `check`, holds
-    /// the new entry at `pos` with every old entry unchanged in order around it, has exactly
-    /// `entry_cost` fewer free bytes, and equals encoding the new list of entries.
-    #[kani::proof]
-    #[kani::unwind(30)]
-    fn insert_matches_encoding_the_new_list() {
-        for n in 0..MAX_ENTRIES {
-            for shape in 0..shapes(n) {
-                for new_len in 0..KEY_LENS {
-                    for pos in 0..=n {
-                        let before = any_entries(n, shape);
-                        let new = Entry::any_with_key_len(new_len);
-                        let mut buf = encode(&before[..n]);
-                        let free_before = AREA.free(&buf, n);
+    /// Inserting at `pos` of an area holding `n` encoded entries, for every key-length shape,
+    /// leaves an area that passes `check`, has exactly `entry_cost` fewer free bytes, and is
+    /// byte for byte the encoding of the new list of entries.
+    fn insert_matches_encoding_the_new_list(n: usize, pos: usize) {
+        for shape in 0..shapes(n) {
+            for new_len in 0..KEY_LENS {
+                let before = any_entries(n, shape);
+                let new = Entry::any_with_key_len(new_len);
+                let mut buf = encode(&before[..n]);
+                let free_before = AREA.free(&buf, n);
 
-                        AREA.insert(&mut buf, n, pos, new.key(), &new.payload);
+                AREA.insert(&mut buf, n, pos, new.key(), &new.payload);
 
-                        assert_eq!(AREA.check(&buf, n + 1), Ok(()));
-                        assert_eq!(
-                            AREA.free(&buf, n + 1),
-                            free_before - AREA.entry_cost(new_len)
-                        );
-                        assert_entry(&buf, n + 1, pos, &new);
-                        let mut after = before;
-                        after.copy_within(pos..n, pos + 1);
-                        after[pos] = new;
-                        for (i, e) in after[..=n].iter().enumerate() {
-                            assert_entry(&buf, n + 1, i, e);
-                        }
-                        let byte: usize = kani::any();
-                        kani::assume(byte < PAGE_SIZE);
-                        assert_eq!(buf[byte], encode(&after[..=n])[byte]);
-                    }
-                }
+                assert_eq!(AREA.check(&buf, n + 1), Ok(()));
+                assert_eq!(
+                    AREA.free(&buf, n + 1),
+                    free_before - AREA.entry_cost(new_len)
+                );
+                let mut after = before;
+                after.copy_within(pos..n, pos + 1);
+                after[pos] = new;
+                let byte: usize = kani::any();
+                kani::assume(byte < PAGE_SIZE);
+                assert_eq!(buf[byte], encode(&after[..=n])[byte]);
             }
         }
     }
 
-    /// Removing any entry of an encoded area leaves an area that passes `check`, gives the
-    /// entry's bytes back as free space, and equals encoding the remaining entries, so the
-    /// bytes it frees are zeroed.
-    #[kani::proof]
-    #[kani::unwind(30)]
-    fn remove_matches_encoding_the_remaining_entries() {
-        for n in 1..=MAX_ENTRIES {
-            for shape in 0..shapes(n) {
-                for pos in 0..n {
-                    let before = any_entries(n, shape);
-                    let mut buf = encode(&before[..n]);
-                    let free_before = AREA.free(&buf, n);
+    /// Removing entry `pos` of `n` encoded entries, for every key-length shape, leaves an area
+    /// that passes `check`, gives the entry's bytes back as free space, and is byte for byte
+    /// the encoding of the remaining entries, so the bytes it frees are zeroed.
+    fn remove_matches_encoding_the_remaining_entries(n: usize, pos: usize) {
+        for shape in 0..shapes(n) {
+            let before = any_entries(n, shape);
+            let mut buf = encode(&before[..n]);
+            let free_before = AREA.free(&buf, n);
 
-                    AREA.remove(&mut buf, n, pos);
+            AREA.remove(&mut buf, n, pos);
 
-                    assert_eq!(AREA.check(&buf, n - 1), Ok(()));
-                    assert_eq!(
-                        AREA.free(&buf, n - 1),
-                        free_before + AREA.entry_cost(before[pos].key_len)
-                    );
-                    let mut after = before;
-                    after.copy_within(pos + 1..n, pos);
-                    for (i, e) in after[..n - 1].iter().enumerate() {
-                        assert_entry(&buf, n - 1, i, e);
-                    }
-                    let byte: usize = kani::any();
-                    kani::assume(byte < PAGE_SIZE);
-                    assert_eq!(buf[byte], encode(&after[..n - 1])[byte]);
-                }
-            }
+            assert_eq!(AREA.check(&buf, n - 1), Ok(()));
+            assert_eq!(
+                AREA.free(&buf, n - 1),
+                free_before + AREA.entry_cost(before[pos].key_len)
+            );
+            let mut after = before;
+            after.copy_within(pos + 1..n, pos);
+            let byte: usize = kani::any();
+            kani::assume(byte < PAGE_SIZE);
+            assert_eq!(buf[byte], encode(&after[..n - 1])[byte]);
         }
+    }
+
+    /// One proof per entry count and position, so each CBMC run stays small.
+    macro_rules! proofs {
+        ($($name:ident => $check:ident($($arg:expr),*);)*) => {
+            $(
+                #[kani::proof]
+                #[kani::unwind(30)]
+                fn $name() {
+                    $check($($arg),*);
+                }
+            )*
+        };
+    }
+
+    proofs! {
+        encode_0 => encoded_entries_pass_check_and_read_back(0);
+        encode_1 => encoded_entries_pass_check_and_read_back(1);
+        encode_2 => encoded_entries_pass_check_and_read_back(2);
+        encode_3 => encoded_entries_pass_check_and_read_back(3);
+        insert_into_0_at_0 => insert_matches_encoding_the_new_list(0, 0);
+        insert_into_1_at_0 => insert_matches_encoding_the_new_list(1, 0);
+        insert_into_1_at_1 => insert_matches_encoding_the_new_list(1, 1);
+        insert_into_2_at_0 => insert_matches_encoding_the_new_list(2, 0);
+        insert_into_2_at_1 => insert_matches_encoding_the_new_list(2, 1);
+        insert_into_2_at_2 => insert_matches_encoding_the_new_list(2, 2);
+        remove_from_1_at_0 => remove_matches_encoding_the_remaining_entries(1, 0);
+        remove_from_2_at_0 => remove_matches_encoding_the_remaining_entries(2, 0);
+        remove_from_2_at_1 => remove_matches_encoding_the_remaining_entries(2, 1);
+        remove_from_3_at_0 => remove_matches_encoding_the_remaining_entries(3, 0);
+        remove_from_3_at_1 => remove_matches_encoding_the_remaining_entries(3, 1);
+        remove_from_3_at_2 => remove_matches_encoding_the_remaining_entries(3, 2);
     }
 }
