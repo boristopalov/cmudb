@@ -303,3 +303,308 @@ mod tests {
         assert_eq!(AREA.check(&too_short, 2), Err(ENTRY_OUT_OF_BOUNDS));
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    const MAX_PAYLOAD: usize = 16;
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Insert {
+            at: prop::sample::Index,
+            key: Vec<u8>,
+            payload: [u8; MAX_PAYLOAD],
+        },
+        Remove {
+            at: prop::sample::Index,
+        },
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            3 => (
+                any::<prop::sample::Index>(),
+                prop_oneof![
+                    prop::collection::vec(any::<u8>(), 0..=8),
+                    prop::collection::vec(any::<u8>(), 0..=600),
+                ],
+                any::<[u8; MAX_PAYLOAD]>(),
+            )
+                .prop_map(|(at, key, payload)| Op::Insert { at, key, payload }),
+            2 => any::<prop::sample::Index>().prop_map(|at| Op::Remove { at }),
+        ]
+    }
+
+    /// The bytes `put_entry` writes for `entries` laid out in order on a zeroed page, the
+    /// encoding the B+ tree page codecs produce.
+    fn encoded(area: EntryArea, entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+        let mut buf = vec![0u8; PAGE_SIZE];
+        let total: usize = entries.iter().map(|(k, p)| k.len() + p.len()).sum();
+        let mut at = PAGE_SIZE - total;
+        for (i, (k, p)) in entries.iter().enumerate() {
+            at = area.put_entry(&mut buf, i, at, k, p);
+        }
+        buf
+    }
+
+    fn cost(area: EntryArea, entries: &[(Vec<u8>, Vec<u8>)]) -> usize {
+        entries.iter().map(|(k, _)| area.entry_cost(k.len())).sum()
+    }
+
+    /// Fails unless `buf` passes `check` for the model's entries, has the free space they
+    /// leave, reads back each of them, and equals encoding them in order.
+    fn assert_matches_model(area: EntryArea, buf: &[u8], model: &[(Vec<u8>, Vec<u8>)]) {
+        let n = model.len();
+        assert_eq!(area.check(buf, n), Ok(()));
+        assert_eq!(area.free(buf, n), area.capacity() - cost(area, model));
+        for (i, (key, payload)) in model.iter().enumerate() {
+            assert_eq!(area.key(buf, n, i), key.as_slice());
+            assert_eq!(area.payload(buf, n, i), payload.as_slice());
+        }
+        assert!(
+            buf == encoded(area, model),
+            "page differs from encoding the model"
+        );
+    }
+
+    #[test]
+    fn inserts_fill_the_page_until_no_entry_fits_and_removes_empty_it() {
+        let area = EntryArea::new(16, 2);
+        let mut buf = vec![0u8; PAGE_SIZE];
+        let mut model: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut round = 0u8;
+        loop {
+            let n = model.len();
+            let free = area.free(&buf, n);
+            let Some(key_len) = [600, 37, 1, 0]
+                .into_iter()
+                .find(|&len| area.entry_cost(len) <= free)
+            else {
+                break;
+            };
+            let pos = [0, n / 2, n][usize::from(round) % 3];
+            let key = vec![round; key_len];
+            let payload = vec![round, !round];
+            area.insert(&mut buf, n, pos, &key, &payload);
+            model.insert(pos, (key, payload));
+            assert_matches_model(area, &buf, &model);
+            round = round.wrapping_add(1);
+        }
+        let n = model.len();
+        assert!(
+            area.free(&buf, n) < area.entry_cost(0),
+            "the page is full: not even an empty key fits"
+        );
+        assert!(
+            model.iter().any(|(k, _)| k.len() == 600),
+            "the page holds long keys"
+        );
+        while !model.is_empty() {
+            let n = model.len();
+            let pos = n / 2;
+            area.remove(&mut buf, n, pos);
+            model.remove(pos);
+            assert_matches_model(area, &buf, &model);
+        }
+        assert!(buf.iter().all(|&b| b == 0), "an emptied page is all zeros");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 512,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        /// Any sequence of inserts and removes on a page with entries keeps the area passing
+        /// `check`, keeps `free` equal to the capacity left by the entries, and leaves the page
+        /// byte for byte equal to encoding the same entries in order, so removed bytes are
+        /// zeroed. Inserts that do not fit are skipped.
+        #[test]
+        fn inserts_and_removes_match_encoding_the_model(
+            slots_start in 0usize..64,
+            payload_len in 0usize..=MAX_PAYLOAD,
+            ops in prop::collection::vec(op(), 1..200),
+        ) {
+            let area = EntryArea::new(slots_start, payload_len);
+            let mut buf = vec![0u8; PAGE_SIZE];
+            let mut model: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            for op in ops {
+                let n = model.len();
+                match op {
+                    Op::Insert { at, key, payload } => {
+                        if area.free(&buf, n) < area.entry_cost(key.len()) {
+                            continue;
+                        }
+                        let pos = at.index(n + 1);
+                        let payload = payload[..payload_len].to_vec();
+                        area.insert(&mut buf, n, pos, &key, &payload);
+                        model.insert(pos, (key, payload));
+                    }
+                    Op::Remove { at } => {
+                        if n == 0 {
+                            continue;
+                        }
+                        let pos = at.index(n);
+                        area.remove(&mut buf, n, pos);
+                        model.remove(pos);
+                    }
+                }
+                assert_matches_model(area, &buf, &model);
+            }
+        }
+    }
+}
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    const AREA: EntryArea = EntryArea::new(16, 2);
+    const MAX_ENTRIES: usize = 3;
+    const KEY_LENS: usize = 3;
+
+    /// Key lengths of `n` entries, one per base-`KEY_LENS` digit of `shape`.
+    fn key_lens(n: usize, shape: usize) -> [usize; MAX_ENTRIES] {
+        core::array::from_fn(|i| {
+            if i < n {
+                shape / KEY_LENS.pow(i as u32) % KEY_LENS
+            } else {
+                0
+            }
+        })
+    }
+
+    fn shapes(n: usize) -> usize {
+        KEY_LENS.pow(n as u32)
+    }
+
+    #[derive(Clone, Copy)]
+    struct Entry {
+        key: [u8; KEY_LENS - 1],
+        key_len: usize,
+        payload: [u8; 2],
+    }
+
+    impl Entry {
+        fn any_with_key_len(key_len: usize) -> Self {
+            Entry {
+                key: kani::any(),
+                key_len,
+                payload: kani::any(),
+            }
+        }
+
+        fn key(&self) -> &[u8] {
+            &self.key[..self.key_len]
+        }
+    }
+
+    /// A zeroed page with `entries` laid out by [`EntryArea::put_entry`], the way the page
+    /// encoders in `b_plus_page` write them.
+    fn encode(entries: &[Entry]) -> [u8; PAGE_SIZE] {
+        let mut buf = [0u8; PAGE_SIZE];
+        let total: usize = entries
+            .iter()
+            .map(|e| AREA.entry_cost(e.key_len) - SLOT_ENCODED_BYTES)
+            .sum();
+        let mut at = PAGE_SIZE - total;
+        for (i, e) in entries.iter().enumerate() {
+            at = AREA.put_entry(&mut buf, i, at, e.key(), &e.payload);
+        }
+        assert_eq!(at, PAGE_SIZE);
+        buf
+    }
+
+    fn any_entries(n: usize, shape: usize) -> [Entry; MAX_ENTRIES] {
+        let lens = key_lens(n, shape);
+        core::array::from_fn(|i| Entry::any_with_key_len(lens[i]))
+    }
+
+    fn assert_entry(buf: &[u8], n: usize, i: usize, expected: &Entry) {
+        assert_eq!(AREA.key(buf, n, i), expected.key());
+        assert_eq!(AREA.payload(buf, n, i), &expected.payload);
+    }
+
+    /// Reads of an area that passed `check` stay inside the page without panicking, and its
+    /// used bytes fit within its capacity, so `free` cannot underflow. The page bytes are
+    /// unconstrained apart from passing `check`.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn reads_of_a_checked_area_stay_in_bounds() {
+        let buf: [u8; PAGE_SIZE] = kani::any();
+        let n: usize = kani::any();
+        kani::assume(n <= MAX_ENTRIES);
+        kani::assume(AREA.check(&buf, n).is_ok());
+        assert!(AREA.used(&buf, n) <= AREA.capacity());
+        let i: usize = kani::any();
+        kani::assume(i < n);
+        let key = AREA.key(&buf, n, i);
+        let payload = AREA.payload(&buf, n, i);
+        assert_eq!(payload.len(), AREA.payload_len());
+        assert!(key.len() + payload.len() <= AREA.capacity());
+    }
+
+    /// `n` entries written in order with `put_entry`, for every key-length shape, form an
+    /// area that passes `check` and reads back as the same entries.
+    fn encoded_entries_pass_check_and_read_back(n: usize) {
+        for shape in 0..shapes(n) {
+            let entries = any_entries(n, shape);
+            let buf = encode(&entries[..n]);
+            assert_eq!(AREA.check(&buf, n), Ok(()));
+            for (i, e) in entries[..n].iter().enumerate() {
+                assert_entry(&buf, n, i, e);
+            }
+        }
+    }
+
+    /// Inserting at `pos` of an area holding `n` encoded entries, for every key-length shape,
+    /// leaves an area that passes `check`, has exactly `entry_cost` fewer free bytes, and is
+    /// byte for byte the encoding of the new list of entries.
+    fn insert_matches_encoding_the_new_list(n: usize, pos: usize) {
+        for shape in 0..shapes(n) {
+            for new_len in 0..KEY_LENS {
+                let before = any_entries(n, shape);
+                let new = Entry::any_with_key_len(new_len);
+                let mut buf = encode(&before[..n]);
+                let free_before = AREA.free(&buf, n);
+
+                AREA.insert(&mut buf, n, pos, new.key(), &new.payload);
+
+                assert_eq!(AREA.check(&buf, n + 1), Ok(()));
+                assert_eq!(
+                    AREA.free(&buf, n + 1),
+                    free_before - AREA.entry_cost(new_len)
+                );
+                let mut after = before;
+                after.copy_within(pos..n, pos + 1);
+                after[pos] = new;
+                let byte: usize = kani::any();
+                kani::assume(byte < PAGE_SIZE);
+                assert_eq!(buf[byte], encode(&after[..=n])[byte]);
+            }
+        }
+    }
+
+    /// One proof per entry count and position, so each CBMC run stays small.
+    macro_rules! proofs {
+        ($($name:ident => $check:ident($($arg:expr),*);)*) => {
+            $(
+                #[kani::proof]
+                #[kani::unwind(30)]
+                fn $name() {
+                    $check($($arg),*);
+                }
+            )*
+        };
+    }
+
+    proofs! {
+        encode_0 => encoded_entries_pass_check_and_read_back(0);
+        encode_1 => encoded_entries_pass_check_and_read_back(1);
+        insert_into_0_at_0 => insert_matches_encoding_the_new_list(0, 0);
+    }
+}
