@@ -354,6 +354,64 @@ mod properties {
         entries.iter().map(|(k, _)| area.entry_cost(k.len())).sum()
     }
 
+    /// Fails unless `buf` passes `check` for the model's entries, has the free space they
+    /// leave, reads back each of them, and equals encoding them in order.
+    fn assert_matches_model(area: EntryArea, buf: &[u8], model: &[(Vec<u8>, Vec<u8>)]) {
+        let n = model.len();
+        assert_eq!(area.check(buf, n), Ok(()));
+        assert_eq!(area.free(buf, n), area.capacity() - cost(area, model));
+        for (i, (key, payload)) in model.iter().enumerate() {
+            assert_eq!(area.key(buf, n, i), key.as_slice());
+            assert_eq!(area.payload(buf, n, i), payload.as_slice());
+        }
+        assert!(
+            buf == encoded(area, model),
+            "page differs from encoding the model"
+        );
+    }
+
+    #[test]
+    fn inserts_fill_the_page_until_no_entry_fits_and_removes_empty_it() {
+        let area = EntryArea::new(16, 2);
+        let mut buf = vec![0u8; PAGE_SIZE];
+        let mut model: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut round = 0u8;
+        loop {
+            let n = model.len();
+            let free = area.free(&buf, n);
+            let Some(key_len) = [600, 37, 1, 0]
+                .into_iter()
+                .find(|&len| area.entry_cost(len) <= free)
+            else {
+                break;
+            };
+            let pos = [0, n / 2, n][usize::from(round) % 3];
+            let key = vec![round; key_len];
+            let payload = vec![round, !round];
+            area.insert(&mut buf, n, pos, &key, &payload);
+            model.insert(pos, (key, payload));
+            assert_matches_model(area, &buf, &model);
+            round = round.wrapping_add(1);
+        }
+        let n = model.len();
+        assert!(
+            area.free(&buf, n) < area.entry_cost(0),
+            "the page is full: not even an empty key fits"
+        );
+        assert!(
+            model.iter().any(|(k, _)| k.len() == 600),
+            "the page holds long keys"
+        );
+        while !model.is_empty() {
+            let n = model.len();
+            let pos = n / 2;
+            area.remove(&mut buf, n, pos);
+            model.remove(pos);
+            assert_matches_model(area, &buf, &model);
+        }
+        assert!(buf.iter().all(|&b| b == 0), "an emptied page is all zeros");
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 512,
@@ -364,7 +422,7 @@ mod properties {
         /// Any sequence of inserts and removes on a page with entries keeps the area passing
         /// `check`, keeps `free` equal to the capacity left by the entries, and leaves the page
         /// byte for byte equal to encoding the same entries in order, so removed bytes are
-        /// zeroed. Inserts that do not fit are skipped, which also fills pages to capacity.
+        /// zeroed. Inserts that do not fit are skipped.
         #[test]
         fn inserts_and_removes_match_encoding_the_model(
             slots_start in 0usize..64,
@@ -395,14 +453,7 @@ mod properties {
                         model.remove(pos);
                     }
                 }
-                let n = model.len();
-                prop_assert_eq!(area.check(&buf, n), Ok(()));
-                prop_assert_eq!(area.free(&buf, n), area.capacity() - cost(area, &model));
-                prop_assert!(buf == encoded(area, &model), "page differs from encoding the model");
-                for (i, (key, payload)) in model.iter().enumerate() {
-                    prop_assert_eq!(area.key(&buf, n, i), key.as_slice());
-                    prop_assert_eq!(area.payload(&buf, n, i), payload.as_slice());
-                }
+                assert_matches_model(area, &buf, &model);
             }
         }
     }
@@ -416,10 +467,7 @@ mod verification {
     const MAX_ENTRIES: usize = 3;
     const KEY_LENS: usize = 3;
 
-    /// Key lengths of `n` entries, one per base-`KEY_LENS` digit of `shape`. Harnesses loop over
-    /// every shape with concrete lengths and leave the key and payload bytes symbolic, since
-    /// symbolic lengths make CBMC run out of memory on an 8 KiB page. Cases with two or more
-    /// entries also run out of memory in a 15 GB sandbox, so only smaller cases are proofs here.
+    /// Key lengths of `n` entries, one per base-`KEY_LENS` digit of `shape`.
     fn key_lens(n: usize, shape: usize) -> [usize; MAX_ENTRIES] {
         core::array::from_fn(|i| {
             if i < n {
