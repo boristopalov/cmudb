@@ -304,6 +304,110 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    const MAX_PAYLOAD: usize = 16;
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Insert {
+            at: prop::sample::Index,
+            key: Vec<u8>,
+            payload: [u8; MAX_PAYLOAD],
+        },
+        Remove {
+            at: prop::sample::Index,
+        },
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            3 => (
+                any::<prop::sample::Index>(),
+                prop_oneof![
+                    prop::collection::vec(any::<u8>(), 0..=8),
+                    prop::collection::vec(any::<u8>(), 0..=600),
+                ],
+                any::<[u8; MAX_PAYLOAD]>(),
+            )
+                .prop_map(|(at, key, payload)| Op::Insert { at, key, payload }),
+            2 => any::<prop::sample::Index>().prop_map(|at| Op::Remove { at }),
+        ]
+    }
+
+    /// The bytes `put_entry` writes for `entries` laid out in order on a zeroed page, the
+    /// encoding the B+ tree page codecs produce.
+    fn encoded(area: EntryArea, entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+        let mut buf = vec![0u8; PAGE_SIZE];
+        let total: usize = entries.iter().map(|(k, p)| k.len() + p.len()).sum();
+        let mut at = PAGE_SIZE - total;
+        for (i, (k, p)) in entries.iter().enumerate() {
+            at = area.put_entry(&mut buf, i, at, k, p);
+        }
+        buf
+    }
+
+    fn cost(area: EntryArea, entries: &[(Vec<u8>, Vec<u8>)]) -> usize {
+        entries.iter().map(|(k, _)| area.entry_cost(k.len())).sum()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 512,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        /// Any sequence of inserts and removes on a page with entries keeps the area passing
+        /// `check`, keeps `free` equal to the capacity left by the entries, and leaves the page
+        /// byte for byte equal to encoding the same entries in order, so removed bytes are
+        /// zeroed. Inserts that do not fit are skipped, which also fills pages to capacity.
+        #[test]
+        fn inserts_and_removes_match_encoding_the_model(
+            slots_start in 0usize..64,
+            payload_len in 0usize..=MAX_PAYLOAD,
+            ops in prop::collection::vec(op(), 1..200),
+        ) {
+            let area = EntryArea::new(slots_start, payload_len);
+            let mut buf = vec![0u8; PAGE_SIZE];
+            let mut model: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            for op in ops {
+                let n = model.len();
+                match op {
+                    Op::Insert { at, key, payload } => {
+                        if area.free(&buf, n) < area.entry_cost(key.len()) {
+                            continue;
+                        }
+                        let pos = at.index(n + 1);
+                        let payload = payload[..payload_len].to_vec();
+                        area.insert(&mut buf, n, pos, &key, &payload);
+                        model.insert(pos, (key, payload));
+                    }
+                    Op::Remove { at } => {
+                        if n == 0 {
+                            continue;
+                        }
+                        let pos = at.index(n);
+                        area.remove(&mut buf, n, pos);
+                        model.remove(pos);
+                    }
+                }
+                let n = model.len();
+                prop_assert_eq!(area.check(&buf, n), Ok(()));
+                prop_assert_eq!(area.free(&buf, n), area.capacity() - cost(area, &model));
+                prop_assert!(buf == encoded(area, &model), "page differs from encoding the model");
+                for (i, (key, payload)) in model.iter().enumerate() {
+                    prop_assert_eq!(area.key(&buf, n, i), key.as_slice());
+                    prop_assert_eq!(area.payload(&buf, n, i), payload.as_slice());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(kani)]
 mod verification {
     use super::*;
