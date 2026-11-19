@@ -17,15 +17,13 @@ log in `mydb/cmudb.log`. A commit is durable once the shell prints it: after a c
 that had not committed. Data folders made before data file version 2 do not open.
 
 ## What's done:
-- disk-backed pages for tables, read and written in place through typed views over the page bytes
-- a single data file per database holding the pages, the catalog and the transaction clocks, so
-  tables, rows and indexes survive a restart; the file is locked while a process has it open
+- disk-backed pages for tables. pages are read through typed views over the page bytes to avoid deserialization/serialization for reads
 - Adaptive replacement cache policy for pages
 - B+ tree indexes with optimistic latch coupling
 - Vectorized pull-based query execution engine
-- MVCC with snapshot isolation, works similar to cmudb where the latest snapshot of a record is stored in-place and read in O(1), with previous versions tracked through an in-memory undo log that readers can walk
+- MVCC with snapshot isolation, where the newest version of a record is stored in-place and can be read in O(1), with previous versions tracked by a transaction manager, which readers can walk if needed
 - parser (using sqlparser crate), binder, planner
-- WAL
+- WAL and checkpointing for recovery
 SQL the shell runs:
 - `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`, `INSERT ... VALUES`, `UPDATE`, `DELETE`
 - `SELECT` with `WHERE`, inner and left joins of two tables, `GROUP BY` with
@@ -42,9 +40,8 @@ SQL the shell runs:
 - `HAVING`, subqueries, `WITH`, `OFFSET`, `IS NULL`, `NOT`, `LIKE`, `IN`, `CAST`, `%`, string
   functions and `||`, joins of more than two tables, window frames (`ROWS`/`RANGE`) and window
   functions in a `SELECT` that also aggregates
-- index keys > 2007 bytes
-- a row must fit in one 8 KiB page, `UPDATE`s that would cause a page overflow fail
-- `DROP TABLE` and `DROP INDEX` do not free their pages and GC doesn't reclaim free space yet
+- better page/data handling: a row must fit in one 8 KiB page currently, and `UPDATE`s that would cause a page overflow fail
+- `DROP TABLE` and `DROP INDEX` do not free their pages yet
 
 ## Benchmarks
 
