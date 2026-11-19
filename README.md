@@ -25,7 +25,7 @@ that had not committed. Data folders made before data file version 2 do not open
 - Vectorized pull-based query execution engine
 - MVCC with snapshot isolation, works similar to cmudb where the latest snapshot of a record is stored in-place and read in O(1), with previous versions tracked through an in-memory undo log that readers can walk
 - parser (using sqlparser crate), binder, planner
-- 
+- WAL
 SQL the shell runs:
 - `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`, `INSERT ... VALUES`, `UPDATE`, `DELETE`
 - `SELECT` with `WHERE`, inner and left joins of two tables, `GROUP BY` with
