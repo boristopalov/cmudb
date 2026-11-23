@@ -45,9 +45,6 @@ SQL the shell runs:
 
 ## Benchmarks
 
-Benchmarks use [criterion](https://docs.rs/criterion) and sit behind the `bench` feature. CI
-type-checks them on every pull request but never runs them. Run them by hand on a quiet machine:
-
 ```sh
 cargo bench --features bench                  # everything, about 4 minutes
 cargo bench --features bench --bench storage  # buffer pool and table heap
@@ -56,7 +53,7 @@ cargo bench --features bench --bench query    # SQL: scan, filter, aggregate, so
 cargo bench --features bench --bench index -- search   # filter by name
 ```
 
-Baseline, on commit d97bbc8: the median of three runs on a 4 vCPU Intel Xeon @ 2.10GHz cloud
+From commit d97bbc8: the median of three runs on a 4 vCPU Intel Xeon @ 2.10GHz cloud
 VM, rustc 1.99.1, release build. Time is the middle run's median, with the lowest and highest
 median of the three in brackets:
 
@@ -81,9 +78,3 @@ median of the three in brackets:
 | query/index_join_100_into_10k | 237 µs (230 to 242) | 2.37 µs per outer row |
 | query/index_point_lookup | 9.64 µs (9.22 to 9.79) | |
 | query/insert_1k_rows | 2.52 ms (2.34 to 2.55) | 2.52 µs |
-
-The table heap benches use a 64-frame pool on a heap of about 270 pages, so scans and random
-gets include disk reads and evictions. The bench asserts that the heap is larger than the pool,
-and, before timing, that every read in two laps of `read_miss_evict`'s fixed cycle misses. The B+ tree lookup and scan benches use a
-1024-frame pool and assert that the whole 100k-key tree stays in it, so their cost is buffer
-pool hits and page reads rather than I/O.
